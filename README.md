@@ -8,8 +8,8 @@ The first build supports:
 - Per-event environment allowlists
 - A global kill switch
 - Event cooldowns
-- Persistent Codex threads through `@openai/codex-sdk`
-- Read-only diagnosis by default
+- Persistent Codex threads through the installed `codex app-server`
+- Existing Codex permissions inherited by default
 
 ## Configuration
 
@@ -22,14 +22,13 @@ export default defineConfig({
   enabled: process.env.PAGENT_ENABLED === "true",
   environment: process.env.PAGENT_ENV,
   cwd: process.cwd(),
-  codex: {
-    sandboxMode: "read-only",
-    approvalPolicy: "never",
-  },
+  codex: {},
 });
 ```
 
-`sandboxMode` accepts `read-only`, `workspace-write`, or `danger-full-access`. Keep `read-only` for automatic diagnosis. Choosing either write mode allows the automatic run to change files.
+Pagent launches `codex app-server` from `PATH` and inherits its environment. That means it uses the existing Codex login, `config.toml`, skills, plugins, MCP servers, and `CODEX_HOME`. Pagent does not install or bundle a second Codex executable.
+
+The empty `codex` object inherits Codex's existing permission defaults. To override them for Pagent runs, `sandboxMode` accepts `read-only`, `workspace-write`, or `danger-full-access`, and `approvalPolicy` accepts `untrusted`, `on-request`, or `never`.
 
 ## Example
 
@@ -61,11 +60,18 @@ Pagent does nothing unless `enabled` is exactly `true` and the current environme
 
 ## Human handoff
 
-Each completed run returns a persistent `threadId`. Codex stores the thread under `~/.codex/sessions`. An App Server client using the same `CODEX_HOME` can inspect it with `thread/read` or load it with `thread/resume`.
+Each completed run returns a persistent `threadId`. The installed Codex stores the thread in its normal session store, usually `~/.codex/sessions`. Any Codex client using the same `CODEX_HOME` can inspect it with `thread/read` or load it with `thread/resume`.
 
-After resuming, the person can start another turn with a different `sandboxPolicy`. For example, a client can change a diagnostic thread to `workspaceWrite` before asking Codex to implement a fix. App Server applies turn-level sandbox overrides to that turn and later turns in the same thread.
+After resuming, the person can start another turn with a different `sandboxPolicy`. App Server applies turn-level sandbox overrides to that turn and later turns in the same thread.
 
-This local handoff is ready for the MVP. A hosted handoff needs a persistent App Server and shared thread storage. App Server's remote WebSocket transport is currently experimental, so it should not be the production transport yet.
+This local handoff is ready for the MVP. App Server's remote WebSocket transport is currently experimental, so Pagent uses the local stdio transport.
+
+## Prerequisites
+
+- `codex` must already be installed, available on `PATH`, and logged in.
+- `cwd` must point to a repository that already exists on the same machine.
+
+Pagent fails with a direct setup error when either prerequisite is missing. It never downloads Codex or a repository on the application's behalf.
 
 ## Demo
 
@@ -83,7 +89,7 @@ Run the same service as staging. The first unhealthy result starts a Codex threa
 PAGENT_ENABLED=true PAGENT_ENV=staging pnpm demo
 ```
 
-The Codex adapter uses the local Codex login by default. It starts a persistent read-only thread with no interactive approval prompts and prints the thread ID for handoff.
+The Codex adapter uses the installed Codex instance, local login, and existing permission defaults. It prints the persistent thread ID for handoff.
 
 ## Development
 

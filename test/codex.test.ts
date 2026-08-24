@@ -1,86 +1,206 @@
+import { EventEmitter } from "node:events";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { PassThrough } from "node:stream";
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const sdk = vi.hoisted(() => {
-  const run = vi.fn();
-  const startThread = vi.fn((_options?: unknown) => ({
-    id: "codex-thread-1" as string | null,
-    run,
-  }));
-  const constructor = vi.fn();
+const childProcesses = vi.hoisted(() => ({
+  spawn: vi.fn(),
+}));
 
-  return { constructor, run, startThread };
-});
-
-vi.mock("@openai/codex-sdk", () => ({
-  Codex: class MockCodex {
-    constructor(options?: unknown) {
-      sdk.constructor(options);
-    }
-
-    startThread(options?: unknown) {
-      return sdk.startThread(options);
-    }
-  },
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
+  spawn: childProcesses.spawn,
 }));
 
 import { codexAgent } from "../src/index.js";
 
+interface SentMessage {
+  id?: number;
+  method: string;
+  params: Record<string, unknown>;
+}
+
 describe("codexAgent", () => {
   beforeEach(() => {
-    sdk.constructor.mockClear();
-    sdk.startThread.mockClear();
-    sdk.run.mockReset();
+    childProcesses.spawn.mockReset();
   });
 
-  it("starts a read-only non-interactive thread by default", async () => {
-    sdk.run.mockResolvedValue({ finalResponse: "fixed" });
-    const agent = codexAgent({ apiKey: "test-key" });
+  it("uses the installed Codex app server and inherits Codex defaults", async () => {
+    const server = fakeAppServer();
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => server.child.emit("spawn"));
+      return server.child;
+    });
 
-    const result = await agent.run({
-      cwd: "/tmp/example-repo",
-      prompt: "Investigate the health failure",
-      event: {
-        id: "event-1",
-        type: "health.failed",
-        environment: "staging",
-        occurredAt: "2026-08-24T12:00:00.000Z",
-        payload: { reason: "latency threshold" },
+    const result = await codexAgent().run(request());
+
+    expect(childProcesses.spawn).toHaveBeenCalledWith(
+      "codex",
+      ["app-server", "--listen", "stdio://"],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    expect(server.message("initialize")?.params).toEqual({
+      clientInfo: {
+        name: "pagent",
+        title: "Pagent",
+        version: "0.0.0",
       },
     });
-
-    expect(sdk.constructor).toHaveBeenCalledWith({ apiKey: "test-key" });
-    expect(sdk.startThread).toHaveBeenCalledWith({
-      approvalPolicy: "never",
-      sandboxMode: "read-only",
-      workingDirectory: "/tmp/example-repo",
+    expect(server.message("thread/start")?.params).toEqual({
+      cwd: process.cwd(),
     });
-    expect(sdk.run).toHaveBeenCalledWith("Investigate the health failure");
+    expect(server.message("turn/start")?.params).toEqual({
+      threadId: "codex-thread-1",
+      input: [
+        {
+          type: "text",
+          text: "Investigate the health failure",
+          text_elements: [],
+        },
+      ],
+    });
     expect(result).toEqual({
       threadId: "codex-thread-1",
-      finalResponse: "fixed",
+      finalResponse: "The threshold caused the failure.",
     });
   });
 
-  it("uses the configured sandbox mode", async () => {
-    sdk.run.mockResolvedValue({ finalResponse: "fixed" });
-    const agent = codexAgent({ sandboxMode: "workspace-write" });
-
-    await agent.run({
-      cwd: "/tmp/example-repo",
-      prompt: "Fix the health failure",
-      event: {
-        id: "event-2",
-        type: "health.failed",
-        environment: "staging",
-        occurredAt: "2026-08-24T12:00:00.000Z",
-        payload: { reason: "latency threshold" },
-      },
+  it("only overrides Codex permissions when configured", async () => {
+    const server = fakeAppServer();
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => server.child.emit("spawn"));
+      return server.child;
     });
 
-    expect(sdk.startThread).toHaveBeenCalledWith({
+    await codexAgent({
       approvalPolicy: "never",
-      sandboxMode: "workspace-write",
-      workingDirectory: "/tmp/example-repo",
+      sandboxMode: "read-only",
+    }).run(request());
+
+    expect(server.message("thread/start")?.params).toEqual({
+      cwd: process.cwd(),
+      approvalPolicy: "never",
+      sandbox: "read-only",
     });
+  });
+
+  it("fails clearly when Codex is not installed", async () => {
+    const child = fakeChild();
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => {
+        child.emit(
+          "error",
+          Object.assign(new Error("spawn codex ENOENT"), { code: "ENOENT" }),
+        );
+      });
+      return child;
+    });
+
+    await expect(codexAgent().run(request())).rejects.toThrow(
+      "Codex CLI was not found on PATH",
+    );
+  });
+
+  it("fails before launching Codex when the repository is not local", async () => {
+    await expect(
+      codexAgent().run(request("/definitely/not/a/local/repository")),
+    ).rejects.toThrow("Clone or download it before starting Pagent");
+    expect(childProcesses.spawn).not.toHaveBeenCalled();
   });
 });
+
+function request(cwd = process.cwd()) {
+  return {
+    cwd,
+    prompt: "Investigate the health failure",
+    event: {
+      id: "event-1",
+      type: "health.failed",
+      environment: "staging",
+      occurredAt: "2026-08-24T12:00:00.000Z",
+      payload: { reason: "latency threshold" },
+    },
+  };
+}
+
+function fakeAppServer() {
+  const child = fakeChild();
+  const sent: SentMessage[] = [];
+  let input = "";
+
+  child.stdin.on("data", (chunk: Buffer | string) => {
+    input += chunk.toString();
+    let newline = input.indexOf("\n");
+
+    while (newline >= 0) {
+      const line = input.slice(0, newline);
+      input = input.slice(newline + 1);
+      const message = JSON.parse(line) as SentMessage;
+      sent.push(message);
+      respond(child, message);
+      newline = input.indexOf("\n");
+    }
+  });
+
+  return {
+    child,
+    message(method: string) {
+      return sent.find((message) => message.method === method);
+    },
+  };
+}
+
+function fakeChild(): ChildProcessWithoutNullStreams {
+  const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+  Object.assign(child, {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: vi.fn(() => true),
+  });
+  return child;
+}
+
+function respond(
+  child: ChildProcessWithoutNullStreams,
+  message: SentMessage,
+): void {
+  const send = (value: unknown) => {
+    (child.stdout as PassThrough).write(`${JSON.stringify(value)}\n`);
+  };
+
+  if (message.method === "initialize") {
+    send({ id: message.id, result: {} });
+  } else if (message.method === "thread/start") {
+    send({
+      id: message.id,
+      result: { thread: { id: "codex-thread-1" } },
+    });
+  } else if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-1" } } });
+    send({
+      method: "item/completed",
+      params: {
+        threadId: "codex-thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "agentMessage",
+          text: "The threshold caused the failure.",
+        },
+      },
+    });
+    send({
+      method: "turn/completed",
+      params: {
+        threadId: "codex-thread-1",
+        turn: {
+          id: "turn-1",
+          status: "completed",
+          error: null,
+          items: [],
+        },
+      },
+    });
+  }
+}
