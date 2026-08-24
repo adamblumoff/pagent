@@ -3,6 +3,7 @@ import {
   createPagent,
   defineEvent,
 } from "../src/index.js";
+import pagentConfig from "../pagent.config.js";
 import { checkHealth, type HealthResult } from "./health.js";
 
 const healthFailed = defineEvent<HealthResult>({
@@ -22,15 +23,14 @@ threshold. This is a simulated incident, so do not change files.
 `.trim(),
 });
 
+const { codex, ...runtimeConfig } = pagentConfig;
 const pagent = createPagent({
-  enabled: process.env.PAGENT_ENABLED === "true",
-  environment: process.env.PAGENT_ENV,
-  cwd: process.cwd(),
-  agent: codexAgent(),
+  ...runtimeConfig,
+  agent: codexAgent(codex),
   onError: (error) => console.error("[pagent] agent run failed", error),
   onAgentResult: (result, event) => {
     console.log(
-      `[pagent] ${event.type} opened ${result.threadId ?? "an unknown thread"}`,
+      `[pagent] ${event.type} diagnosis thread: ${result.threadId ?? "unknown"}`,
     );
     if (result.finalResponse !== undefined) {
       console.log(result.finalResponse);

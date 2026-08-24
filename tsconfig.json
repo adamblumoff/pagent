@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src", "test", "demo"]
+  "include": ["src", "test", "demo", "pagent.config.ts"]
 }

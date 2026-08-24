@@ -1,4 +1,5 @@
 export { codexAgent, type CodexAgentOptions } from "./codex.js";
+export { defineConfig, type PagentConfig } from "./config.js";
 export { createPagent, Pagent } from "./pagent.js";
 export {
   defineEvent,

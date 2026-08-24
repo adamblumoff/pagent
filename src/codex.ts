@@ -21,7 +21,7 @@ export function codexAgent(options: CodexAgentOptions = {}): AgentAdapter {
     async run(request): Promise<AgentResult> {
       const thread = codex.startThread({
         approvalPolicy: options.approvalPolicy ?? "never",
-        sandboxMode: options.sandboxMode ?? "workspace-write",
+        sandboxMode: options.sandboxMode ?? "read-only",
         workingDirectory: request.cwd,
       });
       const result = await thread.run(request.prompt);

@@ -32,7 +32,7 @@ describe("codexAgent", () => {
     sdk.run.mockReset();
   });
 
-  it("starts a writable non-interactive thread in the event repository", async () => {
+  it("starts a read-only non-interactive thread by default", async () => {
     sdk.run.mockResolvedValue({ finalResponse: "fixed" });
     const agent = codexAgent({ apiKey: "test-key" });
 
@@ -51,13 +51,36 @@ describe("codexAgent", () => {
     expect(sdk.constructor).toHaveBeenCalledWith({ apiKey: "test-key" });
     expect(sdk.startThread).toHaveBeenCalledWith({
       approvalPolicy: "never",
-      sandboxMode: "workspace-write",
+      sandboxMode: "read-only",
       workingDirectory: "/tmp/example-repo",
     });
     expect(sdk.run).toHaveBeenCalledWith("Investigate the health failure");
     expect(result).toEqual({
       threadId: "codex-thread-1",
       finalResponse: "fixed",
+    });
+  });
+
+  it("uses the configured sandbox mode", async () => {
+    sdk.run.mockResolvedValue({ finalResponse: "fixed" });
+    const agent = codexAgent({ sandboxMode: "workspace-write" });
+
+    await agent.run({
+      cwd: "/tmp/example-repo",
+      prompt: "Fix the health failure",
+      event: {
+        id: "event-2",
+        type: "health.failed",
+        environment: "staging",
+        occurredAt: "2026-08-24T12:00:00.000Z",
+        payload: { reason: "latency threshold" },
+      },
+    });
+
+    expect(sdk.startThread).toHaveBeenCalledWith({
+      approvalPolicy: "never",
+      sandboxMode: "workspace-write",
+      workingDirectory: "/tmp/example-repo",
     });
   });
 });
