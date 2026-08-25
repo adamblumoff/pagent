@@ -354,7 +354,11 @@ function printDoctorReport(report: DoctorReport): void {
       `${check.status.toUpperCase().padEnd(5)} ${check.label.padEnd(25)} ${check.detail}`,
     );
     if (check.remediation !== undefined) {
-      console.log(`      Fix: ${check.remediation}`);
+      const [summary, ...steps] = check.remediation.split("\n");
+      console.log(`      Fix: ${summary}`);
+      for (const step of steps) {
+        console.log(`           ${step}`);
+      }
     }
   }
   const passed = report.checks.filter(({ status }) => status === "pass").length;

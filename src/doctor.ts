@@ -629,8 +629,15 @@ function sandboxFailure(causeText: string): {
     return {
       detail:
         "Bubblewrap cannot create Codex's Linux sandbox because the host blocked its user or network namespace.",
-      remediation:
-        "Add `use_legacy_landlock = true` under `[features]` in `~/.codex/config.toml`, then rerun `pagent doctor`. If that backend is unavailable, allow Codex's Bubblewrap helper to create user namespaces with a scoped AppArmor profile or run Pagent outside the restricted container. Do not disable AppArmor globally.",
+      remediation: [
+        "On Ubuntu 24.04, load the scoped Bubblewrap AppArmor profile documented by OpenAI:",
+        "sudo apt update",
+        "sudo apt install apparmor-profiles apparmor-utils",
+        "sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict",
+        "sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict",
+        "Then rerun `pagent doctor`. Do not disable AppArmor globally or enable Codex's deprecated `use_legacy_landlock` fallback.",
+        "OpenAI docs: https://learn.chatgpt.com/docs/sandboxing",
+      ].join("\n"),
     };
   }
   if (
@@ -640,7 +647,7 @@ function sandboxFailure(causeText: string): {
     return {
       detail: "Codex cannot find its Bubblewrap sandbox helper.",
       remediation:
-        "Update Codex first. If Codex still reports a missing system helper, install your Linux distribution's `bubblewrap` package, then rerun `pagent doctor`.",
+        "Install your Linux distribution's `bubblewrap` package (`sudo apt install bubblewrap` on Ubuntu/Debian or `sudo dnf install bubblewrap` on Fedora), then rerun `pagent doctor`.",
     };
   }
   return {

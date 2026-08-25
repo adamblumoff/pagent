@@ -193,12 +193,46 @@ describe("runDoctor", () => {
     expect(check(report, "sandbox.runtime")).toMatchObject({
       status: "fail",
       detail: expect.stringContaining("host blocked"),
-      remediation: expect.stringContaining("use_legacy_landlock = true"),
+      remediation: expect.stringContaining(
+        "sudo apt install apparmor-profiles apparmor-utils",
+      ),
     });
+    expect(check(report, "sandbox.runtime").remediation).toContain(
+      "sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict",
+    );
+    expect(check(report, "sandbox.runtime").remediation).toContain(
+      "deprecated `use_legacy_landlock` fallback",
+    );
+    expect(check(report, "sandbox.runtime").remediation).toContain(
+      "https://learn.chatgpt.com/docs/sandboxing",
+    );
     expect(report.checks.map(({ id }) => id)).not.toContain("worktree");
     expect(report.checks.map(({ id }) => id)).not.toContain("sandbox");
     expect(report.ok).toBe(false);
     expect(JSON.stringify(report)).not.toContain("secret=hidden");
+  });
+
+  it("recommends the system Bubblewrap package when the helper is missing", async () => {
+    const report = await runDoctor(
+      input({ includeAdvisories: false }),
+      dependencies({
+        probeCodex: vi.fn(async () => {
+          throw new CodexSandboxProbeError(
+            "bubblewrap: ENOENT secret=should-not-leak",
+          );
+        }),
+      }),
+    );
+
+    expect(check(report, "sandbox.runtime")).toMatchObject({
+      status: "fail",
+      detail: expect.stringContaining("cannot find"),
+      remediation: expect.stringContaining("sudo apt install bubblewrap"),
+    });
+    expect(check(report, "sandbox.runtime").remediation).toContain(
+      "sudo dnf install bubblewrap",
+    );
+    expect(JSON.stringify(report)).not.toContain("should-not-leak");
   });
 });
 
