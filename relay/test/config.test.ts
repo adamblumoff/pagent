@@ -4,15 +4,15 @@ import { describe, it } from "node:test";
 import { loadConfig } from "../src/config.js";
 
 describe("relay config", () => {
-  it("allows enrollment-only bootstrap", () => {
+  it("allows admin-only bootstrap", () => {
     assert.deepEqual(
-      loadConfig({ PAGENT_ENROLLMENT_TOKEN: " enrollment-secret " }),
+      loadConfig({ PAGENT_ADMIN_TOKEN: " admin-secret " }),
       {
         port: 3000,
         heartbeatMs: 15_000,
         sources: [],
         connectors: [],
-        enrollmentToken: "enrollment-secret",
+        adminToken: "admin-secret",
       },
     );
   });
@@ -37,18 +37,22 @@ describe("relay config", () => {
     assert.deepEqual(config.connectors, [
       { id: "connector", token: "connector-secret" },
     ]);
-    assert.equal(config.enrollmentToken, undefined);
+    assert.equal(config.adminToken, undefined);
   });
 
   it("rejects an inert config and incomplete static credentials", () => {
-    assert.throws(() => loadConfig({}), /static source.*enrollment/i);
+    assert.throws(() => loadConfig({}), /static source.*admin/i);
     assert.throws(
       () =>
         loadConfig({
-          PAGENT_ENROLLMENT_TOKEN: "enrollment-secret",
+          PAGENT_ADMIN_TOKEN: "admin-secret",
           PAGENT_SOURCE_TOKEN: "partial-source",
         }),
       /PAGENT_REPOSITORY_KEY is required/,
+    );
+    assert.throws(
+      () => loadConfig({ PAGENT_ENROLLMENT_TOKEN: "legacy" }),
+      /no longer supported/i,
     );
   });
 });

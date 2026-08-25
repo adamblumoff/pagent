@@ -9,6 +9,10 @@ import { parseEnv } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { createRelayServer } from "../relay/src/server.js";
+import type { RelayConfig } from "../relay/src/types.js";
+import { RecordingRelayStore } from "../relay/test/recording-store.js";
+
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -28,47 +32,16 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
     await runProcess("git", ["init", "--quiet"], root);
     await fakeInstalledPackage(root);
 
-    let enrollment: Record<string, unknown> | undefined;
-    const relay = createServer(async (request, response) => {
-      if (request.method === "POST" && request.url === "/v1/enroll") {
-        if (request.headers.authorization !== "Bearer enrollment-secret") {
-          response.writeHead(401).end();
-          return;
-        }
-        let body = "";
-        request.setEncoding("utf8");
-        for await (const chunk of request) body += chunk;
-        enrollment = JSON.parse(body) as Record<string, unknown>;
-        response.writeHead(201, { "content-type": "application/json" });
-        response.end('{"status":"enrolled"}\n');
-        return;
-      }
-      if (request.url === "/health") {
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end('{"status":"ok"}\n');
-        return;
-      }
-      if (
-        request.method === "GET" &&
-        request.url ===
-          `/v1/connectors/${encodeURIComponent(String(enrollment?.connectorId))}/events`
-      ) {
-        const token = request.headers.authorization?.replace(/^Bearer /u, "");
-        if (
-          token === undefined ||
-          sha256(token) !== enrollment?.connectorTokenHash
-        ) {
-          response.writeHead(401).end();
-          return;
-        }
-        response.writeHead(200, {
-          "content-type": "text/event-stream",
-          "cache-control": "no-cache",
-        });
-        response.write(": connected\n\n");
-        return;
-      }
-      response.writeHead(404).end();
+    const store = new RecordingRelayStore();
+    const relay = createRelayServer({
+      config: {
+        port: 0,
+        heartbeatMs: 100,
+        sources: [],
+        connectors: [],
+        adminToken: "admin-secret",
+      } satisfies RelayConfig,
+      store,
     });
     relay.listen(0, "127.0.0.1");
     await new Promise<void>((resolveListen) =>
@@ -80,13 +53,31 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
     }
 
     try {
+      const code = await runCli(
+        [
+          "enrollment",
+          "create",
+          "--relay",
+          `http://127.0.0.1:${address.port}`,
+          "--admin-token",
+          "admin-secret",
+          "--ttl",
+          "15",
+        ],
+        process.env,
+        root,
+      );
+      expect(code.code).toBe(0);
+      expect(code.stdout.trim()).toMatch(/^pge_[A-Za-z0-9_-]{43}$/u);
+      expect(code.stdout).not.toContain("admin-secret");
+
       const result = await runCli(
         [
           "init",
           "--relay",
           `http://127.0.0.1:${address.port}`,
           "--enrollment",
-          "enrollment-secret",
+          code.stdout.trim(),
           "--yes",
           "--no-start",
         ],
@@ -106,8 +97,8 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
 
       const local = parseEnv(await readFile(join(root, ".pagent/local.env"), "utf8"));
       const cloud = parseEnv(await readFile(join(root, ".pagent/cloud.env"), "utf8"));
-      expect(enrollment).toMatchObject({
-        version: 1,
+      const enrolled = store.enrollments[0];
+      expect(enrolled).toMatchObject({
         repositoryKey: basename(root).toLowerCase(),
         allowedEnvironments: ["staging"],
         sourceTokenHash: sha256(cloud.PAGENT_RELAY_TOKEN!),
@@ -116,9 +107,74 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
       expect(await readFile(join(root, ".gitignore"), "utf8")).toContain(
         ".pagent/",
       );
+
+      const originalConnectorId = enrolled!.connectorId;
+      const originalSourceHash = enrolled!.sourceTokenHash;
+      const rotationCode = await runCli(
+        [
+          "enrollment",
+          "create",
+          "--relay",
+          `http://127.0.0.1:${address.port}`,
+          "--admin-token",
+          "admin-secret",
+          "--connector",
+          originalConnectorId,
+        ],
+        process.env,
+        root,
+      );
+      const rotated = await runCli(
+        [
+          "init",
+          "--relay",
+          `http://127.0.0.1:${address.port}`,
+          "--enrollment",
+          rotationCode.stdout.trim(),
+          "--yes",
+          "--no-start",
+          "--reset",
+        ],
+        {
+          ...process.env,
+          PATH: `${binDirectory}${delimiter}${process.env.PATH ?? ""}`,
+        },
+        root,
+      );
+      expect(rotated.code, JSON.stringify(rotated)).toBe(0);
+      const rotatedEnrollment = store.enrollments[0];
+      expect(rotatedEnrollment).toMatchObject({
+        connectorId: originalConnectorId,
+        replace: true,
+      });
+      expect(rotatedEnrollment?.sourceTokenHash).not.toBe(originalSourceHash);
+
+      const revoke = await runCli(
+        [
+          "connector",
+          "revoke",
+          originalConnectorId,
+          "--relay",
+          `http://127.0.0.1:${address.port}`,
+          "--admin-token",
+          "admin-secret",
+          "--yes",
+        ],
+        process.env,
+        root,
+      );
+      expect(revoke.code).toBe(0);
+      expect(revoke.stdout).toContain("Revoked connector");
+      expect(
+        await store.authorizeConnector(
+          originalConnectorId,
+          rotatedEnrollment!.connectorTokenHash,
+        ),
+      ).toBe(false);
     } finally {
       relay.closeAllConnections();
       await new Promise<void>((resolveClose) => relay.close(() => resolveClose()));
+      await store.close();
     }
   }, 30_000);
 

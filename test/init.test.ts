@@ -22,7 +22,7 @@ import {
 } from "../src/init.js";
 
 const execFileAsync = promisify(execFile);
-const ENROLLMENT_TOKEN = "pg_enroll_test-secret";
+const ENROLLMENT_CODE = "pge_test-secret";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -45,7 +45,7 @@ describe("project initialization", () => {
       {
         cwd: nested,
         relayUrl: "https://relay.example.test/",
-        enrollmentToken: ENROLLMENT_TOKEN,
+        enrollmentCode: ENROLLMENT_CODE,
         environments: ["staging", "production"],
       },
       dependencies(fetchEnrollment),
@@ -71,7 +71,7 @@ describe("project initialization", () => {
     expect(config).toContain(
       'stateDirectory: join(repositoryDirectory, ".pagent", "state")',
     );
-    expect(config).not.toContain(ENROLLMENT_TOKEN);
+    expect(config).not.toContain(ENROLLMENT_CODE);
     expect(config).not.toContain(local.PAGENT_CONNECTOR_TOKEN);
     expect(config).not.toContain(cloud.PAGENT_RELAY_TOKEN);
     expect(config).not.toContain(cloud.PAGENT_ENCRYPTION_KEY);
@@ -100,7 +100,7 @@ describe("project initialization", () => {
     expect(url.toString()).toBe("https://relay.example.test/v1/enroll");
     expect(request.method).toBe("POST");
     expect(request.headers).toEqual({
-      authorization: `Bearer ${ENROLLMENT_TOKEN}`,
+      authorization: `Bearer ${ENROLLMENT_CODE}`,
       "content-type": "application/json",
     });
     expect(request.signal).toBeInstanceOf(AbortSignal);
@@ -112,10 +112,11 @@ describe("project initialization", () => {
       allowedEnvironments: ["staging", "production"],
       sourceTokenHash: hash(cloud.PAGENT_RELAY_TOKEN!),
       connectorTokenHash: hash(local.PAGENT_CONNECTOR_TOKEN!),
+      replace: false,
     });
     expect(JSON.stringify(body)).not.toContain(cloud.PAGENT_RELAY_TOKEN);
     expect(JSON.stringify(body)).not.toContain(local.PAGENT_CONNECTOR_TOKEN);
-    expect(JSON.stringify(result)).not.toContain(ENROLLMENT_TOKEN);
+    expect(JSON.stringify(result)).not.toContain(ENROLLMENT_CODE);
     expect(JSON.stringify(result)).not.toContain(cloud.PAGENT_ENCRYPTION_KEY);
   });
 
@@ -127,7 +128,7 @@ describe("project initialization", () => {
       {
         cwd: root,
         relayUrl: "http://127.0.0.1:8787",
-        enrollmentToken: ENROLLMENT_TOKEN,
+        enrollmentCode: ENROLLMENT_CODE,
       },
       dependencies(successfulFetch()),
     );
@@ -157,8 +158,13 @@ describe("project initialization", () => {
     expect(await readFile(first.configPath, "utf8")).toBe(originalConfig);
 
     const reset = await runProjectInit(
-      { ...initOptions(root), reset: true, environments: ["production"] },
-      dependencies(successfulFetch(), 90),
+      {
+        ...initOptions(root),
+        reset: true,
+        connectorId: first.connectorId,
+        environments: ["production"],
+      },
+      dependencies(successfulFetch("rotated"), 90),
     );
     expect(reset.environments).toEqual(["production"]);
     expect(await readFile(reset.configPath, "utf8")).toContain(
@@ -210,6 +216,9 @@ describe("project initialization", () => {
     await expect(access(join(root, ".pagent"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+    await expect(
+      access(join(root, ".git", "pagent", "pending-init.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(join(root, ".gitignore"), "utf8")).toBe("dist/\n");
   });
 
@@ -226,18 +235,47 @@ describe("project initialization", () => {
       ),
     );
     await expect(httpError).rejects.toThrow("Relay enrollment failed with HTTP 500");
-    await expect(httpError).rejects.not.toThrow(ENROLLMENT_TOKEN);
+    await expect(httpError).rejects.not.toThrow(ENROLLMENT_CODE);
 
     const networkError = runProjectInit(
       initOptions(root),
       dependencies(
         vi
           .fn<EnrollmentFetch>()
-          .mockRejectedValue(new Error(`upstream echoed ${ENROLLMENT_TOKEN}`)),
+          .mockRejectedValue(new Error(`upstream echoed ${ENROLLMENT_CODE}`)),
       ),
     );
     await expect(networkError).rejects.toThrow("Pagent could not reach the relay");
-    await expect(networkError).rejects.not.toThrow(ENROLLMENT_TOKEN);
+    await expect(networkError).rejects.not.toThrow(ENROLLMENT_CODE);
+  });
+
+  it("reuses pending credentials after an ambiguous network failure", async () => {
+    const root = await repository("api");
+    const fetchEnrollment = vi
+      .fn<EnrollmentFetch>()
+      .mockRejectedValueOnce(new Error("connection closed after request"))
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: "existing" }),
+      });
+
+    await expect(
+      runProjectInit(initOptions(root), dependencies(fetchEnrollment, 1)),
+    ).rejects.toThrow("could not reach the relay");
+    await expect(
+      access(join(root, ".git", "pagent", "pending-init.json")),
+    ).resolves.toBeUndefined();
+
+    await runProjectInit(initOptions(root), dependencies(fetchEnrollment, 90));
+
+    expect(fetchEnrollment).toHaveBeenCalledTimes(2);
+    expect(fetchEnrollment.mock.calls[1]?.[1].body).toBe(
+      fetchEnrollment.mock.calls[0]?.[1].body,
+    );
+    await expect(
+      access(join(root, ".git", "pagent", "pending-init.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects an HTML or malformed success response", async () => {
@@ -246,7 +284,7 @@ describe("project initialization", () => {
       ok: true,
       status: 200,
       json: async () => {
-        throw new SyntaxError(`unexpected ${ENROLLMENT_TOKEN}`);
+        throw new SyntaxError(`unexpected ${ENROLLMENT_CODE}`);
       },
     });
 
@@ -257,7 +295,7 @@ describe("project initialization", () => {
     await expect(initialization).rejects.toThrow(
       "Relay enrollment returned an invalid response with HTTP 200",
     );
-    await expect(initialization).rejects.not.toThrow(ENROLLMENT_TOKEN);
+    await expect(initialization).rejects.not.toThrow(ENROLLMENT_CODE);
     await expect(access(join(root, ".pagent"))).rejects.toMatchObject({
       code: "ENOENT",
     });
@@ -271,7 +309,7 @@ describe("project initialization", () => {
       runProjectInit(initOptions(root), {
         ...dependencies(fetchEnrollment),
         probeCodex: async () => {
-          throw new Error(`not signed in ${ENROLLMENT_TOKEN}`);
+          throw new Error(`not signed in ${ENROLLMENT_CODE}`);
         },
       }),
     ).rejects.toThrow(
@@ -284,20 +322,20 @@ describe("project initialization", () => {
 function initOptions(root: string): {
   cwd: string;
   relayUrl: string;
-  enrollmentToken: string;
+  enrollmentCode: string;
 } {
   return {
     cwd: root,
     relayUrl: "https://relay.example.test",
-    enrollmentToken: ENROLLMENT_TOKEN,
+    enrollmentCode: ENROLLMENT_CODE,
   };
 }
 
-function successfulFetch() {
+function successfulFetch(status: "enrolled" | "rotated" = "enrolled") {
   return vi.fn<EnrollmentFetch>().mockResolvedValue({
     ok: true,
     status: 201,
-    json: async () => ({ status: "enrolled" }),
+    json: async () => ({ status }),
   });
 }
 

@@ -4,7 +4,10 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { loadConnectorConfig } from "../src/local-config.js";
+import {
+  invalidateConnectorConfigCache,
+  loadConnectorConfig,
+} from "../src/local-config.js";
 
 const KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const temporaryDirectories: string[] = [];
@@ -77,6 +80,28 @@ describe("local connector config", () => {
 
     await expect(loadConnectorConfig({ cwd: root })).rejects.toThrow(
       "is invalid. Relay settings are required.",
+    );
+  });
+
+  it("reloads a config after reset invalidates the module cache", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "pagent.config.mjs");
+    const config = (url: string) => `export default {
+      relay: { url: ${JSON.stringify(url)}, token: "secret", connectorId: "local" },
+      repositories: { pagent: ${JSON.stringify(root)} },
+      environments: ["staging"],
+      encryption: { keys: { current: ${JSON.stringify(KEY)} } }
+    };\n`;
+    await writeFile(path, config("https://old.example.test"));
+    expect((await loadConnectorConfig({ cwd: root })).config.relay.url).toBe(
+      "https://old.example.test",
+    );
+
+    await writeFile(path, config("https://new.example.test"));
+    invalidateConnectorConfigCache();
+
+    expect((await loadConnectorConfig({ cwd: root })).config.relay.url).toBe(
+      "https://new.example.test",
     );
   });
 

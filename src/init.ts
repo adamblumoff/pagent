@@ -29,10 +29,10 @@ const CONFIG_NAMES = [
 export interface ProjectInitOptions {
   cwd?: string | undefined;
   relayUrl: string;
-  enrollmentToken: string;
+  enrollmentCode: string;
   environments?: readonly string[] | undefined;
   reset?: boolean | undefined;
-  /** Intended for controlled tests and migrations, not the public CLI. */
+  /** Existing connector identity required when reset rotates credentials. */
   connectorId?: string | undefined;
 }
 
@@ -51,6 +51,7 @@ export interface ProjectInitResult {
 export interface ProjectInitDependencies {
   fetch?: EnrollmentFetch | undefined;
   findGitRoot?: ((cwd: string) => Promise<string>) | undefined;
+  findGitStateDirectory?: ((cwd: string) => Promise<string>) | undefined;
   probeCodex?: (() => Promise<void>) | undefined;
   randomBytes?: ((size: number) => Uint8Array) | undefined;
   hostname?: (() => string) | undefined;
@@ -74,52 +75,113 @@ interface FileSnapshot {
   mode?: number | undefined;
 }
 
+interface PendingInit {
+  version: 1;
+  projectDirectory: string;
+  relayUrl: string;
+  enrollmentCodeHash: string;
+  connectorId: string;
+  repositoryKey: string;
+  environments: string[];
+  replace: boolean;
+  sourceToken: string;
+  connectorToken: string;
+  contextKey: string;
+}
+
+class EnrollmentRequestError extends Error {
+  readonly retrySameCode: boolean;
+
+  constructor(message: string, retrySameCode: boolean) {
+    super(message);
+    this.name = "EnrollmentRequestError";
+    this.retrySameCode = retrySameCode;
+  }
+}
+
 export async function runProjectInit(
   options: ProjectInitOptions,
   dependencies: ProjectInitDependencies = {},
 ): Promise<ProjectInitResult> {
   const relayUrl = normalizeRelayUrl(options.relayUrl);
-  const enrollmentToken = requiredSecret(
-    options.enrollmentToken,
-    "Enrollment token",
+  const enrollmentCode = requiredSecret(
+    options.enrollmentCode,
+    "Enrollment code",
   );
   const environments = normalizeEnvironments(options.environments);
   const cwd = resolve(options.cwd ?? process.cwd());
   const findGitRoot = dependencies.findGitRoot ?? defaultFindGitRoot;
   const projectDirectory = resolve(await findGitRoot(cwd));
+  const gitStateDirectory = resolve(
+    await (dependencies.findGitStateDirectory ?? defaultGitStateDirectory)(
+      projectDirectory,
+    ),
+  );
   const repositoryKey = identifier(basename(projectDirectory), "repository");
   const paths = setupPaths(projectDirectory);
+  const pendingPath = join(gitStateDirectory, "pending-init.json");
 
   await requireAvailableTargets(projectDirectory, paths, options.reset === true);
   const existingGitIgnore = await readOptionalText(paths.gitIgnorePath);
   await requireCodex(dependencies.probeCodex);
 
   const makeRandomBytes = dependencies.randomBytes ?? randomBytes;
-  const connectorId =
+  if (options.reset === true && options.connectorId === undefined) {
+    throw new Error(
+      "Pagent reset needs the existing connector identity. Restore the current config or revoke the connector before initializing again.",
+    );
+  }
+  const requestedConnectorId =
     options.connectorId === undefined
-      ? generatedConnectorId(
+      ? undefined
+      : requiredIdentifier(options.connectorId, "Connector ID");
+  const previousPending = await readPendingInit(pendingPath);
+  const pending =
+    previousPending ??
+    {
+      version: 1,
+      projectDirectory,
+      relayUrl,
+      enrollmentCodeHash: tokenHash(enrollmentCode),
+      connectorId:
+        requestedConnectorId ??
+        generatedConnectorId(
           repositoryKey,
           (dependencies.hostname ?? hostname)(),
           makeRandomBytes,
-        )
-      : requiredIdentifier(options.connectorId, "Connector ID");
-  const sourceToken = `pgsrc_${encode(makeRandomBytes(32))}`;
-  const connectorToken = `pgcon_${encode(makeRandomBytes(32))}`;
-  const contextKey = encode(makeRandomBytes(32));
-
-  await enroll(
-    {
-      relayUrl,
-      enrollmentToken,
-      connectorId,
+        ),
       repositoryKey,
       environments,
-      sourceToken,
-      connectorToken,
-    },
-    dependencies.fetch ?? defaultFetch,
-    dependencies.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-  );
+      replace: options.reset === true,
+      sourceToken: `pgsrc_${encode(makeRandomBytes(32))}`,
+      connectorToken: `pgcon_${encode(makeRandomBytes(32))}`,
+      contextKey: encode(makeRandomBytes(32)),
+    } satisfies PendingInit;
+  assertPendingMatches(pending, {
+    projectDirectory,
+    relayUrl,
+    enrollmentCode,
+    connectorId: requestedConnectorId,
+    repositoryKey,
+    environments,
+    replace: options.reset === true,
+  });
+  if (previousPending === undefined) await writePendingInit(pendingPath, pending);
+
+  try {
+    await enroll(
+      { ...pending, enrollmentCode },
+      dependencies.fetch ?? defaultFetch,
+      dependencies.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    );
+  } catch (error) {
+    if (error instanceof EnrollmentRequestError && !error.retrySameCode) {
+      await rm(pendingPath, { force: true });
+    }
+    throw error;
+  }
+
+  const { connectorId, sourceToken, connectorToken, contextKey } = pending;
 
   const keyring = JSON.stringify({ [KEY_ID]: contextKey });
   const files: SetupFile[] = [
@@ -161,6 +223,7 @@ export async function runProjectInit(
   ];
 
   await writeSetupFiles(paths.setupDirectory, files);
+  await rm(pendingPath, { force: true });
 
   return {
     projectDirectory,
@@ -194,6 +257,23 @@ async function defaultFindGitRoot(cwd: string): Promise<string> {
   );
 }
 
+async function defaultGitStateDirectory(cwd: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["rev-parse", "--git-path", "pagent"],
+      { cwd, encoding: "utf8" },
+    );
+    const path = stdout.trim();
+    if (path !== "") return resolve(cwd, path);
+  } catch {
+    // The Git-root check already gives the common remediation.
+  }
+  throw new Error(
+    "Pagent could not find writable Git metadata for enrollment recovery.",
+  );
+}
+
 async function requireCodex(probe: (() => Promise<void>) | undefined): Promise<void> {
   try {
     await (probe ?? (() => probeCodexAppServer({ timeoutMs: 5_000 })))();
@@ -207,12 +287,13 @@ async function requireCodex(probe: (() => Promise<void>) | undefined): Promise<v
 async function enroll(
   input: {
     relayUrl: string;
-    enrollmentToken: string;
+    enrollmentCode: string;
     connectorId: string;
     repositoryKey: string;
     environments: readonly string[];
     sourceToken: string;
     connectorToken: string;
+    replace: boolean;
   },
   fetchEnrollment: EnrollmentFetch,
   timeoutMs: number,
@@ -226,7 +307,7 @@ async function enroll(
     response = await fetchEnrollment(new URL("/v1/enroll", input.relayUrl), {
       method: "POST",
       headers: {
-        authorization: `Bearer ${input.enrollmentToken}`,
+        authorization: `Bearer ${input.enrollmentCode}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({
@@ -236,18 +317,24 @@ async function enroll(
         allowedEnvironments: input.environments,
         sourceTokenHash: tokenHash(input.sourceToken),
         connectorTokenHash: tokenHash(input.connectorToken),
+        replace: input.replace,
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
-    throw new Error(
+    throw new EnrollmentRequestError(
       "Pagent could not reach the relay enrollment endpoint. Check the relay URL and network connection, then run `pagent init` again.",
+      true,
     );
   }
 
   if (!response.ok) {
-    throw new Error(
-      `Relay enrollment failed with HTTP ${response.status}. Check the enrollment code and relay configuration, then run \`pagent init\` again.`,
+    const remediation = input.replace
+      ? `Issue a rotation code for connector ${input.connectorId} with \`pagent enrollment create --connector ${input.connectorId}\`, then run \`pagent init --reset\` again.`
+      : "Check the enrollment code and relay configuration, then run `pagent init` again.";
+    throw new EnrollmentRequestError(
+      `Relay enrollment failed with HTTP ${response.status}. ${remediation}`,
+      response.status >= 500,
     );
   }
 
@@ -261,15 +348,18 @@ async function enroll(
     typeof result !== "object" ||
     result === null ||
     !("status" in result) ||
-    (result.status !== "enrolled" && result.status !== "existing")
+    result.status !== "enrolled" &&
+    result.status !== "rotated" &&
+    result.status !== "existing"
   ) {
     throw invalidEnrollmentResponse(response.status);
   }
 }
 
 function invalidEnrollmentResponse(status: number): Error {
-  return new Error(
+  return new EnrollmentRequestError(
     `Relay enrollment returned an invalid response with HTTP ${status}. Check that the relay supports enrollment, then run \`pagent init\` again.`,
+    true,
   );
 }
 
@@ -479,7 +569,7 @@ function addGitIgnoreEntry(current: string | undefined): string {
   return `${current.endsWith("\n") ? current : `${current}\n`}.pagent/\n`;
 }
 
-function normalizeRelayUrl(value: string): string {
+export function normalizeRelayUrl(value: string): string {
   let url: URL;
   try {
     url = new URL(value);
@@ -582,6 +672,91 @@ function encode(value: Uint8Array): string {
   return Buffer.from(value).toString("base64url");
 }
 
+async function readPendingInit(path: string): Promise<PendingInit | undefined> {
+  const contents = await readOptionalText(path);
+  if (contents === undefined) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(contents);
+  } catch {
+    throw invalidPendingInit(path);
+  }
+  const pending = record(value);
+  if (
+    pending?.version !== 1 ||
+    typeof pending.projectDirectory !== "string" ||
+    typeof pending.relayUrl !== "string" ||
+    typeof pending.enrollmentCodeHash !== "string" ||
+    typeof pending.connectorId !== "string" ||
+    typeof pending.repositoryKey !== "string" ||
+    !Array.isArray(pending.environments) ||
+    !pending.environments.every((item) => typeof item === "string") ||
+    typeof pending.replace !== "boolean" ||
+    typeof pending.sourceToken !== "string" ||
+    typeof pending.connectorToken !== "string" ||
+    typeof pending.contextKey !== "string"
+  ) {
+    throw invalidPendingInit(path);
+  }
+  return pending as unknown as PendingInit;
+}
+
+function assertPendingMatches(
+  pending: PendingInit,
+  requested: {
+    projectDirectory: string;
+    relayUrl: string;
+    enrollmentCode: string;
+    connectorId: string | undefined;
+    repositoryKey: string;
+    environments: readonly string[];
+    replace: boolean;
+  },
+): void {
+  if (
+    pending.projectDirectory !== requested.projectDirectory ||
+    pending.relayUrl !== requested.relayUrl ||
+    pending.enrollmentCodeHash !== tokenHash(requested.enrollmentCode) ||
+    (requested.connectorId !== undefined &&
+      pending.connectorId !== requested.connectorId) ||
+    pending.repositoryKey !== requested.repositoryKey ||
+    pending.replace !== requested.replace ||
+    JSON.stringify(pending.environments) !==
+      JSON.stringify(requested.environments)
+  ) {
+    throw new Error(
+      "Pagent found an unfinished enrollment with different options. Retry the original command and enrollment code before changing the setup.",
+    );
+  }
+}
+
+async function writePendingInit(
+  path: string,
+  pending: PendingInit,
+): Promise<void> {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await chmod(directory, 0o700);
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(pending)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await rename(temporaryPath, path);
+    if (process.platform !== "win32") await chmod(path, 0o600);
+  } catch (error) {
+    await rm(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
+function invalidPendingInit(path: string): Error {
+  return new Error(
+    `Pagent cannot read its pending enrollment at ${path}. Restore that file or revoke the connector before trying again.`,
+  );
+}
+
 async function readOptionalText(path: string): Promise<string | undefined> {
   try {
     return await readFile(path, "utf8");
@@ -607,4 +782,10 @@ async function exists(path: string): Promise<boolean> {
 
 function isMissing(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }

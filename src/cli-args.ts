@@ -1,5 +1,7 @@
 export const cliCommandNames = [
   "init",
+  "enrollment",
+  "connector",
   "start",
   "stop",
   "status",
@@ -20,6 +22,20 @@ export type CliCommand =
       yes: boolean;
       noStart: boolean;
       reset: boolean;
+    }
+  | {
+      name: "enrollment";
+      relay: string | undefined;
+      adminToken: string | undefined;
+      ttlMinutes: number;
+      connectorId: string | undefined;
+    }
+  | {
+      name: "connector";
+      connectorId: string;
+      relay: string | undefined;
+      adminToken: string | undefined;
+      yes: boolean;
     }
   | {
       name: "start";
@@ -66,12 +82,31 @@ Enroll this repository and write its local configuration.
 
 Options:
   --relay <url>           Relay URL
-  --enrollment <token>   Relay enrollment token
+  --enrollment <code>    Single-use enrollment code
   --environments <list>  Comma-separated environments (default: staging)
   --yes                   Skip the confirmation prompt
   --no-start              Do not start the connector after setup
   --reset                 Replace an existing Pagent setup
   -h, --help              Show help for init`,
+  enrollment: `Usage: pagent enrollment create [options]
+
+Create a short-lived, single-use enrollment code.
+
+Options:
+  --relay <url>          Relay URL
+  --admin-token <token> Relay administrator token
+  --ttl <minutes>       Code lifetime from 1 to 1440 minutes (default: 15)
+  --connector <id>      Scope the code to rotating this connector
+  -h, --help            Show help for enrollment`,
+  connector: `Usage: pagent connector revoke <connector-id> [options]
+
+Revoke a dynamic connector and close its relay streams.
+
+Options:
+  --relay <url>          Relay URL
+  --admin-token <token> Relay administrator token
+  --yes                  Skip the confirmation prompt
+  -h, --help             Show help for connector`,
   start: `Usage: pagent start [options]
 
 Start the local connector in the background.
@@ -121,14 +156,16 @@ const generalHelp = `Usage: pagent <command> [options]
 Run and inspect the local Pagent connector.
 
 Commands:
-  init     Enroll this repository and write its configuration
-  start    Start the connector (background by default)
-  stop     Stop the connector gracefully
-  status   Show connector state
-  logs     Read connector logs
-  doctor   Check the local setup without changing it
-  help     Show help for a command
-  version  Print the installed version
+  init        Enroll this repository and write its configuration
+  enrollment  Create a single-use enrollment code
+  connector   Revoke a connector
+  start       Start the connector (background by default)
+  stop        Stop the connector gracefully
+  status      Show connector state
+  logs        Read connector logs
+  doctor      Check the local setup without changing it
+  help        Show help for a command
+  version     Print the installed version
 
 Run \`pagent help <command>\` for command-specific options.`;
 
@@ -173,6 +210,10 @@ export function parseCliArgs(args: readonly string[]): CliCommand {
   switch (first) {
     case "init":
       return parseInit(rest);
+    case "enrollment":
+      return parseEnrollment(rest);
+    case "connector":
+      return parseConnector(rest);
     case "start":
       return parseStart(rest);
     case "stop":
@@ -190,6 +231,120 @@ export function parseCliArgs(args: readonly string[]): CliCommand {
       requireNoCommandArgs(first, rest);
       return { name: "version" };
   }
+}
+
+function parseEnrollment(args: readonly string[]): CliCommand {
+  if (args[0] !== "create") {
+    throw new CliUsageError(
+      'The enrollment command requires the action "create".',
+    );
+  }
+  let relay: string | undefined;
+  let adminToken: string | undefined;
+  let connectorId: string | undefined;
+  let ttlMinutes = 15;
+  let hasTtl = false;
+
+  for (let index = 1; index < args.length; index += 1) {
+    const arg = args[index]!;
+    const option = valueOption(arg, [
+      "--relay",
+      "--admin-token",
+      "--ttl",
+      "--connector",
+    ]);
+    if (!option) rejectCommandArg("enrollment", arg);
+    const duplicate =
+      (option.flag === "--relay" && relay !== undefined) ||
+      (option.flag === "--admin-token" && adminToken !== undefined) ||
+      (option.flag === "--connector" && connectorId !== undefined) ||
+      (option.flag === "--ttl" && hasTtl);
+    if (duplicate) throw duplicateOption("enrollment", option.flag);
+    const value = optionValue(option, args[index + 1]);
+    if (option.inlineValue === undefined) index += 1;
+    if (option.flag === "--relay") relay = value;
+    else if (option.flag === "--admin-token") adminToken = value;
+    else if (option.flag === "--connector") connectorId = value;
+    else {
+      ttlMinutes = parsePositiveInteger("--ttl", value);
+      if (ttlMinutes > 1_440) {
+        throw new CliUsageError('Option "--ttl" cannot exceed 1440 minutes.');
+      }
+      hasTtl = true;
+    }
+  }
+  return {
+    name: "enrollment",
+    relay,
+    adminToken,
+    ttlMinutes,
+    connectorId,
+  };
+}
+
+function parseConnector(args: readonly string[]): CliCommand {
+  if (args[0] !== "revoke" || args[1] === undefined || args[1].startsWith("-")) {
+    throw new CliUsageError(
+      'Usage: pagent connector revoke <connector-id> [options].',
+    );
+  }
+  const connectorId = args[1];
+  let relay: string | undefined;
+  let adminToken: string | undefined;
+  let yes = false;
+
+  for (let index = 2; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--yes") {
+      yes = setOnce("connector", arg, yes);
+      continue;
+    }
+    const option = valueOption(arg, ["--relay", "--admin-token"]);
+    if (!option) rejectCommandArg("connector", arg);
+    const duplicate =
+      (option.flag === "--relay" && relay !== undefined) ||
+      (option.flag === "--admin-token" && adminToken !== undefined);
+    if (duplicate) throw duplicateOption("connector", option.flag);
+    const value = optionValue(option, args[index + 1]);
+    if (option.inlineValue === undefined) index += 1;
+    if (option.flag === "--relay") relay = value;
+    else adminToken = value;
+  }
+  return {
+    name: "connector",
+    connectorId,
+    relay,
+    adminToken,
+    yes,
+  };
+}
+
+function valueOption<const TFlag extends string>(
+  arg: string,
+  flags: readonly TFlag[],
+): { flag: TFlag; inlineValue?: string } | undefined {
+  for (const flag of flags) {
+    if (arg === flag) return { flag };
+    if (arg.startsWith(`${flag}=`)) {
+      return { flag, inlineValue: arg.slice(flag.length + 1) };
+    }
+  }
+  return undefined;
+}
+
+function optionValue(
+  option: { flag: string; inlineValue?: string },
+  next: string | undefined,
+): string {
+  const value = option.inlineValue ?? next;
+  if (
+    value === undefined ||
+    value.trim() === "" ||
+    (option.inlineValue === undefined && value.startsWith("-"))
+  ) {
+    throw new CliUsageError(`Option "${option.flag}" requires a value.`);
+  }
+  return value;
 }
 
 function parseInit(args: readonly string[]): CliCommand {
@@ -217,7 +372,11 @@ function parseInit(args: readonly string[]): CliCommand {
       continue;
     }
 
-    const option = initValueOption(arg);
+    const option = valueOption(arg, [
+      "--relay",
+      "--enrollment",
+      "--environments",
+    ]);
     if (option !== undefined) {
       const duplicate =
         (option.flag === "--relay" && relay !== undefined) ||
@@ -227,15 +386,7 @@ function parseInit(args: readonly string[]): CliCommand {
         throw duplicateOption("init", option.flag);
       }
 
-      const inlineValue = option.inlineValue;
-      const value = inlineValue ?? args[index + 1];
-      if (
-        value === undefined ||
-        value.trim() === "" ||
-        (inlineValue === undefined && value.startsWith("-"))
-      ) {
-        throw new CliUsageError(`Option "${option.flag}" requires a value.`);
-      }
+      const value = optionValue(option, args[index + 1]);
 
       if (option.flag === "--relay") {
         relay = value;
@@ -246,7 +397,7 @@ function parseInit(args: readonly string[]): CliCommand {
         hasEnvironments = true;
       }
 
-      if (inlineValue === undefined) {
+      if (option.inlineValue === undefined) {
         index += 1;
       }
       continue;
@@ -264,20 +415,6 @@ function parseInit(args: readonly string[]): CliCommand {
     noStart,
     reset,
   };
-}
-
-function initValueOption(
-  arg: string,
-): { flag: "--relay" | "--enrollment" | "--environments"; inlineValue?: string } | undefined {
-  for (const flag of ["--relay", "--enrollment", "--environments"] as const) {
-    if (arg === flag) {
-      return { flag };
-    }
-    if (arg.startsWith(`${flag}=`)) {
-      return { flag, inlineValue: arg.slice(flag.length + 1) };
-    }
-  }
-  return undefined;
 }
 
 function parseEnvironmentList(value: string): string[] {

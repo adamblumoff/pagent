@@ -40,7 +40,7 @@ export interface RelayConfig {
   heartbeatMs: number;
   sources: readonly SourceRoute[];
   connectors: readonly ConnectorCredential[];
-  enrollmentToken?: string;
+  adminToken?: string;
 }
 
 export interface EnqueueInput {
@@ -54,12 +54,24 @@ export interface EnrollmentInput {
   allowedEnvironments: readonly string[];
   sourceTokenHash: string;
   connectorTokenHash: string;
+  replace: boolean;
 }
 
-export type EnrollmentResult =
-  | { status: "enrolled" }
-  | { status: "existing" }
-  | { status: "conflict" };
+export interface EnrollmentResult {
+  status: "enrolled" | "rotated" | "existing" | "conflict" | "invalid-code";
+}
+
+export interface EnrollmentAttempt {
+  codeHash: string;
+  requestHash: string;
+  enrollment: EnrollmentInput;
+}
+
+export interface EnrollmentCodeInput {
+  codeHash: string;
+  expiresAt: string;
+  connectorId?: string | undefined;
+}
 
 export interface RelayTask {
   id: string;
@@ -79,7 +91,9 @@ export type EnqueueResult =
 
 export interface RelayStore {
   initialize(): Promise<void>;
-  enroll(input: EnrollmentInput): Promise<EnrollmentResult>;
+  createEnrollmentCode(input: EnrollmentCodeInput): Promise<void>;
+  enroll(input: EnrollmentAttempt): Promise<EnrollmentResult>;
+  revokeConnector(connectorId: string): Promise<boolean>;
   findSource(sourceTokenHash: string): Promise<SourceAuthorization | undefined>;
   authorizeConnector(
     connectorId: string,
@@ -92,6 +106,9 @@ export interface RelayStore {
     limit: number,
   ): Promise<RelayTask[]>;
   subscribe(connectorId: string, listener: () => void): () => void;
+  subscribeCredentialChanges(
+    listener: (connectorId: string) => void,
+  ): () => void;
   health(): Promise<void>;
   close(): Promise<void>;
 }

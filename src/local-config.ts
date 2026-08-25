@@ -14,6 +14,7 @@ const CONFIG_NAMES = [
   "pagent.config.mjs",
   "pagent.config.js",
 ] as const;
+let configRevision = 0;
 
 export interface LoadedConnectorConfig {
   config: ConnectorConfig;
@@ -42,7 +43,11 @@ export async function loadConnectorConfig(options: {
 
   let imported: unknown;
   try {
-    imported = await import(pathToFileURL(path).href);
+    const url = pathToFileURL(path);
+    if (configRevision > 0) {
+      url.searchParams.set("pagent_revision", String(configRevision));
+    }
+    imported = await import(url.href);
   } catch (cause) {
     throw new Error(`Could not load Pagent config at ${path}.`, { cause });
   }
@@ -57,6 +62,11 @@ export async function loadConnectorConfig(options: {
   }
 
   return { config, path, projectDirectory: dirname(path) };
+}
+
+/** Reloads a config after `pagent init --reset` replaces it in this process. */
+export function invalidateConnectorConfigCache(): void {
+  configRevision += 1;
 }
 
 function loadProjectEnvironment(directory: string): void {

@@ -6,6 +6,7 @@ import pg from "pg";
 
 import { PostgresRelayStore } from "../src/postgres-store.js";
 import type {
+  EnrollmentAttempt,
   EnrollmentInput,
   EnqueueInput,
   SourceRoute,
@@ -31,7 +32,19 @@ const enrollment: EnrollmentInput = {
   allowedEnvironments: ["staging", "production"],
   sourceTokenHash: sha256("enrolled-source-secret"),
   connectorTokenHash: sha256("enrolled-connector-secret"),
+  replace: false,
 };
+
+function attempt(
+  code: string,
+  input: EnrollmentInput = enrollment,
+): EnrollmentAttempt {
+  return {
+    codeHash: sha256(code),
+    requestHash: sha256(JSON.stringify(input)),
+    enrollment: input,
+  };
+}
 
 function input(
   id: string,
@@ -100,17 +113,26 @@ describe(
         : false,
   },
   () => {
-    it("persists idempotent enrollment credentials for dynamic auth", async () => {
+    it("consumes codes, rotates credentials, and revokes dynamic auth", async () => {
       await withStore(async (store) => {
-        assert.deepEqual(await store.enroll(enrollment), {
+        await store.createEnrollmentCode({
+          codeHash: sha256("first-code"),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        });
+        assert.deepEqual(await store.enroll(attempt("first-code")), {
           status: "enrolled",
         });
-        assert.deepEqual(await store.enroll(enrollment), {
+        assert.deepEqual(await store.enroll(attempt("first-code")), {
           status: "existing",
         });
         assert.deepEqual(
-          await store.enroll({ ...enrollment, repositoryKey: "other-repo" }),
-          { status: "conflict" },
+          await store.enroll(
+            attempt("first-code", {
+              ...enrollment,
+              repositoryKey: "other-repo",
+            }),
+          ),
+          { status: "invalid-code" },
         );
         assert.deepEqual(
           await store.findSource(enrollment.sourceTokenHash),
@@ -132,6 +154,51 @@ describe(
           false,
         );
         assert.equal(await store.findSource(sha256("wrong")), undefined);
+
+        const rotated = {
+          ...enrollment,
+          sourceTokenHash: sha256("rotated-source"),
+          connectorTokenHash: sha256("rotated-connector"),
+          replace: true,
+        };
+        await store.createEnrollmentCode({
+          codeHash: sha256("rotation-code"),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          connectorId: enrollment.connectorId,
+        });
+        assert.deepEqual(
+          await store.enroll(attempt("rotation-code", rotated)),
+          { status: "rotated" },
+        );
+        assert.deepEqual(await store.enroll(attempt("first-code")), {
+          status: "invalid-code",
+        });
+        assert.equal(
+          await store.authorizeConnector(
+            enrollment.connectorId,
+            enrollment.connectorTokenHash,
+          ),
+          false,
+        );
+        assert.equal(
+          await store.authorizeConnector(
+            rotated.connectorId,
+            rotated.connectorTokenHash,
+          ),
+          true,
+        );
+        assert.equal(await store.revokeConnector(rotated.connectorId), true);
+        assert.deepEqual(
+          await store.enroll(attempt("rotation-code", rotated)),
+          { status: "invalid-code" },
+        );
+        assert.equal(
+          await store.authorizeConnector(
+            rotated.connectorId,
+            rotated.connectorTokenHash,
+          ),
+          false,
+        );
       });
     });
 

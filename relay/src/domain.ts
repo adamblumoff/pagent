@@ -180,6 +180,7 @@ export function parseEnrollment(value: unknown): EnrollmentInput {
       "allowedEnvironments",
       "sourceTokenHash",
       "connectorTokenHash",
+      "replace",
     ],
     "body",
   );
@@ -216,6 +217,9 @@ export function parseEnrollment(value: unknown): EnrollmentInput {
   if (sourceTokenHash.encoded === connectorTokenHash.encoded) {
     throw new Error("source and connector credentials must be different");
   }
+  if (typeof value.replace !== "boolean") {
+    throw new Error("body.replace must be a boolean");
+  }
   return {
     connectorId: canonicalBoundedString(value.connectorId, "body.connectorId"),
     repositoryKey: canonicalBoundedString(
@@ -225,6 +229,41 @@ export function parseEnrollment(value: unknown): EnrollmentInput {
     allowedEnvironments,
     sourceTokenHash: sourceTokenHash.encoded,
     connectorTokenHash: connectorTokenHash.encoded,
+    replace: value.replace,
+  };
+}
+
+export function parseEnrollmentCodeRequest(value: unknown): {
+  expiresInSeconds: number;
+  connectorId?: string | undefined;
+} {
+  if (!isRecord(value) || value.version !== 1) {
+    throw new Error("body must contain enrollment-code version 1");
+  }
+  assertOnlyKeys(
+    value,
+    ["version", "expiresInSeconds", "connectorId"],
+    "body",
+  );
+  const expiresInSeconds = value.expiresInSeconds ?? 900;
+  if (
+    typeof expiresInSeconds !== "number" ||
+    !Number.isSafeInteger(expiresInSeconds) ||
+    expiresInSeconds < 60 ||
+    expiresInSeconds > 86_400
+  ) {
+    throw new Error("body.expiresInSeconds must be an integer from 60 to 86400");
+  }
+  return {
+    expiresInSeconds,
+    ...(value.connectorId === undefined
+      ? {}
+      : {
+          connectorId: canonicalBoundedString(
+            value.connectorId,
+            "body.connectorId",
+          ),
+        }),
   };
 }
 

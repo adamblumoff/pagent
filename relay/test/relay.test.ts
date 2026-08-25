@@ -20,7 +20,7 @@ const config: RelayConfig = {
     },
   ],
   connectors: [{ id: "local-1", token: "connector-secret" }],
-  enrollmentToken: "enrollment-secret",
+  adminToken: "admin-secret",
 };
 
 const dynamicSourceToken = "dynamic-source-secret";
@@ -38,8 +38,74 @@ function enrollment(overrides: Record<string, unknown> = {}) {
     allowedEnvironments: ["staging"],
     sourceTokenHash: sha256(dynamicSourceToken),
     connectorTokenHash: sha256(dynamicConnectorToken),
+    replace: false,
     ...overrides,
   };
+}
+
+async function issueEnrollmentCode(
+  baseUrl: string,
+  connectorId?: string,
+): Promise<string> {
+  const response = await fetch(`${baseUrl}/v1/admin/enrollment-codes`, {
+    method: "POST",
+    body: JSON.stringify({
+      version: 1,
+      expiresInSeconds: 900,
+      ...(connectorId === undefined ? {} : { connectorId }),
+    }),
+    headers: {
+      authorization: "Bearer admin-secret",
+      "content-type": "application/json",
+    },
+  });
+  assert.equal(response.status, 201);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const body = (await response.json()) as { code: string };
+  assert.match(body.code, /^pge_/u);
+  return body.code;
+}
+
+function postEnrollment(
+  baseUrl: string,
+  code: string,
+  body: unknown = enrollment(),
+): Promise<Response> {
+  return fetch(`${baseUrl}/v1/enroll`, {
+    method: "POST",
+    body: JSON.stringify(body),
+    headers: {
+      authorization: `Bearer ${code}`,
+      "content-type": "application/json",
+    },
+  });
+}
+
+async function waitForStreamClose(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      (async () => {
+        try {
+          while (!(await reader.read()).done) {
+            // Drain frames already buffered before the credential change.
+          }
+        } catch {
+          // Undici reports a destroyed SSE response as a rejected read.
+        }
+      })(),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("SSE stream stayed open")),
+          2_000,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 function event(id: string, overrides: Record<string, unknown> = {}) {
@@ -127,22 +193,27 @@ describe("relay HTTP API", () => {
     await store.close();
   });
 
-  it("authenticates and idempotently registers an enrollment", async () => {
-    const enroll = (body: unknown, token = "enrollment-secret") =>
-      fetch(`${baseUrl}/v1/enroll`, {
+  it("issues and consumes a single-use enrollment code", async () => {
+    const unauthorizedIssue = await fetch(
+      `${baseUrl}/v1/admin/enrollment-codes`,
+      {
         method: "POST",
-        body: JSON.stringify(body),
+        body: JSON.stringify({ version: 1 }),
         headers: {
-          authorization: `Bearer ${token}`,
+          authorization: "Bearer wrong",
           "content-type": "application/json",
         },
-      });
+      },
+    );
+    assert.equal(unauthorizedIssue.status, 401);
 
-    const unauthorized = await enroll({ not: "json enrollment" }, "wrong");
+    const code = await issueEnrollmentCode(baseUrl);
+
+    const unauthorized = await postEnrollment(baseUrl, "wrong");
     assert.equal(unauthorized.status, 401);
     assert.equal(store.enrollments.length, 0);
 
-    const first = await enroll(enrollment());
+    const first = await postEnrollment(baseUrl, code);
     assert.equal(first.status, 201);
     assert.deepEqual(await first.json(), { status: "enrolled" });
     assert.deepEqual(store.enrollments, [
@@ -152,34 +223,96 @@ describe("relay HTTP API", () => {
         allowedEnvironments: ["staging"],
         sourceTokenHash: sha256(dynamicSourceToken),
         connectorTokenHash: sha256(dynamicConnectorToken),
+        replace: false,
       },
     ]);
 
-    const repeated = await enroll(enrollment());
+    const repeated = await postEnrollment(baseUrl, code);
     assert.equal(repeated.status, 200);
     assert.deepEqual(await repeated.json(), { status: "existing" });
     assert.equal(store.enrollments.length, 1);
 
-    const conflict = await enroll(enrollment({ repositoryKey: "other-repo" }));
+    const reused = await postEnrollment(
+      baseUrl,
+      code,
+      enrollment({ repositoryKey: "other-repo" }),
+    );
+    assert.equal(reused.status, 401);
+
+    const staticCollisionCode = await issueEnrollmentCode(baseUrl);
+    const staticCollision = await postEnrollment(
+      baseUrl,
+      staticCollisionCode,
+      enrollment({ connectorId: "local-1" }),
+    );
+    assert.equal(staticCollision.status, 409);
+
+    const unscopedRotationCode = await issueEnrollmentCode(baseUrl);
+    const unscopedRotation = await postEnrollment(
+      baseUrl,
+      unscopedRotationCode,
+      enrollment({ replace: true }),
+    );
+    assert.equal(unscopedRotation.status, 401);
+
+    const scopedCreateCode = await issueEnrollmentCode(baseUrl, "dynamic-4");
+    const scopedCreate = await postEnrollment(
+      baseUrl,
+      scopedCreateCode,
+      enrollment({
+        connectorId: "dynamic-4",
+        sourceTokenHash: sha256("dynamic-4-source"),
+        connectorTokenHash: sha256("dynamic-4-connector"),
+      }),
+    );
+    assert.equal(scopedCreate.status, 401);
+
+    const conflictCode = await issueEnrollmentCode(baseUrl);
+    const conflict = await postEnrollment(baseUrl, conflictCode);
     assert.equal(conflict.status, 409);
-    assert.match(JSON.stringify(await conflict.json()), /already enrolled/);
+    const recovered = await postEnrollment(
+      baseUrl,
+      conflictCode,
+      enrollment({
+        connectorId: "dynamic-2",
+        sourceTokenHash: sha256("dynamic-2-source"),
+        connectorTokenHash: sha256("dynamic-2-connector"),
+      }),
+    );
+    assert.equal(recovered.status, 201);
+
+    const expiredCode = "pge_expired";
+    await store.createEnrollmentCode({
+      codeHash: sha256(expiredCode),
+      expiresAt: new Date(Date.now() - 1_000).toISOString(),
+    });
+    const expired = await postEnrollment(
+      baseUrl,
+      expiredCode,
+      enrollment({
+        connectorId: "dynamic-3",
+        sourceTokenHash: sha256("dynamic-3-source"),
+        connectorTokenHash: sha256("dynamic-3-connector"),
+      }),
+    );
+    assert.equal(expired.status, 401);
   });
 
-  it("does not expose enrollment when it is not configured", async () => {
+  it("does not expose administrator routes when they are not configured", async () => {
     const disabledConfig = { ...config };
-    delete disabledConfig.enrollmentToken;
+    delete disabledConfig.adminToken;
     const disabledServer = createRelayServer({ config: disabledConfig, store });
     disabledServer.listen(0, "127.0.0.1");
     await once(disabledServer, "listening");
     const address = disabledServer.address() as AddressInfo;
     try {
       const response = await fetch(
-        `http://127.0.0.1:${address.port}/v1/enroll`,
+        `http://127.0.0.1:${address.port}/v1/admin/enrollment-codes`,
         {
           method: "POST",
-          body: JSON.stringify(enrollment()),
+          body: JSON.stringify({ version: 1 }),
           headers: {
-            authorization: "Bearer enrollment-secret",
+            authorization: "Bearer admin-secret",
             "content-type": "application/json",
           },
         },
@@ -193,6 +326,7 @@ describe("relay HTTP API", () => {
   });
 
   it("rejects malformed enrollment fields", async () => {
+    const code = await issueEnrollmentCode(baseUrl);
     const invalidBodies = [
       { ...enrollment(), version: 2 },
       { ...enrollment(), unexpected: true },
@@ -202,31 +336,19 @@ describe("relay HTTP API", () => {
       enrollment({ sourceTokenHash: "not-a-sha256-hash" }),
       enrollment({ connectorTokenHash: Buffer.alloc(31).toString("base64url") }),
       enrollment({ connectorTokenHash: sha256(dynamicSourceToken) }),
+      enrollment({ replace: "yes" }),
     ];
 
     for (const body of invalidBodies) {
-      const response = await fetch(`${baseUrl}/v1/enroll`, {
-        method: "POST",
-        body: JSON.stringify(body),
-        headers: {
-          authorization: "Bearer enrollment-secret",
-          "content-type": "application/json",
-        },
-      });
+      const response = await postEnrollment(baseUrl, code, body);
       assert.equal(response.status, 400);
     }
     assert.equal(store.enrollments.length, 0);
   });
 
   it("accepts events and SSE connections with enrolled credentials", async () => {
-    const enrolled = await fetch(`${baseUrl}/v1/enroll`, {
-      method: "POST",
-      body: JSON.stringify(enrollment()),
-      headers: {
-        authorization: "Bearer enrollment-secret",
-        "content-type": "application/json",
-      },
-    });
+    const code = await issueEnrollmentCode(baseUrl);
+    const enrolled = await postEnrollment(baseUrl, code);
     assert.equal(enrolled.status, 201);
 
     const ingested = await fetch(`${baseUrl}/v1/events`, {
@@ -292,6 +414,90 @@ describe("relay HTTP API", () => {
     }
     abort.abort();
     assert.match(text, /"repositoryKey":"dynamic-repo"/);
+  });
+
+  it("rotates credentials and revokes active connector streams", async () => {
+    const firstCode = await issueEnrollmentCode(baseUrl);
+    const first = await postEnrollment(baseUrl, firstCode);
+    assert.equal(first.status, 201);
+
+    const oldStream = await fetch(
+      `${baseUrl}/v1/connectors/dynamic-1/events`,
+      { headers: { authorization: `Bearer ${dynamicConnectorToken}` } },
+    );
+    assert.equal(oldStream.status, 200);
+    const oldReader = oldStream.body?.getReader();
+    assert.ok(oldReader);
+
+    const rotatedSourceToken = "rotated-source-secret";
+    const rotatedConnectorToken = "rotated-connector-secret";
+    const rotationCode = await issueEnrollmentCode(baseUrl, "dynamic-1");
+    const rotationBody = enrollment({
+      sourceTokenHash: sha256(rotatedSourceToken),
+      connectorTokenHash: sha256(rotatedConnectorToken),
+      replace: true,
+    });
+    const rotate = () =>
+      postEnrollment(baseUrl, rotationCode, rotationBody);
+    const rotated = await rotate();
+    assert.equal(rotated.status, 201);
+    assert.deepEqual(await rotated.json(), { status: "rotated" });
+    const rotationRetry = await rotate();
+    assert.equal(rotationRetry.status, 200);
+    assert.deepEqual(await rotationRetry.json(), { status: "existing" });
+    await waitForStreamClose(oldReader);
+
+    const staleRetry = await postEnrollment(baseUrl, firstCode);
+    assert.equal(staleRetry.status, 401);
+
+    const oldAuthorization = await fetch(
+      `${baseUrl}/v1/connectors/dynamic-1/events`,
+      { headers: { authorization: `Bearer ${dynamicConnectorToken}` } },
+    );
+    assert.equal(oldAuthorization.status, 401);
+
+    const newStream = await fetch(
+      `${baseUrl}/v1/connectors/dynamic-1/events`,
+      { headers: { authorization: `Bearer ${rotatedConnectorToken}` } },
+    );
+    assert.equal(newStream.status, 200);
+    const newReader = newStream.body?.getReader();
+    assert.ok(newReader);
+
+    const revoked = await fetch(
+      `${baseUrl}/v1/admin/connectors/dynamic-1`,
+      {
+        method: "DELETE",
+        headers: { authorization: "Bearer admin-secret" },
+      },
+    );
+    assert.equal(revoked.status, 200);
+    assert.deepEqual(await revoked.json(), {
+      status: "revoked",
+      connectorId: "dynamic-1",
+    });
+    const revokedRetry = await rotate();
+    assert.equal(revokedRetry.status, 401);
+    await waitForStreamClose(newReader);
+
+    const revokedSource = await fetch(`${baseUrl}/v1/events`, {
+      method: "POST",
+      body: JSON.stringify(event("revoked-source")),
+      headers: {
+        authorization: `Bearer ${rotatedSourceToken}`,
+        "content-type": "application/json",
+      },
+    });
+    assert.equal(revokedSource.status, 401);
+
+    const staticRevoke = await fetch(
+      `${baseUrl}/v1/admin/connectors/local-1`,
+      {
+        method: "DELETE",
+        headers: { authorization: "Bearer admin-secret" },
+      },
+    );
+    assert.equal(staticRevoke.status, 409);
   });
 
   it("rejects unauthenticated ingest without reading application data", async () => {

@@ -1,4 +1,6 @@
 import type {
+  EnrollmentAttempt,
+  EnrollmentCodeInput,
   EnrollmentInput,
   EnrollmentResult,
   EnqueueInput,
@@ -11,22 +13,6 @@ import type {
 interface StoredTask {
   connectorId: string;
   task: RelayTask;
-}
-
-function enrollmentsEqual(
-  left: EnrollmentInput,
-  right: EnrollmentInput,
-): boolean {
-  return (
-    left.connectorId === right.connectorId &&
-    left.repositoryKey === right.repositoryKey &&
-    left.sourceTokenHash === right.sourceTokenHash &&
-    left.connectorTokenHash === right.connectorTokenHash &&
-    left.allowedEnvironments.length === right.allowedEnvironments.length &&
-    left.allowedEnvironments.every(
-      (environment, index) => environment === right.allowedEnvironments[index],
-    )
-  );
 }
 
 function taskFor(input: EnqueueInput, id: string): RelayTask {
@@ -47,16 +33,61 @@ export class RecordingRelayStore implements RelayStore {
   readonly enrollments: EnrollmentInput[] = [];
   readonly enqueueResults: EnqueueResult[] = [];
   readonly #listeners = new Map<string, Set<() => void>>();
+  readonly #credentialListeners = new Set<(connectorId: string) => void>();
+  readonly #codes = new Map<
+    string,
+    {
+      expiresAt: number;
+      connectorId?: string | undefined;
+      requestHash?: string | undefined;
+    }
+  >();
+  readonly #revoked = new Set<string>();
   readonly #tasks: StoredTask[] = [];
   healthError: Error | undefined;
 
   async initialize(): Promise<void> {}
 
-  async enroll(input: EnrollmentInput): Promise<EnrollmentResult> {
+  async createEnrollmentCode(input: EnrollmentCodeInput): Promise<void> {
+    this.#codes.set(input.codeHash, {
+      expiresAt: new Date(input.expiresAt).getTime(),
+      ...(input.connectorId === undefined
+        ? {}
+        : { connectorId: input.connectorId }),
+    });
+  }
+
+  async enroll(attempt: EnrollmentAttempt): Promise<EnrollmentResult> {
+    const code = this.#codes.get(attempt.codeHash);
+    if (!code) {
+      return { status: "invalid-code" };
+    }
+    if (code.requestHash !== undefined) {
+      const current = this.enrollments.find(
+        (enrollment) => enrollment.connectorId === attempt.enrollment.connectorId,
+      );
+      return code.requestHash === attempt.requestHash &&
+        current !== undefined &&
+        !this.#revoked.has(current.connectorId) &&
+        sameEnrollment(current, attempt.enrollment)
+        ? { status: "existing" }
+        : { status: "invalid-code" };
+    }
+    if (code.expiresAt <= Date.now()) {
+      return { status: "invalid-code" };
+    }
+    const input = attempt.enrollment;
+    const codeAllowsRequest = input.replace
+      ? code.connectorId === input.connectorId
+      : code.connectorId === undefined;
+    if (!codeAllowsRequest) return { status: "invalid-code" };
     const existing = this.enrollments.find(
       (enrollment) => enrollment.connectorId === input.connectorId,
     );
-    if (!existing) {
+    if ((existing !== undefined) !== input.replace) {
+      return { status: "conflict" };
+    }
+    if (existing === undefined) {
       if (
         this.enrollments.some(
           (enrollment) =>
@@ -67,18 +98,37 @@ export class RecordingRelayStore implements RelayStore {
         return { status: "conflict" };
       }
       this.enrollments.push(input);
+      code.requestHash = attempt.requestHash;
       return { status: "enrolled" };
     }
-    return enrollmentsEqual(existing, input)
-      ? { status: "existing" }
-      : { status: "conflict" };
+    const index = this.enrollments.indexOf(existing);
+    this.enrollments[index] = input;
+    this.#revoked.delete(input.connectorId);
+    code.requestHash = attempt.requestHash;
+    this.#notifyCredentialChange(input.connectorId);
+    return { status: "rotated" };
+  }
+
+  async revokeConnector(connectorId: string): Promise<boolean> {
+    if (
+      !this.enrollments.some(
+        (enrollment) => enrollment.connectorId === connectorId,
+      )
+    ) {
+      return false;
+    }
+    this.#revoked.add(connectorId);
+    this.#notifyCredentialChange(connectorId);
+    return true;
   }
 
   async findSource(
     sourceTokenHash: string,
   ): Promise<SourceAuthorization | undefined> {
     const enrollment = this.enrollments.find(
-      (candidate) => candidate.sourceTokenHash === sourceTokenHash,
+      (candidate) =>
+        candidate.sourceTokenHash === sourceTokenHash &&
+        !this.#revoked.has(candidate.connectorId),
     );
     return enrollment
       ? {
@@ -96,7 +146,8 @@ export class RecordingRelayStore implements RelayStore {
     return this.enrollments.some(
       (enrollment) =>
         enrollment.connectorId === connectorId &&
-        enrollment.connectorTokenHash === connectorTokenHash,
+        enrollment.connectorTokenHash === connectorTokenHash &&
+        !this.#revoked.has(connectorId),
     );
   }
 
@@ -137,6 +188,13 @@ export class RecordingRelayStore implements RelayStore {
     };
   }
 
+  subscribeCredentialChanges(
+    listener: (connectorId: string) => void,
+  ): () => void {
+    this.#credentialListeners.add(listener);
+    return () => this.#credentialListeners.delete(listener);
+  }
+
   publish(connectorId: string, task: RelayTask): void {
     this.#tasks.push({ connectorId, task });
     for (const listener of this.#listeners.get(connectorId) ?? []) {
@@ -152,5 +210,25 @@ export class RecordingRelayStore implements RelayStore {
 
   async close(): Promise<void> {
     this.#listeners.clear();
+    this.#credentialListeners.clear();
   }
+
+  #notifyCredentialChange(connectorId: string): void {
+    for (const listener of this.#credentialListeners) {
+      queueMicrotask(() => listener(connectorId));
+    }
+  }
+}
+
+function sameEnrollment(left: EnrollmentInput, right: EnrollmentInput): boolean {
+  return (
+    left.connectorId === right.connectorId &&
+    left.repositoryKey === right.repositoryKey &&
+    left.sourceTokenHash === right.sourceTokenHash &&
+    left.connectorTokenHash === right.connectorTokenHash &&
+    left.allowedEnvironments.length === right.allowedEnvironments.length &&
+    left.allowedEnvironments.every(
+      (environment, index) => environment === right.allowedEnvironments[index],
+    )
+  );
 }

@@ -13,9 +13,17 @@ import {
   renderCliHelp,
   type CliCommand,
 } from "./cli-args.js";
+import {
+  createEnrollmentCode,
+  revokeConnector,
+} from "./admin.js";
 import { runDoctor, type DoctorReport } from "./doctor.js";
 import { runProjectInit } from "./init.js";
-import { loadConnectorConfig, type LoadedConnectorConfig } from "./local-config.js";
+import {
+  invalidateConnectorConfigCache,
+  loadConnectorConfig,
+  type LoadedConnectorConfig,
+} from "./local-config.js";
 import {
   requestLocalControl,
   type LocalDaemonStatus,
@@ -66,6 +74,12 @@ async function main(): Promise<void> {
     case "init":
       await initCommand(command);
       return;
+    case "enrollment":
+      await enrollmentCommand(command);
+      return;
+    case "connector":
+      await connectorCommand(command);
+      return;
     case "doctor":
       await doctorCommand(command.json);
       return;
@@ -84,24 +98,67 @@ async function main(): Promise<void> {
   }
 }
 
+async function enrollmentCommand(
+  command: Extract<CliCommand, { name: "enrollment" }>,
+): Promise<void> {
+  const { relayUrl, adminToken } = await adminCredentials(command);
+  const enrollment = await createEnrollmentCode({
+    relayUrl,
+    adminToken,
+    ttlMinutes: command.ttlMinutes,
+    ...(command.connectorId === undefined
+      ? {}
+      : { connectorId: command.connectorId }),
+  });
+  console.log(enrollment.code);
+  console.error(`Expires at ${enrollment.expiresAt}.`);
+}
+
+async function connectorCommand(
+  command: Extract<CliCommand, { name: "connector" }>,
+): Promise<void> {
+  const { relayUrl, adminToken, interactive } =
+    await adminCredentials(command);
+  if (!command.yes) {
+    if (!interactive) {
+      throw new Error(
+        "Connector revocation needs confirmation in a non-interactive shell. Review the connector ID, then add `--yes`.",
+      );
+    }
+    const answer = await question(
+      `Revoke connector ${command.connectorId}? Its source and connector credentials will stop working. [y/N] `,
+    );
+    if (answer.toLowerCase() !== "y" && answer.toLowerCase() !== "yes") {
+      console.log("Connector revocation cancelled.");
+      return;
+    }
+  }
+  await revokeConnector({
+    relayUrl,
+    adminToken,
+    connectorId: command.connectorId,
+  });
+  console.log(`Revoked connector ${command.connectorId}.`);
+}
+
 async function initCommand(
   command: Extract<CliCommand, { name: "init" }>,
 ): Promise<void> {
-  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
-  const relayUrl = await initValue({
+  const interactive = isInteractive();
+  const relayUrl = await cliValue({
     value: command.relay ?? process.env.PAGENT_RELAY_URL,
     interactive,
     prompt: "Relay URL: ",
     missing:
       "Relay URL is required. Pass `--relay <url>` or set PAGENT_RELAY_URL.",
   });
-  const enrollmentToken = await initValue({
-    value: command.enrollment ?? process.env.PAGENT_ENROLLMENT_TOKEN,
+  const enrollmentCode = await cliValue({
+    value: command.enrollment ?? process.env.PAGENT_ENROLLMENT_CODE,
     interactive,
-    prompt: "Enrollment token: ",
+    prompt: "Enrollment code: ",
     hidden: true,
     missing:
-      "Enrollment token is required. Pass `--enrollment <token>` or set PAGENT_ENROLLMENT_TOKEN.",
+      "Enrollment code is required. Pass `--enrollment <code>` or set PAGENT_ENROLLMENT_CODE.",
   });
 
   if (!command.yes) {
@@ -110,11 +167,12 @@ async function initCommand(
         "Pagent init needs confirmation in a non-interactive shell. Review the options, then add `--yes`.",
       );
     }
-    const answer = await question(
-      `Enroll this repository for ${command.environments.join(", ")} and ${
-        command.noStart ? "leave the connector stopped" : "start the connector"
-      }? [y/N] `,
-    );
+    const action = command.reset
+      ? "Rotate this connector and invalidate its current cloud credentials now"
+      : `Enroll this repository for ${command.environments.join(", ")} and ${
+          command.noStart ? "leave the connector stopped" : "start the connector"
+        }`;
+    const answer = await question(`${action}? [y/N] `);
     if (answer.toLowerCase() !== "y" && answer.toLowerCase() !== "yes") {
       console.log("Pagent init cancelled.");
       return;
@@ -122,17 +180,44 @@ async function initCommand(
   }
 
   console.log("Checking Git, Codex, and relay enrollment.");
+  const connectorEnvironment = {
+    token: process.env.PAGENT_CONNECTOR_TOKEN,
+    keys: process.env.PAGENT_CONTEXT_KEYS,
+  };
+  let existingConnectorId: string | undefined;
+  if (command.reset) {
+    try {
+      existingConnectorId = (await loadConnectorConfig()).config.relay.connectorId;
+    } catch {
+      throw new Error(
+        "Pagent could not read the existing connector identity. Repair the current config or revoke the connector before resetting it.",
+      );
+    }
+  }
   const initialized = await runProjectInit({
     relayUrl,
-    enrollmentToken,
+    enrollmentCode,
     environments: command.environments,
     reset: command.reset,
+    connectorId: existingConnectorId,
   });
   process.chdir(initialized.projectDirectory);
+
+  if (command.reset) {
+    restoreEnvironment("PAGENT_CONNECTOR_TOKEN", connectorEnvironment.token);
+    restoreEnvironment("PAGENT_CONTEXT_KEYS", connectorEnvironment.keys);
+    invalidateConnectorConfigCache();
+    await stopConnectorForRotation();
+  }
 
   console.log(`\nPagent initialized for ${initialized.repositoryKey}.`);
   console.log(`Connector config: ${initialized.configPath}`);
   console.log(`Cloud environment: ${initialized.cloudEnvironmentPath}`);
+  if (command.reset) {
+    console.log(
+      "Cloud credentials changed. Update the deployment from cloud.env before sending more events.",
+    );
+  }
 
   if (command.noStart) {
     await doctorCommand(false);
@@ -144,7 +229,56 @@ async function initCommand(
   await startCommand(false, false);
 }
 
-async function initValue(options: {
+async function adminCredentials(command: {
+  relay: string | undefined;
+  adminToken: string | undefined;
+}): Promise<{ relayUrl: string; adminToken: string; interactive: boolean }> {
+  const interactive = isInteractive();
+  const relayUrl = await cliValue({
+    value: command.relay ?? process.env.PAGENT_RELAY_URL,
+    prompt: "Relay URL: ",
+    missing:
+      "Relay URL is required. Pass `--relay <url>` or set PAGENT_RELAY_URL.",
+    interactive,
+  });
+  const adminToken = await cliValue({
+    value: command.adminToken ?? process.env.PAGENT_ADMIN_TOKEN,
+    prompt: "Relay administrator token: ",
+    missing:
+      "Relay administrator token is required. Pass `--admin-token <token>` or set PAGENT_ADMIN_TOKEN.",
+    interactive,
+    hidden: true,
+  });
+  return { relayUrl, adminToken, interactive };
+}
+
+function isInteractive(): boolean {
+  return process.stdin.isTTY === true && process.stdout.isTTY === true;
+}
+
+function restoreEnvironment(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+async function stopConnectorForRotation(): Promise<void> {
+  const loaded = await loadConnectorConfig();
+  const paths = localStatePaths({ stateDirectory: loaded.config.stateDirectory });
+  const running = await existingDaemon(paths);
+  if (running === undefined) return;
+
+  await requestLocalControl(paths.controlEndpoint, { method: "stop" });
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if ((await existingDaemon(paths)) === undefined) return;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+  }
+  throw new Error(
+    "The old connector did not stop after credential rotation. Run `pagent stop`, then `pagent start`.",
+  );
+}
+
+async function cliValue(options: {
   value: string | undefined;
   interactive: boolean;
   prompt: string;

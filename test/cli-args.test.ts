@@ -43,6 +43,44 @@ describe("CLI arguments", () => {
     });
   });
 
+  it("parses relay administration commands", () => {
+    expect(
+      parseCliArgs([
+        "enrollment",
+        "create",
+        "--relay=https://relay.example.test",
+        "--admin-token",
+        "admin-secret",
+        "--ttl",
+        "30",
+        "--connector",
+        "api-laptop",
+      ]),
+    ).toEqual({
+      name: "enrollment",
+      relay: "https://relay.example.test",
+      adminToken: "admin-secret",
+      ttlMinutes: 30,
+      connectorId: "api-laptop",
+    });
+    expect(
+      parseCliArgs([
+        "connector",
+        "revoke",
+        "api-laptop",
+        "--relay",
+        "https://relay.example.test",
+        "--yes",
+      ]),
+    ).toEqual({
+      name: "connector",
+      connectorId: "api-laptop",
+      relay: "https://relay.example.test",
+      adminToken: undefined,
+      yes: true,
+    });
+  });
+
   it("starts in the background with doctor checks by default", () => {
     expect(parseCliArgs(["start"])).toEqual({
       name: "start",
@@ -162,6 +200,21 @@ describe("CLI arguments", () => {
     );
   });
 
+  it("rejects malformed relay administration commands", () => {
+    expectUsageError(
+      ["enrollment"],
+      'The enrollment command requires the action "create".',
+    );
+    expectUsageError(
+      ["enrollment", "create", "--ttl", "1441"],
+      'Option "--ttl" cannot exceed 1440 minutes.',
+    );
+    expectUsageError(
+      ["connector", "revoke"],
+      "Usage: pagent connector revoke <connector-id> [options].",
+    );
+  });
+
   it("requires a valid positive line count", () => {
     expectUsageError(
       ["logs", "--lines"],
@@ -179,9 +232,11 @@ describe("CLI arguments", () => {
 
   it("renders concise general and command help", () => {
     expect(renderCliHelp()).toContain("Usage: pagent <command> [options]");
-    expect(renderCliHelp()).toContain("init     Enroll this repository");
-    expect(renderCliHelp()).toContain("start    Start the connector");
-    expect(renderCliHelp("init")).toContain("--enrollment <token>");
+    expect(renderCliHelp()).toContain("init        Enroll this repository");
+    expect(renderCliHelp()).toContain("enrollment  Create a single-use");
+    expect(renderCliHelp("connector")).toContain("connector revoke");
+    expect(renderCliHelp()).toContain("start       Start the connector");
+    expect(renderCliHelp("init")).toContain("--enrollment <code>");
     expect(renderCliHelp("start")).toContain("--foreground");
     expect(renderCliHelp("logs")).toContain("--lines <count>");
   });

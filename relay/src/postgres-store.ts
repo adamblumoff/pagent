@@ -2,7 +2,8 @@ import pg from "pg";
 
 import type {
   EncryptedContext,
-  EnrollmentInput,
+  EnrollmentAttempt,
+  EnrollmentCodeInput,
   EnrollmentResult,
   EnqueueInput,
   EnqueueResult,
@@ -12,7 +13,8 @@ import type {
 } from "./types.js";
 
 const { Pool } = pg;
-const NOTIFY_CHANNEL = "pagent_tasks";
+const TASK_NOTIFY_CHANNEL = "pagent_tasks";
+const CREDENTIAL_NOTIFY_CHANNEL = "pagent_credentials";
 
 interface TaskRow {
   id: string;
@@ -30,8 +32,12 @@ interface EnrollmentRow {
   connector_id: string;
   repository_key: string;
   allowed_environments: string[];
-  source_token_hash: string;
-  connector_token_hash: string;
+}
+
+interface EnrollmentCodeRow {
+  active: boolean;
+  used_request_hash: string | null;
+  connector_id: string | null;
 }
 
 function taskFromRow(row: TaskRow): RelayTask {
@@ -55,6 +61,7 @@ function taskFromRow(row: TaskRow): RelayTask {
 export class PostgresRelayStore implements RelayStore {
   readonly #pool: pg.Pool;
   readonly #listeners = new Map<string, Set<() => void>>();
+  readonly #credentialListeners = new Set<(connectorId: string) => void>();
   #closed = false;
   #listenerClient: pg.PoolClient | undefined;
   #reconnectTimer: NodeJS.Timeout | undefined;
@@ -71,9 +78,31 @@ export class PostgresRelayStore implements RelayStore {
         allowed_environments TEXT[] NOT NULL,
         source_token_hash TEXT NOT NULL UNIQUE CHECK (length(source_token_hash) = 43),
         connector_token_hash TEXT NOT NULL UNIQUE CHECK (length(connector_token_hash) = 43),
+        revoked_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CHECK (cardinality(allowed_environments) > 0)
       );
+
+      ALTER TABLE pagent_enrollments
+        ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+
+      CREATE TABLE IF NOT EXISTS pagent_enrollment_codes (
+        code_hash TEXT PRIMARY KEY CHECK (length(code_hash) = 43),
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ,
+        used_request_hash TEXT CHECK (
+          used_request_hash IS NULL OR length(used_request_hash) = 43
+        ),
+        connector_id TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK (
+          (used_at IS NULL AND used_request_hash IS NULL) OR
+          (used_at IS NOT NULL AND used_request_hash IS NOT NULL)
+        )
+      );
+
+      ALTER TABLE pagent_enrollment_codes
+        ADD COLUMN IF NOT EXISTS connector_id TEXT;
 
       CREATE TABLE IF NOT EXISTS pagent_events (
         event_id TEXT PRIMARY KEY,
@@ -157,57 +186,157 @@ export class PostgresRelayStore implements RelayStore {
     await this.#connectListener();
   }
 
-  async enroll(input: EnrollmentInput): Promise<EnrollmentResult> {
-    const inserted = await this.#pool.query<{ connector_id: string }>(
-      `INSERT INTO pagent_enrollments (
-         connector_id, repository_key, allowed_environments,
-         source_token_hash, connector_token_hash
-       ) VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT DO NOTHING
-       RETURNING connector_id`,
-      [
-        input.connectorId,
-        input.repositoryKey,
-        input.allowedEnvironments,
-        input.sourceTokenHash,
-        input.connectorTokenHash,
-      ],
+  async createEnrollmentCode(input: EnrollmentCodeInput): Promise<void> {
+    await this.#pool.query(
+      `INSERT INTO pagent_enrollment_codes (
+         code_hash, expires_at, connector_id
+       ) VALUES ($1, $2, $3)`,
+      [input.codeHash, input.expiresAt, input.connectorId ?? null],
     );
-    if ((inserted.rowCount ?? 0) > 0) {
-      return { status: "enrolled" };
-    }
+  }
 
-    const existing = await this.#pool.query<EnrollmentRow>(
-      `SELECT connector_id, repository_key, allowed_environments,
-              source_token_hash, connector_token_hash
-         FROM pagent_enrollments
-        WHERE connector_id = $1`,
-      [input.connectorId],
-    );
-    const row = existing.rows[0];
-    if (
-      row &&
-      row.repository_key === input.repositoryKey &&
-      row.source_token_hash === input.sourceTokenHash &&
-      row.connector_token_hash === input.connectorTokenHash &&
-      row.allowed_environments.length === input.allowedEnvironments.length &&
-      row.allowed_environments.every(
-        (environment, index) => environment === input.allowedEnvironments[index],
-      )
-    ) {
-      return { status: "existing" };
+  async enroll(attempt: EnrollmentAttempt): Promise<EnrollmentResult> {
+    try {
+      return await this.#transaction(async (client) => {
+        const codes = await client.query<EnrollmentCodeRow>(
+          `SELECT expires_at > NOW() AS active, used_request_hash, connector_id
+             FROM pagent_enrollment_codes
+            WHERE code_hash = $1
+            FOR UPDATE`,
+          [attempt.codeHash],
+        );
+        const code = codes.rows[0];
+        if (code === undefined) {
+          return { status: "invalid-code" };
+        }
+        if (code.used_request_hash !== null) {
+          if (code.used_request_hash !== attempt.requestHash) {
+            return { status: "invalid-code" };
+          }
+          const input = attempt.enrollment;
+          const current = await client.query(
+            `SELECT 1
+               FROM pagent_enrollments
+              WHERE connector_id = $1
+                AND repository_key = $2
+                AND allowed_environments = $3::text[]
+                AND source_token_hash = $4
+                AND connector_token_hash = $5
+                AND revoked_at IS NULL`,
+            [
+              input.connectorId,
+              input.repositoryKey,
+              input.allowedEnvironments,
+              input.sourceTokenHash,
+              input.connectorTokenHash,
+            ],
+          );
+          return (current.rowCount ?? 0) > 0
+            ? { status: "existing" }
+            : { status: "invalid-code" };
+        }
+        if (!code.active) {
+          return { status: "invalid-code" };
+        }
+
+        const input = attempt.enrollment;
+        const codeAllowsRequest = input.replace
+          ? code.connector_id === input.connectorId
+          : code.connector_id === null;
+        if (!codeAllowsRequest) {
+          return { status: "invalid-code" };
+        }
+        const existing = await client.query<{ connector_id: string }>(
+          `SELECT connector_id
+             FROM pagent_enrollments
+            WHERE connector_id = $1
+            FOR UPDATE`,
+          [input.connectorId],
+        );
+        const exists = (existing.rowCount ?? 0) > 0;
+        if (exists !== input.replace) {
+          return { status: "conflict" };
+        }
+
+        let status: "enrolled" | "rotated";
+        if (exists) {
+          await client.query(
+            `UPDATE pagent_enrollments
+                SET repository_key = $2,
+                    allowed_environments = $3,
+                    source_token_hash = $4,
+                    connector_token_hash = $5,
+                    revoked_at = NULL
+              WHERE connector_id = $1`,
+            [
+              input.connectorId,
+              input.repositoryKey,
+              input.allowedEnvironments,
+              input.sourceTokenHash,
+              input.connectorTokenHash,
+            ],
+          );
+          status = "rotated";
+        } else {
+          await client.query(
+            `INSERT INTO pagent_enrollments (
+               connector_id, repository_key, allowed_environments,
+               source_token_hash, connector_token_hash
+             ) VALUES ($1, $2, $3, $4, $5)`,
+            [
+              input.connectorId,
+              input.repositoryKey,
+              input.allowedEnvironments,
+              input.sourceTokenHash,
+              input.connectorTokenHash,
+            ],
+          );
+          status = "enrolled";
+        }
+        await client.query(
+          `UPDATE pagent_enrollment_codes
+              SET used_at = NOW(), used_request_hash = $2
+            WHERE code_hash = $1`,
+          [attempt.codeHash, attempt.requestHash],
+        );
+        if (status === "rotated") {
+          await client.query("SELECT pg_notify($1, $2)", [
+            CREDENTIAL_NOTIFY_CHANNEL,
+            input.connectorId,
+          ]);
+        }
+        return { status };
+      });
+    } catch (error) {
+      if (isUniqueViolation(error)) return { status: "conflict" };
+      throw error;
     }
-    return { status: "conflict" };
+  }
+
+  async revokeConnector(connectorId: string): Promise<boolean> {
+    return this.#transaction(async (client) => {
+      const result = await client.query(
+        `UPDATE pagent_enrollments
+            SET revoked_at = COALESCE(revoked_at, NOW())
+          WHERE connector_id = $1`,
+        [connectorId],
+      );
+      if ((result.rowCount ?? 0) === 0) return false;
+      await client.query("SELECT pg_notify($1, $2)", [
+        CREDENTIAL_NOTIFY_CHANNEL,
+        connectorId,
+      ]);
+      return true;
+    });
   }
 
   async findSource(
     sourceTokenHash: string,
   ): Promise<SourceAuthorization | undefined> {
     const result = await this.#pool.query<EnrollmentRow>(
-      `SELECT connector_id, repository_key, allowed_environments,
-              source_token_hash, connector_token_hash
+      `SELECT connector_id, repository_key, allowed_environments
          FROM pagent_enrollments
-        WHERE source_token_hash = $1`,
+        WHERE source_token_hash = $1 AND revoked_at IS NULL`,
       [sourceTokenHash],
     );
     const row = result.rows[0];
@@ -227,7 +356,9 @@ export class PostgresRelayStore implements RelayStore {
     const result = await this.#pool.query(
       `SELECT 1
          FROM pagent_enrollments
-        WHERE connector_id = $1 AND connector_token_hash = $2`,
+        WHERE connector_id = $1
+          AND connector_token_hash = $2
+          AND revoked_at IS NULL`,
       [connectorId, connectorTokenHash],
     );
     return (result.rowCount ?? 0) > 0;
@@ -346,7 +477,7 @@ export class PostgresRelayStore implements RelayStore {
         [input.event.id],
       );
       await client.query("SELECT pg_notify($1, $2)", [
-        NOTIFY_CHANNEL,
+        TASK_NOTIFY_CHANNEL,
         input.source.connectorId,
       ]);
       await client.query("COMMIT");
@@ -397,6 +528,13 @@ export class PostgresRelayStore implements RelayStore {
     };
   }
 
+  subscribeCredentialChanges(
+    listener: (connectorId: string) => void,
+  ): () => void {
+    this.#credentialListeners.add(listener);
+    return () => this.#credentialListeners.delete(listener);
+  }
+
   async health(): Promise<void> {
     if (!this.#listenerClient) {
       throw new Error("Postgres notification connection is unavailable");
@@ -407,6 +545,7 @@ export class PostgresRelayStore implements RelayStore {
   async close(): Promise<void> {
     this.#closed = true;
     this.#listeners.clear();
+    this.#credentialListeners.clear();
     if (this.#reconnectTimer) {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = undefined;
@@ -415,10 +554,25 @@ export class PostgresRelayStore implements RelayStore {
       const client = this.#listenerClient;
       this.#listenerClient = undefined;
       client.removeAllListeners();
-      await client.query(`UNLISTEN ${NOTIFY_CHANNEL}`).catch(() => undefined);
+      await client.query("UNLISTEN *").catch(() => undefined);
       client.release();
     }
     await this.#pool.end();
+  }
+
+  async #transaction<T>(run: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.#pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await run(client);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async #connectListener(): Promise<void> {
@@ -428,7 +582,8 @@ export class PostgresRelayStore implements RelayStore {
       return;
     }
     try {
-      await client.query(`LISTEN ${NOTIFY_CHANNEL}`);
+      await client.query(`LISTEN ${TASK_NOTIFY_CHANNEL}`);
+      await client.query(`LISTEN ${CREDENTIAL_NOTIFY_CHANNEL}`);
     } catch (error) {
       client.release(true);
       throw error;
@@ -436,11 +591,17 @@ export class PostgresRelayStore implements RelayStore {
 
     this.#listenerClient = client;
     client.on("notification", (notification) => {
-      if (notification.channel !== NOTIFY_CHANNEL || !notification.payload) {
+      if (!notification.payload) {
         return;
       }
-      for (const listener of this.#listeners.get(notification.payload) ?? []) {
-        listener();
+      if (notification.channel === TASK_NOTIFY_CHANNEL) {
+        for (const listener of this.#listeners.get(notification.payload) ?? []) {
+          listener();
+        }
+      } else if (notification.channel === CREDENTIAL_NOTIFY_CHANNEL) {
+        for (const listener of this.#credentialListeners) {
+          listener(notification.payload);
+        }
       }
     });
     client.once("error", (error) => this.#listenerFailed(client, error));
@@ -452,6 +613,9 @@ export class PostgresRelayStore implements RelayStore {
       for (const listener of listeners) {
         listener();
       }
+    }
+    for (const listener of this.#credentialListeners) {
+      listener("*");
     }
   }
 
@@ -481,4 +645,8 @@ export class PostgresRelayStore implements RelayStore {
     }, 1_000);
     this.#reconnectTimer.unref();
   }
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "23505";
 }

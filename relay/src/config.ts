@@ -157,10 +157,15 @@ function assertUnique(values: readonly string[], name: string): void {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
   const sources = sourcesFromEnvironment(env);
   const connectors = connectorsFromEnvironment(env);
-  const enrollmentToken = env.PAGENT_ENROLLMENT_TOKEN?.trim() || undefined;
-  if (sources.length === 0 && connectors.length === 0 && !enrollmentToken) {
+  if (env.PAGENT_ENROLLMENT_TOKEN !== undefined) {
     throw new Error(
-      "configure static source and connector credentials or PAGENT_ENROLLMENT_TOKEN",
+      "PAGENT_ENROLLMENT_TOKEN is no longer supported; set PAGENT_ADMIN_TOKEN and issue a single-use enrollment code",
+    );
+  }
+  const adminToken = env.PAGENT_ADMIN_TOKEN?.trim() || undefined;
+  if (sources.length === 0 && connectors.length === 0 && !adminToken) {
+    throw new Error(
+      "configure static source and connector credentials or PAGENT_ADMIN_TOKEN",
     );
   }
   assertUnique(
@@ -199,6 +204,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
     ),
     sources,
     connectors,
-    ...(enrollmentToken === undefined ? {} : { enrollmentToken }),
+    ...(adminToken === undefined ? {} : { adminToken }),
   };
 }
