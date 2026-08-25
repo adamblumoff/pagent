@@ -6,34 +6,14 @@ import {
   createEventContextDecryptor,
   type EventContextDecryptor,
 } from "./crypto.js";
-import { decodeBase64Url } from "./encoding.js";
+import type { AgentAdapter, AgentResult } from "./agent.js";
+import type { ConnectorEncryptionConfig } from "./config.js";
 import type {
-  ConnectorEncryptionConfig,
-  ConnectorKeyring,
-} from "./config.js";
-import type {
-  AgentAdapter,
-  AgentResult,
   EncryptedContext,
   JsonValue,
   PagentEvent,
   PagentEventMetadata,
 } from "./types.js";
-
-export {
-  codexAgent,
-  type CodexAgentOptions,
-  type CodexApprovalPolicy,
-  type CodexSandboxMode,
-} from "./codex.js";
-export {
-  defineConnectorConfig,
-  type ConnectorConfig,
-  type ConnectorEncryptionConfig,
-  type ConnectorKeyring,
-  type ConnectorRelayConfig,
-} from "./config.js";
-export type { AgentAdapter, AgentRequest, AgentResult } from "./types.js";
 
 export interface RelayTask {
   id: string;
@@ -73,11 +53,12 @@ export interface RelayConnector {
 }
 
 interface InboxState {
-  version: 2;
+  version: 3;
   cursor?: string;
   pending: RelayTask[];
-  completed: string[];
 }
+
+const MAX_SEQUENCE_ID = 9_223_372_036_854_775_807n;
 
 interface SseMessage {
   id: string;
@@ -99,12 +80,12 @@ class FileInbox {
 
   async receive(task: RelayTask): Promise<void> {
     const state = await this.#load();
-    state.cursor = task.id;
+    if (state.cursor !== undefined && !sequenceAfter(task.id, state.cursor)) {
+      return;
+    }
 
-    if (
-      !state.completed.includes(task.id) &&
-      !state.pending.some((pending) => pending.id === task.id)
-    ) {
+    state.cursor = task.id;
+    if (!state.pending.some((pending) => pending.id === task.id)) {
       state.pending.push(task);
     }
 
@@ -112,12 +93,14 @@ class FileInbox {
   }
 
   async skip(id: string): Promise<void> {
-    const state = await this.#load();
-    state.cursor = id;
-    state.pending = state.pending.filter((task) => task.id !== id);
-    if (!state.completed.includes(id)) {
-      state.completed.push(id);
+    if (!isTaskId(id)) {
+      throw new Error("Relay task IDs must be positive 64-bit integers.");
     }
+    const state = await this.#load();
+    if (state.cursor === undefined || sequenceAfter(id, state.cursor)) {
+      state.cursor = id;
+    }
+    state.pending = state.pending.filter((task) => task.id !== id);
     await this.#save();
   }
 
@@ -128,9 +111,6 @@ class FileInbox {
   async complete(id: string): Promise<void> {
     const state = await this.#load();
     state.pending = state.pending.filter((task) => task.id !== id);
-    if (!state.completed.includes(id)) {
-      state.completed.push(id);
-    }
     await this.#save();
   }
 
@@ -139,14 +119,20 @@ class FileInbox {
       return this.#state;
     }
 
+    let parsed: unknown;
     try {
-      const parsed: unknown = JSON.parse(await readFile(this.#path, "utf8"));
-      this.#state = inboxState(parsed);
+      parsed = JSON.parse(await readFile(this.#path, "utf8"));
     } catch (error) {
       if (!isNodeError(error) || error.code !== "ENOENT") {
         throw error;
       }
-      this.#state = { version: 2, pending: [], completed: [] };
+      this.#state = { version: 3, pending: [] };
+      return this.#state;
+    }
+
+    this.#state = inboxState(parsed);
+    if (record(parsed)?.version === 2) {
+      await this.#save();
     }
 
     return this.#state;
@@ -187,12 +173,22 @@ class DefaultRelayConnector implements RelayConnector {
   #active = false;
 
   constructor(options: RelayConnectorOptions) {
-    this.#url = relayUrl(options.url);
-    this.#token = bearerToken(options.token);
+    this.#url = options.url;
+    this.#token = options.token;
     this.#inbox = new FileInbox(options.inboxPath);
-    this.#repositories = repositoryAllowlist(options.repositories);
-    this.#environments = environmentAllowlist(options.environments);
-    this.#decryptors = decryptionKeyring(options.encryption.keys);
+    this.#repositories = new Map(
+      Object.entries(options.repositories).map(([key, path]) => [
+        key,
+        resolve(path),
+      ]),
+    );
+    this.#environments = new Set(options.environments);
+    this.#decryptors = new Map(
+      Object.entries(options.encryption.keys).map(([keyId, key]) => [
+        keyId,
+        createEventContextDecryptor(key),
+      ]),
+    );
     this.#agent = options.agent;
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#reconnectDelayMs = options.reconnectDelayMs ?? 1_000;
@@ -514,6 +510,7 @@ function relayTask(message: SseMessage): RelayTask {
   const value = record(parsed);
   if (
     value === undefined ||
+    !isTaskId(message.id) ||
     value.id !== message.id ||
     !nonempty(value.type) ||
     !nonempty(value.eventId) ||
@@ -541,21 +538,21 @@ function relayTask(message: SseMessage): RelayTask {
 function inboxState(value: unknown): InboxState {
   const state = record(value);
   if (
-    state?.version !== 2 ||
+    (state?.version !== 2 && state?.version !== 3) ||
     !Array.isArray(state.pending) ||
     !state.pending.every(isRelayTask) ||
-    !Array.isArray(state.completed) ||
-    !state.completed.every((id) => typeof id === "string") ||
-    (state.cursor !== undefined && typeof state.cursor !== "string")
+    (state.cursor !== undefined && !isTaskId(state.cursor)) ||
+    (state.version === 2 &&
+      (!Array.isArray(state.completed) ||
+        !state.completed.every((id) => typeof id === "string")))
   ) {
     throw new Error("Relay connector inbox is invalid.");
   }
 
   return {
-    version: 2,
+    version: 3,
     ...(state.cursor === undefined ? {} : { cursor: state.cursor }),
     pending: state.pending,
-    completed: state.completed,
   };
 }
 
@@ -563,7 +560,7 @@ function isRelayTask(value: unknown): value is RelayTask {
   const task = record(value);
   return (
     task !== undefined &&
-    nonempty(task.id) &&
+    isTaskId(task.id) &&
     nonempty(task.eventId) &&
     nonempty(task.type) &&
     nonempty(task.environment) &&
@@ -572,6 +569,21 @@ function isRelayTask(value: unknown): value is RelayTask {
     nonempty(task.repositoryKey) &&
     isEncryptedContext(task.context)
   );
+}
+
+function isTaskId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[1-9]\d*$/u.test(value) &&
+    BigInt(value) <= MAX_SEQUENCE_ID
+  );
+}
+
+function sequenceAfter(candidate: string, cursor: string): boolean {
+  if (!isTaskId(candidate) || !isTaskId(cursor)) {
+    throw new Error("Relay task IDs must be positive 64-bit integers.");
+  }
+  return BigInt(candidate) > BigInt(cursor);
 }
 
 function isEncryptedContext(value: unknown): value is EncryptedContext {
@@ -604,88 +616,6 @@ function isInvestigationPolicy(
         policy.group === policy.group.trim() &&
         policy.group.length <= 200))
   );
-}
-
-function relayUrl(value: string): string {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error("Relay URL must be a valid HTTP or HTTPS URL.");
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("Relay URL must be a valid HTTP or HTTPS URL.");
-  }
-  return url.toString();
-}
-
-function bearerToken(value: string): string {
-  const token = value.trim();
-  if (token === "" || token !== value || /[\r\n]/u.test(token)) {
-    throw new Error("Relay token must be a non-empty bearer token.");
-  }
-  return token;
-}
-
-function repositoryAllowlist(
-  values: Readonly<Record<string, string>>,
-): Map<string, string> {
-  const repositories = new Map<string, string>();
-  for (const [key, path] of Object.entries(values)) {
-    if (!nonempty(key) || !nonempty(path)) {
-      throw new Error("Repository keys and paths must be non-empty strings.");
-    }
-    repositories.set(key, resolve(path));
-  }
-  return repositories;
-}
-
-function environmentAllowlist(values: readonly string[]): Set<string> {
-  const environments = new Set<string>();
-  for (const environment of values) {
-    if (!nonempty(environment)) {
-      throw new Error("Allowed environments must be non-empty strings.");
-    }
-    environments.add(environment);
-  }
-  return environments;
-}
-
-function decryptionKeyring(
-  values: ConnectorKeyring,
-): Map<string, EventContextDecryptor> {
-  const decryptors = new Map<string, EventContextDecryptor>();
-  for (const [keyId, key] of Object.entries(values)) {
-    if (
-      !nonempty(keyId) ||
-      keyId !== keyId.trim() ||
-      keyId.length > 200 ||
-      typeof key !== "string"
-    ) {
-      throw new Error(
-        "Connector encryption keys must map a trimmed key ID to a 32-byte base64url key.",
-      );
-    }
-    let decoded: Uint8Array;
-    try {
-      decoded = decodeBase64Url(key, `Connector encryption key ${keyId}`);
-    } catch (cause) {
-      throw new Error(
-        "Connector encryption keys must map a trimmed key ID to a 32-byte base64url key.",
-        { cause },
-      );
-    }
-    if (decoded.byteLength !== 32) {
-      throw new Error(
-        "Connector encryption keys must map a trimmed key ID to a 32-byte base64url key.",
-      );
-    }
-    decryptors.set(keyId, createEventContextDecryptor(key));
-  }
-  if (decryptors.size === 0) {
-    throw new Error("Connector encryption requires at least one decryption key.");
-  }
-  return decryptors;
 }
 
 function investigationPrompt(

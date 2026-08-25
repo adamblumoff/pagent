@@ -1,6 +1,7 @@
 packages:
-  - .
-  - demo
+  - fastify
+  - hono
+  - next
 
 allowBuilds:
   esbuild: true

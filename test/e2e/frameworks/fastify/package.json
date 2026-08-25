@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "fastify": "5.12.1",
-    "pagent": "workspace:*"
+    "pagent": "link:../../../.."
   },
   "devDependencies": {
     "@types/node": "26.3.0",

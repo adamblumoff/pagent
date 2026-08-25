@@ -39,12 +39,10 @@ describe("runDoctor", () => {
       "config",
       "repositories",
       "inbox",
-      "state",
       "relay.health",
       "relay.sse",
       "codex",
       "sandbox.runtime",
-      "worktree",
       "sandbox",
     ]);
     expect(report.checks.every(({ status }) => status === "pass")).toBe(true);
@@ -74,7 +72,7 @@ describe("runDoctor", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("detects legacy inbox and incompatible process state", async () => {
+  it("detects a legacy inbox", async () => {
     const report = await runDoctor(
       input(),
       dependencies({
@@ -83,11 +81,7 @@ describe("runDoctor", () => {
             ? directory()
             : file(),
         ),
-        readFile: vi.fn(async (path: string) =>
-          path.endsWith("inbox.json")
-            ? JSON.stringify({ version: 1 })
-            : JSON.stringify({ version: 9 }),
-        ),
+        readFile: vi.fn(async () => JSON.stringify({ version: 1 })),
       }),
     );
 
@@ -97,8 +91,26 @@ describe("runDoctor", () => {
       status: "fail",
       detail: "Inbox uses v1; archive or remove it before starting Pagent.",
     });
-    expect(check(report, "state").status).toBe("fail");
     expect(report.ok).toBe(false);
+  });
+
+  it("accepts a v2 inbox that will migrate on startup", async () => {
+    const report = await runDoctor(
+      input(),
+      dependencies({
+        stat: vi.fn(async (path: string) =>
+          path === resolve("/repo") ? directory() : file(),
+        ),
+        readFile: vi.fn(async () =>
+          JSON.stringify({ version: 2, pending: [], completed: [] }),
+        ),
+      }),
+    );
+
+    expect(check(report, "inbox")).toMatchObject({
+      status: "pass",
+      detail: expect.stringContaining("migrate to v3"),
+    });
   });
 
   it("reports relay status failures and never includes the connector token", async () => {
@@ -118,16 +130,15 @@ describe("runDoctor", () => {
     expect(JSON.stringify(report)).not.toContain("connector-secret");
   });
 
-  it("keeps dirty worktrees and a write-capable sandbox advisory", async () => {
+  it("keeps the write-capable sandbox advisory", async () => {
     const report = await runDoctor(
       input({ codex: { sandboxMode: "workspace-write" } }),
-      dependencies({ gitStatus: vi.fn(async () => " M src/index.ts\n") }),
+      dependencies(),
     );
 
-    expect(check(report, "worktree").status).toBe("warn");
     expect(check(report, "sandbox").status).toBe("warn");
     expect(report.ok).toBe(true);
-    expect(report.warnings).toBe(2);
+    expect(report.warnings).toBe(1);
   });
 
   it("fails a missing repository and an unavailable Codex app server", async () => {
@@ -206,7 +217,6 @@ describe("runDoctor", () => {
     expect(check(report, "sandbox.runtime").remediation).toContain(
       "https://learn.chatgpt.com/docs/sandboxing",
     );
-    expect(report.checks.map(({ id }) => id)).not.toContain("worktree");
     expect(report.checks.map(({ id }) => id)).not.toContain("sandbox");
     expect(report.ok).toBe(false);
     expect(JSON.stringify(report)).not.toContain("secret=hidden");
@@ -242,7 +252,6 @@ function input(overrides: Partial<DoctorInput> = {}): DoctorInput {
     connectorId: "local-connector",
     connectorToken: "connector-secret",
     inboxPath: "/state/inbox.json",
-    statePath: "/state/process.json",
     repositories: { app: "/repo" },
     environments: ["staging"],
     encryption: { keys: { current: KEY } },
@@ -273,7 +282,6 @@ function dependencies(
             headers: { "content-type": "text/event-stream" },
           }),
     ),
-    gitStatus: vi.fn(async () => ""),
     probeCodex: vi.fn(async () => undefined),
     ...overrides,
   };

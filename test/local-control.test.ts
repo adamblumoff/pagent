@@ -49,7 +49,7 @@ describe("local daemon control", () => {
     }
   });
 
-  it("treats a live listener as authoritative over diagnostic state", async () => {
+  it("rejects a second listener while the control endpoint is live", async () => {
     const paths = await temporaryState();
     const first = await startLocalControlServer({
       endpoint: paths.controlEndpoint,

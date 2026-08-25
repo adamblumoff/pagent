@@ -2,8 +2,6 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 
-import type { DaemonMetadata } from "./local-state.js";
-
 const PROTOCOL_VERSION = 1;
 const DEFAULT_TIMEOUT_MS = 5_000;
 const MAX_MESSAGE_BYTES = 64 * 1024;
@@ -26,7 +24,11 @@ export interface LocalHandoffSummary {
   threadId?: string | undefined;
 }
 
-export interface LocalDaemonStatus extends DaemonMetadata {
+export interface LocalDaemonStatus {
+  version: 1;
+  pid: number;
+  startedAt: string;
+  controlEndpoint: string;
   phase: LocalDaemonPhase;
   relayConnected: boolean;
   pendingTasks: number;

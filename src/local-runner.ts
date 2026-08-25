@@ -9,8 +9,6 @@ import {
 } from "./local-control.js";
 import {
   ensureLocalStateDirectory,
-  removeDaemonMetadata,
-  writeDaemonMetadata,
   type LocalStatePaths,
 } from "./local-state.js";
 
@@ -67,7 +65,6 @@ export async function runLocalConnector(
   });
 
   try {
-    await writeDaemonMetadata(options.paths, status);
     process.once("SIGINT", onSignal);
     process.once("SIGTERM", onSignal);
 
@@ -137,11 +134,10 @@ export async function runLocalConnector(
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
     await control.close();
-    await removeDaemonMetadata(options.paths, process.pid);
   }
 }
 
-export function connectorEventsUrl(baseUrl: string, connectorId: string): string {
+function connectorEventsUrl(baseUrl: string, connectorId: string): string {
   return new URL(
     `/v1/connectors/${encodeURIComponent(connectorId)}/events`,
     baseUrl,
@@ -180,7 +176,7 @@ async function pendingTaskCount(inboxPath: string): Promise<number> {
       typeof value === "object" &&
       value !== null &&
       "version" in value &&
-      value.version === 2 &&
+      (value.version === 2 || value.version === 3) &&
       "pending" in value &&
       Array.isArray(value.pending)
     ) {

@@ -10,7 +10,7 @@ import {
   type LocalDaemonStatus,
 } from "../src/local-control.js";
 import { runLocalConnector } from "../src/local-runner.js";
-import { localStatePaths, readDaemonMetadata } from "../src/local-state.js";
+import { localStatePaths } from "../src/local-state.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -80,7 +80,6 @@ describe("local connector runner", () => {
       });
       await requestLocalControl(paths.controlEndpoint, { method: "stop" });
       await runner;
-      await expect(readDaemonMetadata(paths)).resolves.toBeUndefined();
     } finally {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));

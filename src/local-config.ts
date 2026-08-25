@@ -3,7 +3,10 @@ import { dirname, join, parse, resolve } from "node:path";
 import { loadEnvFile } from "node:process";
 import { pathToFileURL } from "node:url";
 
-import type { ConnectorConfig } from "./config.js";
+import {
+  parseConnectorConfig,
+  type ConnectorConfig,
+} from "./config.js";
 
 const CONFIG_NAMES = [
   "pagent.config.ts",
@@ -45,11 +48,12 @@ export async function loadConnectorConfig(options: {
   }
 
   const module = record(imported);
-  const config = module?.default;
-  if (!isConnectorConfig(config)) {
-    throw new Error(
-      `Pagent config at ${path} must default-export defineConnectorConfig(...).`,
-    );
+  let config: ConnectorConfig;
+  try {
+    config = parseConnectorConfig(module?.default);
+  } catch (cause) {
+    const detail = cause instanceof Error ? ` ${cause.message}` : "";
+    throw new Error(`Pagent config at ${path} is invalid.${detail}`, { cause });
   }
 
   return { config, path, projectDirectory: dirname(path) };
@@ -90,26 +94,6 @@ async function exists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-function isConnectorConfig(value: unknown): value is ConnectorConfig {
-  const config = record(value);
-  const relay = record(config?.relay);
-  const encryption = record(config?.encryption);
-  return (
-    config !== undefined &&
-    relay !== undefined &&
-    typeof relay.url === "string" &&
-    typeof relay.token === "string" &&
-    typeof relay.connectorId === "string" &&
-    record(config.repositories) !== undefined &&
-    Array.isArray(config.environments) &&
-    encryption !== undefined &&
-    record(encryption.keys) !== undefined &&
-    (config.stateDirectory === undefined ||
-      (typeof config.stateDirectory === "string" &&
-        config.stateDirectory !== ""))
-  );
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

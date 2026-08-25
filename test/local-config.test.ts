@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { loadConnectorConfig } from "../src/local-config.js";
 
+const KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -32,7 +33,7 @@ describe("local connector config", () => {
         relay: { url: process.env.PAGENT_TEST_RELAY_URL, token: "secret", connectorId: "local" },
         repositories: { pagent: ${JSON.stringify(root)} },
         environments: ["staging"],
-        encryption: { keys: { current: "key" } }
+        encryption: { keys: { current: ${JSON.stringify(KEY)} } }
       };\n`,
     );
 
@@ -49,8 +50,28 @@ describe("local connector config", () => {
     await writeFile(path, "export default { codex: {} };\n");
 
     await expect(loadConnectorConfig({ cwd: root })).rejects.toThrow(
-      "must default-export defineConnectorConfig",
+      "is invalid. Relay settings are required.",
     );
+  });
+
+  it("rejects invalid key material without including it in the error", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "pagent.config.mjs");
+    await writeFile(
+      path,
+      `export default {
+        relay: { url: "https://relay.example.test", token: "secret", connectorId: "local" },
+        repositories: { pagent: ${JSON.stringify(root)} },
+        environments: ["staging"],
+        encryption: { keys: { current: "secret-key-material" } }
+      };\n`,
+    );
+
+    const loading = loadConnectorConfig({ cwd: root });
+    await expect(loading).rejects.toThrow(
+      "Each connector encryption key must be canonical unpadded base64url.",
+    );
+    await expect(loading).rejects.not.toThrow("secret-key-material");
   });
 
   it("explains when no config exists", async () => {

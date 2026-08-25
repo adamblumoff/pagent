@@ -9,9 +9,10 @@ import type { Readable } from "node:stream";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { RelayEventEnvelope } from "../../src/index.js";
+import type { RelayEventEnvelope } from "../../src/types.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
+const FRAMEWORK_ROOT = resolve(ROOT, "test/e2e/frameworks");
 const TEST_ENCRYPTION_KEY =
   "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const TEST_RELAY_TOKEN = "e2e-relay-token";
@@ -181,7 +182,7 @@ function startFixture(
         ]
       : ["--filter", fixture.packageName, "start"];
   const child = spawn(command, args, {
-    cwd: ROOT,
+    cwd: FRAMEWORK_ROOT,
     env: commonEnvironment,
     stdio: ["ignore", "pipe", "pipe"],
   });

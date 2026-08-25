@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "hono": "4.13.4",
-    "pagent": "workspace:*"
+    "pagent": "link:../../../.."
   },
   "devDependencies": {
     "typescript": "7.0.2",

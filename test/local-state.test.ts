@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,9 +7,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   ensureLocalStateDirectory,
   localStatePaths,
-  readDaemonMetadata,
-  removeDaemonMetadata,
-  writeDaemonMetadata,
 } from "../src/local-state.js";
 
 const temporaryDirectories: string[] = [];
@@ -32,7 +29,6 @@ describe("local state", () => {
       }),
     ).toMatchObject({
       directory: "/home/ada/.local/state/pagent",
-      daemonMetadataPath: "/home/ada/.local/state/pagent/daemon.json",
       inboxPath: "/home/ada/.local/state/pagent/inbox.json",
       logPath: "/home/ada/.local/state/pagent/connector.log",
       controlEndpoint: "/home/ada/.local/state/pagent/control.sock",
@@ -67,49 +63,15 @@ describe("local state", () => {
     ).toBe("/explicit");
   });
 
-  it("writes restricted diagnostic metadata without unknown fields", async () => {
-    const directory = await temporaryDirectory();
-    const paths = localStatePaths({ stateDirectory: join(directory, "state") });
-    const metadata = {
-      version: 1 as const,
-      pid: 42,
-      startedAt: "2026-08-25T12:00:00.000Z",
-      controlEndpoint: paths.controlEndpoint,
-      token: "must-not-be-persisted",
-    };
-
-    await writeDaemonMetadata(paths, metadata);
-
-    expect(await readDaemonMetadata(paths)).toEqual({
-      version: 1,
-      pid: 42,
-      startedAt: "2026-08-25T12:00:00.000Z",
-      controlEndpoint: paths.controlEndpoint,
-    });
-    expect(await readFile(paths.daemonMetadataPath, "utf8")).not.toContain(
-      "must-not-be-persisted",
-    );
-    if (process.platform !== "win32") {
-      expect((await stat(paths.directory)).mode & 0o777).toBe(0o700);
-      expect((await stat(paths.daemonMetadataPath)).mode & 0o777).toBe(0o600);
-    }
-  });
-
-  it("only removes metadata still owned by the expected PID", async () => {
+  it("creates a restricted local state directory", async () => {
     const directory = await temporaryDirectory();
     const paths = localStatePaths({ stateDirectory: join(directory, "state") });
     await ensureLocalStateDirectory(paths);
-    await writeDaemonMetadata(paths, {
-      version: 1,
-      pid: 84,
-      startedAt: "2026-08-25T12:00:00.000Z",
-      controlEndpoint: paths.controlEndpoint,
-    });
 
-    expect(await removeDaemonMetadata(paths, 42)).toBe(false);
-    expect(await readDaemonMetadata(paths)).toBeDefined();
-    expect(await removeDaemonMetadata(paths, 84)).toBe(true);
-    expect(await readDaemonMetadata(paths)).toBeUndefined();
+    expect((await stat(paths.directory)).isDirectory()).toBe(true);
+    if (process.platform !== "win32") {
+      expect((await stat(paths.directory)).mode & 0o777).toBe(0o700);
+    }
   });
 });
 

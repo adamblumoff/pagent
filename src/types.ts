@@ -39,34 +39,6 @@ export interface InvestigationPolicy {
   group?: string | undefined;
 }
 
-export interface AgentRequest<TPayload = unknown> {
-  cwd: string;
-  prompt: string;
-  event: PagentEvent<TPayload>;
-  signal?: AgentAbortSignal | undefined;
-}
-
-/** Runtime-neutral subset of AbortSignal used to cancel a local agent run. */
-export interface AgentAbortSignal {
-  readonly aborted: boolean;
-  readonly reason: unknown;
-  addEventListener(
-    type: "abort",
-    listener: () => void,
-    options?: { once?: boolean },
-  ): void;
-  removeEventListener(type: "abort", listener: () => void): void;
-}
-
-export interface AgentResult {
-  threadId?: string;
-  finalResponse?: string;
-}
-
-export interface AgentAdapter {
-  run(request: AgentRequest): Promise<AgentResult>;
-}
-
 declare const eventPayload: unique symbol;
 
 export interface EventDefinition<TPayload> {

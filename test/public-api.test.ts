@@ -1,13 +1,21 @@
 import { describe, expect, it } from "vitest";
 
 import * as cloudSdk from "../src/index.js";
-import * as localConnector from "../src/connector.js";
+import * as localConnector from "../src/connector-entry.js";
 import type { ObserveResultOptions } from "../src/index.js";
 
 type CloudExports = typeof import("../src/index.js");
 
-// @ts-expect-error Codex execution is local-only and must use pagent/connector.
+// @ts-expect-error Codex execution belongs to the Pagent CLI.
 type RootMustNotExportCodex = CloudExports["codexAgent"];
+
+type ConnectorExports = typeof import("../src/connector-entry.js");
+
+// @ts-expect-error Connector process lifecycle belongs to the Pagent CLI.
+type ConnectorMustNotExportFactory = ConnectorExports["createRelayConnector"];
+
+// @ts-expect-error Direct Codex execution belongs to the Pagent CLI.
+type ConnectorMustNotExportCodex = ConnectorExports["codexAgent"];
 
 const typedEvent = cloudSdk.defineEvent<{ reason: string }>({
   name: "typed.failed",
@@ -54,11 +62,7 @@ describe("public API boundaries", () => {
     ]);
   });
 
-  it("exposes local runtime APIs from the connector entry point", () => {
-    expect(localConnector).toMatchObject({
-      codexAgent: expect.any(Function),
-      createRelayConnector: expect.any(Function),
-      defineConnectorConfig: expect.any(Function),
-    });
+  it("limits the connector entry point to configuration", () => {
+    expect(Object.keys(localConnector)).toEqual(["defineConnectorConfig"]);
   });
 });

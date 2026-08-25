@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { access, readFile, stat } from "node:fs/promises";
 import { dirname, parse, resolve } from "node:path";
@@ -9,8 +8,10 @@ import {
   type CodexAgentOptions,
   type CodexProbeOptions,
 } from "./codex.js";
-import type { ConnectorEncryptionConfig } from "./config.js";
-import { decodeBase64Url } from "./encoding.js";
+import {
+  connectorConfigIssue,
+  type ConnectorEncryptionConfig,
+} from "./config.js";
 
 export type DoctorStatus = "pass" | "warn" | "fail";
 
@@ -27,12 +28,10 @@ export type DoctorCheckId =
   | "config"
   | "repositories"
   | "inbox"
-  | "state"
   | "relay.health"
   | "relay.sse"
   | "codex"
   | "sandbox.runtime"
-  | "worktree"
   | "sandbox";
 
 export interface DoctorReport {
@@ -47,7 +46,6 @@ export interface DoctorInput {
   connectorId: string;
   connectorToken: string;
   inboxPath: string;
-  statePath: string;
   repositories: Readonly<Record<string, string>>;
   environments: readonly string[];
   encryption: ConnectorEncryptionConfig;
@@ -67,7 +65,6 @@ export interface DoctorDependencies {
   stat(path: string): Promise<FileInfo>;
   access(path: string, mode: number): Promise<void>;
   readFile(path: string): Promise<string>;
-  gitStatus(path: string): Promise<string>;
   probeCodex(options?: CodexProbeOptions): Promise<void>;
 }
 
@@ -77,7 +74,6 @@ const defaultDependencies: DoctorDependencies = {
   stat,
   access: (path, mode) => access(path, mode),
   readFile: (path) => readFile(path, "utf8"),
-  gitStatus,
   probeCodex: probeCodexAppServer,
 };
 
@@ -102,7 +98,18 @@ export async function runDoctor(
         ),
   );
 
-  const configValid = connectorConfigIsValid(input);
+  const configValid =
+    connectorConfigIssue({
+      relay: {
+        url: input.relayUrl,
+        connectorId: input.connectorId,
+        token: input.connectorToken,
+      },
+      repositories: input.repositories,
+      environments: input.environments,
+      encryption: input.encryption,
+      ...(input.codex === undefined ? {} : { codex: input.codex }),
+    }) === undefined;
   checks.push(
     configValid
       ? check(
@@ -122,7 +129,6 @@ export async function runDoctor(
   const repositories = await checkRepositories(input.repositories, deps);
   checks.push(repositories);
   checks.push(await checkInbox(input.inboxPath, deps));
-  checks.push(await checkState(input.statePath, deps));
 
   if (configValid && missingCapabilities.length === 0) {
     checks.push(await checkRelayHealth(input.relayUrl, timeoutMs, deps));
@@ -153,7 +159,6 @@ export async function runDoctor(
     )),
   );
   if (input.includeAdvisories !== false) {
-    checks.push(await checkWorktrees(input.repositories, deps));
     checks.push(checkSandbox(input.codex));
   }
 
@@ -178,57 +183,6 @@ function check(
     detail,
     ...(remediation === undefined ? {} : { remediation }),
   };
-}
-
-function connectorConfigIsValid(input: DoctorInput): boolean {
-  try {
-    const relay = new URL(input.relayUrl);
-    if (
-      (relay.protocol !== "http:" && relay.protocol !== "https:") ||
-      relay.username !== "" ||
-      relay.password !== ""
-    ) {
-      return false;
-    }
-    if (
-      !trimmed(input.connectorId) ||
-      !trimmed(input.connectorToken) ||
-      /[\r\n]/u.test(input.connectorToken) ||
-      !Array.isArray(input.environments) ||
-      input.environments.length === 0 ||
-      !input.environments.every(trimmed)
-    ) {
-      return false;
-    }
-
-    const repositories = record(input.repositories);
-    if (
-      repositories === undefined ||
-      Object.keys(repositories).length === 0 ||
-      !Object.entries(repositories).every(
-        ([key, path]) => trimmed(key) && trimmed(path),
-      )
-    ) {
-      return false;
-    }
-
-    const keys = record(input.encryption?.keys);
-    if (keys === undefined || Object.keys(keys).length === 0) {
-      return false;
-    }
-    return Object.entries(keys).every(([keyId, key]) => {
-      if (!trimmed(keyId) || keyId.length > 200 || typeof key !== "string") {
-        return false;
-      }
-      try {
-        return decodeBase64Url(key, "Connector encryption key").byteLength === 32;
-      } catch {
-        return false;
-      }
-    });
-  } catch {
-    return false;
-  }
 }
 
 async function checkRepositories(
@@ -304,7 +258,7 @@ async function checkInbox(
     );
   }
   const value = record(storage.value);
-  if (value?.version !== 2) {
+  if (value?.version !== 2 && value?.version !== 3) {
     return check(
       "inbox",
       "Encrypted inbox",
@@ -314,63 +268,24 @@ async function checkInbox(
         : "Inbox has an unsupported or invalid format.",
     );
   }
-  if (!Array.isArray(value.pending) || !Array.isArray(value.completed)) {
+  if (
+    !Array.isArray(value.pending) ||
+    (value.version === 2 && !Array.isArray(value.completed))
+  ) {
     return check(
       "inbox",
       "Encrypted inbox",
       "fail",
-      "Inbox v2 is malformed.",
+      `Inbox v${value.version} is malformed.`,
     );
   }
   return check(
     "inbox",
     "Encrypted inbox",
     "pass",
-    "Inbox v2 is readable and writable.",
-  );
-}
-
-async function checkState(
-  statePath: string,
-  deps: DoctorDependencies,
-): Promise<DoctorCheck> {
-  const storage = await inspectJsonFile(statePath, deps);
-  if (storage.kind === "missing") {
-    return storage.parentWritable
-      ? check(
-          "state",
-          "Local process state",
-          "pass",
-          "Process state will be created in an accessible location.",
-        )
-      : check(
-          "state",
-          "Local process state",
-          "fail",
-          "Process state location is not writable.",
-        );
-  }
-  if (storage.kind === "inaccessible") {
-    return check(
-      "state",
-      "Local process state",
-      "fail",
-      "Process state is not a readable and writable regular file.",
-    );
-  }
-  if (record(storage.value)?.version !== 1) {
-    return check(
-      "state",
-      "Local process state",
-      "fail",
-      "Process state has an unsupported or invalid format.",
-    );
-  }
-  return check(
-    "state",
-    "Local process state",
-    "pass",
-    "Process state v1 is readable and writable.",
+    value.version === 2
+      ? "Inbox v2 is readable and writable and will migrate to v3 on startup."
+      : "Inbox v3 is readable and writable.",
   );
 }
 
@@ -657,48 +572,6 @@ function sandboxFailure(causeText: string): {
   };
 }
 
-async function checkWorktrees(
-  repositories: Readonly<Record<string, string>>,
-  deps: DoctorDependencies,
-): Promise<DoctorCheck> {
-  const paths = Object.values(record(repositories) ?? {}).filter(
-    (value): value is string => typeof value === "string",
-  );
-  let dirty = 0;
-  let unavailable = 0;
-  for (const path of paths) {
-    try {
-      if ((await deps.gitStatus(resolve(path))).trim() !== "") {
-        dirty += 1;
-      }
-    } catch {
-      unavailable += 1;
-    }
-  }
-  if (dirty > 0) {
-    return check(
-      "worktree",
-      "Repository worktrees",
-      "warn",
-      `${dirty} mapped repositor${dirty === 1 ? "y has" : "ies have"} uncommitted changes.`,
-    );
-  }
-  if (unavailable > 0 || paths.length === 0) {
-    return check(
-      "worktree",
-      "Repository worktrees",
-      "warn",
-      "Git status could not be checked for every repository.",
-    );
-  }
-  return check(
-    "worktree",
-    "Repository worktrees",
-    "pass",
-    "Mapped repository worktrees are clean.",
-  );
-}
-
 function checkSandbox(codex: CodexAgentOptions | undefined): DoctorCheck {
   const mode = codex?.sandboxMode;
   if (mode === "read-only") {
@@ -744,33 +617,8 @@ function runtimeCapabilities(): readonly string[] {
   return missing;
 }
 
-async function gitStatus(path: string): Promise<string> {
-  return new Promise((resolveStatus, rejectStatus) => {
-    execFile(
-      "git",
-      ["status", "--porcelain"],
-      { cwd: path, encoding: "utf8", maxBuffer: 1024 * 1024 },
-      (error, stdout) => {
-        if (error) {
-          rejectStatus(error);
-        } else {
-          resolveStatus(stdout);
-        }
-      },
-    );
-  });
-}
-
 function validTimeout(value: number | undefined): value is number {
   return value !== undefined && Number.isFinite(value) && value > 0;
-}
-
-function nonempty(value: unknown): value is string {
-  return typeof value === "string" && value.trim() !== "";
-}
-
-function trimmed(value: unknown): value is string {
-  return nonempty(value) && value === value.trim();
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

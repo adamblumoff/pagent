@@ -3,9 +3,9 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
-import { MemoryRelayStore } from "../src/memory-store.js";
 import { createRelayServer } from "../src/server.js";
-import type { RelayConfig } from "../src/types.js";
+import type { RelayConfig, RelayTask } from "../src/types.js";
+import { RecordingRelayStore } from "./recording-store.js";
 
 const config: RelayConfig = {
   port: 0,
@@ -40,6 +40,29 @@ function event(id: string, overrides: Record<string, unknown> = {}) {
   };
 }
 
+function task(
+  id: string,
+  eventId: string,
+  overrides: Partial<RelayTask> = {},
+): RelayTask {
+  return {
+    id,
+    eventId,
+    type: "health.failed",
+    environment: "staging",
+    occurredAt: "2026-08-24T12:00:00.000Z",
+    investigation: { cooldownMs: 0 },
+    repositoryKey: "pagent-demo",
+    context: {
+      algorithm: "A256GCM",
+      keyId: "staging-2026-08",
+      iv: "AAECAwQFBgcICQoL",
+      ciphertext: "AAECAwQFBgcICQoLDA0ODw",
+    },
+    ...overrides,
+  };
+}
+
 async function encryptedContextFor(value: unknown) {
   const iv = Uint8Array.from({ length: 12 }, (_, index) => index);
   const key = await crypto.subtle.importKey(
@@ -63,12 +86,12 @@ async function encryptedContextFor(value: unknown) {
 }
 
 describe("relay HTTP API", () => {
-  let store: MemoryRelayStore;
+  let store: RecordingRelayStore;
   let server: ReturnType<typeof createRelayServer>;
   let baseUrl: string;
 
   beforeEach(async () => {
-    store = new MemoryRelayStore();
+    store = new RecordingRelayStore();
     await store.initialize();
     server = createRelayServer({ config, store });
     server.listen(0, "127.0.0.1");
@@ -111,17 +134,17 @@ describe("relay HTTP API", () => {
     };
     assert.equal(body.status, "queued");
     assert.equal(body.taskId, "1");
-    const [task] = await store.tasksAfter("local-1", "0", 10);
-    assert.equal(task?.repositoryKey, "pagent-demo");
-    assert.equal(task?.eventId, "event-1");
-    assert.deepEqual(task?.investigation, { cooldownMs: 0 });
-    assert.deepEqual(task?.context, {
+    const [input] = store.enqueues;
+    assert.equal(input?.source.repositoryKey, "pagent-demo");
+    assert.equal(input?.event.id, "event-1");
+    assert.deepEqual(input?.event.investigation, { cooldownMs: 0 });
+    assert.deepEqual(input?.event.context, {
       algorithm: "A256GCM",
       keyId: "staging-2026-08",
       iv: "AAECAwQFBgcICQoL",
       ciphertext: "AAECAwQFBgcICQoLDA0ODw",
     });
-    assert.doesNotMatch(JSON.stringify(task), /payload|prompt/);
+    assert.doesNotMatch(JSON.stringify(input), /payload|prompt/);
   });
 
   it("fails closed for an environment outside the source policy", async () => {
@@ -262,7 +285,7 @@ describe("relay HTTP API", () => {
     }
   });
 
-  it("deduplicates event IDs and applies cooldown per developer-defined group", async () => {
+  it("maps duplicate and cooldown store outcomes to accepted responses", async () => {
     const ingest = (body: unknown) =>
       fetch(`${baseUrl}/v1/events`, {
         method: "POST",
@@ -273,43 +296,20 @@ describe("relay HTTP API", () => {
         },
       });
 
-    const eastPolicy = {
-      investigation: { cooldownMs: 60_000, group: "us-east-1" },
-    };
-    assert.equal((await ingest(event("event-1", eastPolicy))).status, 201);
-    const duplicate = await ingest(event("event-1", eastPolicy));
+    store.enqueueResults.push({ status: "duplicate" }, { status: "cooldown" });
+
+    const duplicate = await ingest(event("event-1"));
     assert.equal(duplicate.status, 202);
     assert.equal(((await duplicate.json()) as { status: string }).status, "duplicate");
 
-    const cooldown = await ingest(event("event-2", eastPolicy));
+    const cooldown = await ingest(event("event-2"));
     assert.equal(cooldown.status, 202);
     assert.equal(((await cooldown.json()) as { status: string }).status, "cooldown");
-
-    const otherGroup = await ingest(
-      event("event-3", {
-        investigation: { cooldownMs: 60_000, group: "us-west-2" },
-      }),
-    );
-    assert.equal(otherGroup.status, 201);
-
-    assert.equal((await ingest(event("event-4"))).status, 201);
-    assert.equal((await ingest(event("event-5"))).status, 201);
   });
 
   it("replays tasks over authenticated SSE using Last-Event-ID", async () => {
-    for (const id of ["event-1", "event-2"]) {
-      const response = await fetch(`${baseUrl}/v1/events`, {
-        method: "POST",
-        body: JSON.stringify(
-          event(id, { type: id === "event-1" ? "first.failed" : "second.failed" }),
-        ),
-        headers: {
-          authorization: "Bearer source-secret",
-          "content-type": "application/json",
-        },
-      });
-      assert.equal(response.status, 201);
-    }
+    store.publish("local-1", task("1", "event-1", { type: "first.failed" }));
+    store.publish("local-1", task("2", "event-2", { type: "second.failed" }));
 
     const abort = new AbortController();
     const response = await fetch(
@@ -375,9 +375,9 @@ describe("relay HTTP API", () => {
     });
 
     assert.equal(response.status, 201);
-    const [task] = await store.tasksAfter("local-1", "0", 10);
-    assert.equal(task?.context.ciphertext, tamperedCiphertext);
-    const relayRepresentation = JSON.stringify(task);
+    const [input] = store.enqueues;
+    assert.equal(input?.event.context.ciphertext, tamperedCiphertext);
+    const relayRepresentation = JSON.stringify(input);
     assert.doesNotMatch(relayRepresentation, new RegExp(plaintextProbe));
     assert.doesNotMatch(relayRepresentation, /payload|prompt/);
   });
@@ -399,15 +399,7 @@ describe("relay HTTP API", () => {
       text += new TextDecoder().decode(result.value);
     }
 
-    const ingested = await fetch(`${baseUrl}/v1/events`, {
-      method: "POST",
-      body: JSON.stringify(event("live-event")),
-      headers: {
-        authorization: "Bearer source-secret",
-        "content-type": "application/json",
-      },
-    });
-    assert.equal(ingested.status, 201);
+    store.publish("local-1", task("1", "live-event"));
 
     while (!text.includes("event: task")) {
       const result = await reader.read();

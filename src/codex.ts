@@ -3,11 +3,7 @@ import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 
-import type {
-  AgentAbortSignal,
-  AgentAdapter,
-  AgentResult,
-} from "./types.js";
+import type { AgentAdapter, AgentResult } from "./agent.js";
 
 export type CodexApprovalPolicy = "never" | "on-request" | "untrusted";
 export type CodexSandboxMode =
@@ -56,6 +52,13 @@ interface CommandExecResponse {
   stderr: string;
 }
 
+interface AppServerConnection {
+  child: ChildProcessWithoutNullStreams;
+  lines: ReturnType<typeof createInterface>;
+  messages: AsyncIterator<string>;
+  stderr(): string;
+}
+
 export function codexAgent(options: CodexAgentOptions = {}): AgentAdapter {
   return {
     run: (request) =>
@@ -72,44 +75,21 @@ export async function probeCodexAppServer(
     throw new Error("Codex probe timeout must be a positive number.");
   }
 
-  const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  const lines = createInterface({ input: child.stdout });
-  const messages = lines[Symbol.asyncIterator]();
-  let stderr = "";
-
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) => {
-    stderr += chunk;
-  });
-  child.stdin.on("error", (error) => {
-    stderr ||= error.message;
-  });
+  const appServer = startAppServer();
 
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let initialized = false;
   try {
     await Promise.race([
       (async () => {
-        await waitForSpawn(child);
-        send(child, {
-          method: "initialize",
-          id: 1,
-          params: {
-            clientInfo: {
-              name: "pagent-doctor",
-              title: "Pagent Doctor",
-              version: "0.0.0",
-            },
-          },
+        await initializeAppServer(appServer, {
+          name: "pagent-doctor",
+          title: "Pagent Doctor",
         });
-        await waitForResponse(messages, 1, "initialize", () => stderr);
-        send(child, { method: "initialized", params: {} });
         initialized = true;
 
         if (options.sandbox !== undefined) {
-          send(child, {
+          send(appServer.child, {
             method: "command/exec",
             id: 2,
             params: {
@@ -130,10 +110,10 @@ export async function probeCodexAppServer(
           let result: CommandExecResponse;
           try {
             result = await waitForResponse<CommandExecResponse>(
-              messages,
+              appServer.messages,
               2,
               "command/exec",
-              () => stderr,
+              appServer.stderr,
             );
           } catch (error) {
             throw new CodexSandboxProbeError(errorMessage(error));
@@ -169,9 +149,7 @@ export async function probeCodexAppServer(
     if (timeout !== undefined) {
       clearTimeout(timeout);
     }
-    lines.close();
-    child.stdin.end();
-    child.kill();
+    closeAppServer(appServer);
   }
 }
 
@@ -202,45 +180,22 @@ async function runCodex(
   requestedCwd: string,
   prompt: string,
   options: CodexAgentOptions,
-  signal: AgentAbortSignal | undefined,
+  signal: AbortSignal | undefined,
 ): Promise<AgentResult> {
   const cwd = resolve(requestedCwd);
   await requireLocalDirectory(cwd);
   throwIfAborted(signal);
 
-  const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  const lines = createInterface({ input: child.stdout });
-  const messages = lines[Symbol.asyncIterator]();
-  let stderr = "";
-
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) => {
-    stderr += chunk;
-  });
-  child.stdin.on("error", (error) => {
-    stderr ||= error.message;
-  });
-  const abort = () => child.kill();
+  const appServer = startAppServer();
+  const abort = () => appServer.child.kill();
   signal?.addEventListener("abort", abort, { once: true });
 
   try {
-    await waitForSpawn(child);
-
-    send(child, {
-      method: "initialize",
-      id: 1,
-      params: {
-        clientInfo: {
-          name: "pagent",
-          title: "Pagent",
-          version: "0.0.0",
-        },
-      },
-    });
-    await waitForResponse(messages, 1, "initialize", () => stderr, signal);
-    send(child, { method: "initialized", params: {} });
+    await initializeAppServer(
+      appServer,
+      { name: "pagent", title: "Pagent" },
+      signal,
+    );
 
     const threadParams: Record<string, unknown> = { cwd };
     if (options.approvalPolicy !== undefined) {
@@ -250,17 +205,21 @@ async function runCodex(
       threadParams.sandbox = options.sandboxMode;
     }
 
-    send(child, { method: "thread/start", id: 2, params: threadParams });
+    send(appServer.child, {
+      method: "thread/start",
+      id: 2,
+      params: threadParams,
+    });
     const thread = await waitForResponse<ThreadStartResponse>(
-      messages,
+      appServer.messages,
       2,
       "thread/start",
-      () => stderr,
+      appServer.stderr,
       signal,
     );
     const threadId = thread.thread.id;
 
-    send(child, {
+    send(appServer.child, {
       method: "turn/start",
       id: 3,
       params: {
@@ -269,18 +228,15 @@ async function runCodex(
       },
     });
 
-    let finalResponse: string | undefined;
-
     while (true) {
-      const message = await nextMessage(messages, () => stderr, signal);
+      const message = await nextMessage(
+        appServer.messages,
+        appServer.stderr,
+        signal,
+      );
 
       if (message.id === 3 && message.error !== undefined) {
         throw requestError("turn/start", message.error);
-      }
-
-      const item = agentMessageFrom(message, threadId);
-      if (item !== undefined) {
-        finalResponse = item;
       }
 
       const completed = completedTurnFrom(message, threadId);
@@ -293,18 +249,62 @@ async function runCodex(
             `Codex turn ended with status ${completed.status}.`,
         );
       }
-
-      finalResponse = lastAgentMessage(completed.items) ?? finalResponse;
-      return finalResponse === undefined
-        ? { threadId }
-        : { threadId, finalResponse };
+      return { threadId };
     }
   } finally {
     signal?.removeEventListener("abort", abort);
-    lines.close();
-    child.stdin.end();
-    child.kill();
+    closeAppServer(appServer);
   }
+}
+
+function startAppServer(): AppServerConnection {
+  const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lines = createInterface({ input: child.stdout });
+  let stderr = "";
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.stdin.on("error", (error) => {
+    stderr ||= error.message;
+  });
+
+  return {
+    child,
+    lines,
+    messages: lines[Symbol.asyncIterator](),
+    stderr: () => stderr,
+  };
+}
+
+async function initializeAppServer(
+  appServer: AppServerConnection,
+  clientInfo: { name: string; title: string },
+  signal?: AbortSignal,
+): Promise<void> {
+  await waitForSpawn(appServer.child);
+  send(appServer.child, {
+    method: "initialize",
+    id: 1,
+    params: { clientInfo: { ...clientInfo, version: "0.0.0" } },
+  });
+  await waitForResponse(
+    appServer.messages,
+    1,
+    "initialize",
+    appServer.stderr,
+    signal,
+  );
+  send(appServer.child, { method: "initialized", params: {} });
+}
+
+function closeAppServer(appServer: AppServerConnection): void {
+  appServer.lines.close();
+  appServer.child.stdin.end();
+  appServer.child.kill();
 }
 
 async function waitForSpawn(
@@ -321,7 +321,7 @@ async function waitForResponse<TResult>(
   id: number,
   method: string,
   stderr: () => string,
-  signal?: AgentAbortSignal,
+  signal?: AbortSignal,
 ): Promise<TResult> {
   while (true) {
     const message = await nextMessage(messages, stderr, signal);
@@ -338,7 +338,7 @@ async function waitForResponse<TResult>(
 async function nextMessage(
   messages: AsyncIterator<string>,
   stderr: () => string,
-  signal?: AgentAbortSignal,
+  signal?: AbortSignal,
 ): Promise<AppServerMessage> {
   const next = await abortable(messages.next(), signal);
   if (next.done) {
@@ -357,7 +357,7 @@ async function nextMessage(
 
 async function abortable<T>(
   operation: Promise<T>,
-  signal: AgentAbortSignal | undefined,
+  signal: AbortSignal | undefined,
 ): Promise<T> {
   if (signal === undefined) {
     return operation;
@@ -372,7 +372,7 @@ async function abortable<T>(
   });
 }
 
-function throwIfAborted(signal: AgentAbortSignal | undefined): void {
+function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw signal.reason;
   }
@@ -382,27 +382,11 @@ function send(child: ChildProcessWithoutNullStreams, message: object): void {
   child.stdin.write(`${JSON.stringify(message)}\n`);
 }
 
-function agentMessageFrom(
-  message: AppServerMessage,
-  threadId: string,
-): string | undefined {
-  if (message.method !== "item/completed") {
-    return undefined;
-  }
-  const params = record(message.params);
-  const item = record(params?.item);
-  return params?.threadId === threadId &&
-    item?.type === "agentMessage" &&
-    typeof item.text === "string"
-    ? item.text
-    : undefined;
-}
-
 function completedTurnFrom(
   message: AppServerMessage,
   threadId: string,
 ):
-  | { status: string; errorMessage?: string; items: unknown[] }
+  | { status: string; errorMessage?: string }
   | undefined {
   if (message.method !== "turn/completed") {
     return undefined;
@@ -419,18 +403,7 @@ function completedTurnFrom(
   return {
     status: turn.status,
     ...(errorMessage === undefined ? {} : { errorMessage }),
-    items: Array.isArray(turn.items) ? turn.items : [],
   };
-}
-
-function lastAgentMessage(items: unknown[]): string | undefined {
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = record(items[index]);
-    if (item?.type === "agentMessage" && typeof item.text === "string") {
-      return item.text;
-    }
-  }
-  return undefined;
 }
 
 async function requireLocalDirectory(cwd: string): Promise<void> {

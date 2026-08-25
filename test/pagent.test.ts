@@ -1,11 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { decryptEventContext } from "../src/crypto.js";
-import {
-  createPagent,
-  defineEvent,
-  type EncryptedRelayEvent,
-} from "../src/index.js";
+import { createPagent, defineEvent } from "../src/index.js";
+import type { EncryptedRelayEvent } from "../src/types.js";
 
 const TEST_ENCRYPTION_KEY =
   "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

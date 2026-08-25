@@ -13,7 +13,7 @@ vi.mock("node:child_process", async (importOriginal) => ({
   spawn: childProcesses.spawn,
 }));
 
-import { codexAgent } from "../src/connector.js";
+import { codexAgent } from "../src/codex.js";
 import {
   CodexSandboxProbeError,
   probeCodexAppServer,
@@ -64,10 +64,7 @@ describe("codexAgent", () => {
         },
       ],
     });
-    expect(result).toEqual({
-      threadId: "codex-thread-1",
-      finalResponse: "The threshold caused the failure.",
-    });
+    expect(result).toEqual({ threadId: "codex-thread-1" });
   });
 
   it("only overrides Codex permissions when configured", async () => {
@@ -277,17 +274,6 @@ function respond(
     if (!completeTurn) {
       return;
     }
-    send({
-      method: "item/completed",
-      params: {
-        threadId: "codex-thread-1",
-        turnId: "turn-1",
-        item: {
-          type: "agentMessage",
-          text: "The threshold caused the failure.",
-        },
-      },
-    });
     send({
       method: "turn/completed",
       params: {

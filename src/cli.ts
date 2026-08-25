@@ -339,7 +339,6 @@ async function doctorReport(
     connectorId: loaded.config.relay.connectorId,
     connectorToken: loaded.config.relay.token,
     inboxPath: paths.inboxPath,
-    statePath: paths.daemonMetadataPath,
     repositories: loaded.config.repositories,
     environments: loaded.config.environments,
     encryption: loaded.config.encryption,
