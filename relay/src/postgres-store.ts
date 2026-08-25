@@ -103,7 +103,9 @@ export class PostgresRelayStore implements RelayStore {
              AND table_name = 'pagent_tasks'
              AND column_name = 'prompt'
         ) THEN
-          TRUNCATE pagent_tasks, pagent_events RESTART IDENTITY;
+          -- SSE clients persist Last-Event-ID locally, so task IDs must never
+          -- move backward across a schema migration.
+          TRUNCATE pagent_tasks, pagent_events CONTINUE IDENTITY;
         END IF;
       END
       $migration$;
