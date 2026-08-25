@@ -3,22 +3,27 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "sideEffects": false,
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./connector": {
+      "types": "./dist/connector.d.ts",
+      "import": "./dist/connector.js"
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && npm --prefix relay run build",
-    "connector": "tsx demo/connector.ts",
-    "demo": "tsx demo/cloud-server.ts",
-    "demo:local": "tsx demo/server.ts",
+    "build:sdk": "tsc -p tsconfig.build.json",
+    "build": "pnpm build:sdk && pnpm --filter pagent-demo build && npm --prefix relay run build",
+    "connector": "pnpm build:sdk && pnpm --filter pagent-demo connector",
+    "demo": "pnpm build:sdk && pnpm --filter pagent-demo dev",
     "test": "vitest run && npm --prefix relay test",
-    "typecheck": "tsc --noEmit && npm --prefix relay run typecheck"
+    "typecheck": "pnpm build:sdk && tsc --noEmit && pnpm --filter pagent-demo typecheck && npm --prefix relay run typecheck"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

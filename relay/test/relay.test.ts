@@ -16,7 +16,6 @@ const config: RelayConfig = {
       repositoryKey: "pagent-demo",
       connectorId: "local-1",
       allowedEnvironments: ["staging", "production"],
-      cooldownMs: 60_000,
     },
   ],
   connectors: [{ id: "local-1", token: "connector-secret" }],
@@ -87,6 +86,7 @@ describe("relay HTTP API", () => {
     assert.equal(body.taskId, "1");
     const [task] = await store.tasksAfter("local-1", "0", 10);
     assert.equal(task?.repositoryKey, "pagent-demo");
+    assert.deepEqual(task?.investigation, { cooldownMs: 0 });
     assert.match(task?.prompt ?? "", /Find the root cause/);
     assert.match(task?.prompt ?? "", /Do not modify files/);
     assert.match(task?.prompt ?? "", /database pool exhausted/);
@@ -122,7 +122,28 @@ describe("relay HTTP API", () => {
     assert.match(JSON.stringify(await response.json()), /payload is required/);
   });
 
-  it("deduplicates event IDs and suppresses repeated event types during cooldown", async () => {
+  it("rejects invalid investigation policies", async () => {
+    for (const investigation of [
+      { cooldownMs: -1 },
+      { cooldownMs: 1.5 },
+      { cooldownMs: 60_000, group: " " },
+    ]) {
+      const response = await fetch(`${baseUrl}/v1/events`, {
+        method: "POST",
+        body: JSON.stringify(event(`invalid-${JSON.stringify(investigation)}`, {
+          investigation,
+        })),
+        headers: {
+          authorization: "Bearer source-secret",
+          "content-type": "application/json",
+        },
+      });
+
+      assert.equal(response.status, 400);
+    }
+  });
+
+  it("deduplicates event IDs and applies cooldown per developer-defined group", async () => {
     const ingest = (body: unknown) =>
       fetch(`${baseUrl}/v1/events`, {
         method: "POST",
@@ -133,14 +154,27 @@ describe("relay HTTP API", () => {
         },
       });
 
-    assert.equal((await ingest(event("event-1"))).status, 201);
-    const duplicate = await ingest(event("event-1"));
+    const eastPolicy = {
+      investigation: { cooldownMs: 60_000, group: "us-east-1" },
+    };
+    assert.equal((await ingest(event("event-1", eastPolicy))).status, 201);
+    const duplicate = await ingest(event("event-1", eastPolicy));
     assert.equal(duplicate.status, 202);
     assert.equal(((await duplicate.json()) as { status: string }).status, "duplicate");
 
-    const cooldown = await ingest(event("event-2"));
+    const cooldown = await ingest(event("event-2", eastPolicy));
     assert.equal(cooldown.status, 202);
     assert.equal(((await cooldown.json()) as { status: string }).status, "cooldown");
+
+    const otherGroup = await ingest(
+      event("event-3", {
+        investigation: { cooldownMs: 60_000, group: "us-west-2" },
+      }),
+    );
+    assert.equal(otherGroup.status, 201);
+
+    assert.equal((await ingest(event("event-4"))).status, 201);
+    assert.equal((await ingest(event("event-5"))).status, 201);
   });
 
   it("replays tasks over authenticated SSE using Last-Event-ID", async () => {
@@ -191,6 +225,7 @@ describe("relay HTTP API", () => {
     assert.deepEqual(Object.keys(JSON.parse(dataLine.slice(6))).sort(), [
       "environment",
       "id",
+      "investigation",
       "occurredAt",
       "payload",
       "prompt",

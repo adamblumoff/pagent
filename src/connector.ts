@@ -4,11 +4,27 @@ import { dirname, resolve } from "node:path";
 
 import type { AgentAdapter, AgentResult, PagentEvent } from "./types.js";
 
+export {
+  codexAgent,
+  type CodexAgentOptions,
+  type CodexApprovalPolicy,
+  type CodexSandboxMode,
+} from "./codex.js";
+export {
+  defineConnectorConfig,
+  type ConnectorConfig,
+} from "./config.js";
+export type { AgentAdapter, AgentRequest, AgentResult } from "./types.js";
+
 export interface RelayTask<TPayload = unknown> {
   id: string;
   type: string;
   environment: string;
   occurredAt: string;
+  investigation: {
+    cooldownMs: number;
+    group?: string | undefined;
+  };
   repositoryKey: string;
   prompt: string;
   payload: TPayload;
@@ -247,6 +263,7 @@ class DefaultRelayConnector implements RelayConnector {
         type: task.type,
         environment: task.environment,
         occurredAt: task.occurredAt,
+        investigation: task.investigation,
         payload: task.payload,
       };
       const result = await this.#agent.run({
@@ -439,6 +456,7 @@ function relayTask(message: SseMessage): RelayTask {
     !nonempty(value.type) ||
     !nonempty(value.environment) ||
     !nonempty(value.occurredAt) ||
+    !isInvestigationPolicy(value.investigation) ||
     !nonempty(value.repositoryKey) ||
     !nonempty(value.prompt) ||
     !("payload" in value)
@@ -451,6 +469,7 @@ function relayTask(message: SseMessage): RelayTask {
     type: value.type,
     environment: value.environment,
     occurredAt: value.occurredAt,
+    investigation: value.investigation,
     repositoryKey: value.repositoryKey,
     prompt: value.prompt,
     payload: value.payload,
@@ -486,9 +505,26 @@ function isRelayTask(value: unknown): value is RelayTask {
     nonempty(task.type) &&
     nonempty(task.environment) &&
     nonempty(task.occurredAt) &&
+    isInvestigationPolicy(task.investigation) &&
     nonempty(task.repositoryKey) &&
     nonempty(task.prompt) &&
     "payload" in task
+  );
+}
+
+function isInvestigationPolicy(
+  value: unknown,
+): value is RelayTask["investigation"] {
+  const policy = record(value);
+  return (
+    policy !== undefined &&
+    typeof policy.cooldownMs === "number" &&
+    Number.isSafeInteger(policy.cooldownMs) &&
+    policy.cooldownMs >= 0 &&
+    (policy.group === undefined ||
+      (nonempty(policy.group) &&
+        policy.group === policy.group.trim() &&
+        policy.group.length <= 200))
   );
 }
 

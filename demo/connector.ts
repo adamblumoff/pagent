@@ -3,14 +3,15 @@ import { resolve } from "node:path";
 import {
   codexAgent,
   createRelayConnector,
-} from "../src/index.js";
+} from "pagent/connector";
 import pagentConfig from "../pagent.config.js";
 
 const relayUrl = requireEnvironment("PAGENT_RELAY_URL");
 const connectorId = process.env.PAGENT_CONNECTOR_ID?.trim() || "demo-laptop";
 const repositoryKey = process.env.PAGENT_REPOSITORY_KEY?.trim() || "pagent-demo";
+const workspaceRoot = resolve(import.meta.dirname, "..");
 const repositoryPath = resolve(
-  process.env.PAGENT_REPOSITORY_PATH?.trim() || process.cwd(),
+  process.env.PAGENT_REPOSITORY_PATH?.trim() || workspaceRoot,
 );
 
 const connector = createRelayConnector({
@@ -20,7 +21,8 @@ const connector = createRelayConnector({
   ).toString(),
   token: requireEnvironment("PAGENT_CONNECTOR_TOKEN"),
   inboxPath: resolve(
-    process.env.PAGENT_INBOX_PATH?.trim() || ".pagent/inbox.json",
+    process.env.PAGENT_INBOX_PATH?.trim() ||
+      resolve(workspaceRoot, ".pagent/inbox.json"),
   ),
   repositories: { [repositoryKey]: repositoryPath },
   environments: commaSeparated(

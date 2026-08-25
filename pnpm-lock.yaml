@@ -21,6 +21,12 @@ importers:
         specifier: ^4.1.11
         version: 4.1.11(@types/node@24.13.3)(vite@8.2.2(@types/node@24.13.3)(esbuild@0.28.2)(tsx@4.23.12))
 
+  demo:
+    dependencies:
+      pagent:
+        specifier: workspace:*
+        version: link:..
+
 packages:
 
   '@esbuild/aix-ppc64@0.28.2':

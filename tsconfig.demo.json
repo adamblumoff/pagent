@@ -1,9 +1,0 @@
-{
-  "extends": "./tsconfig.json",
-  "compilerOptions": {
-    "noEmit": false,
-    "outDir": "dist-demo",
-    "rootDir": "."
-  },
-  "include": ["src", "demo/cloud-server.ts"]
-}

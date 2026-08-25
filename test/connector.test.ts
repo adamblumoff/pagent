@@ -6,9 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createRelayConnector,
+  type AgentAdapter,
+  type AgentRequest,
   type RelayTask,
 } from "../src/connector.js";
-import type { AgentAdapter, AgentRequest } from "../src/types.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -61,6 +62,7 @@ describe("relay connector", () => {
           type: "health.failed",
           environment: "staging",
           occurredAt: "2026-08-24T12:00:00.000Z",
+          investigation: { cooldownMs: 0 },
           payload: { reason: "pool exhausted" },
         },
       },
@@ -207,6 +209,7 @@ function task(
     type: "health.failed",
     environment: "staging",
     occurredAt: "2026-08-24T12:00:00.000Z",
+    investigation: { cooldownMs: 0 },
     repositoryKey: "pagent",
     prompt: "Find the cause of the failed health check.",
     payload: { reason: "pool exhausted" },

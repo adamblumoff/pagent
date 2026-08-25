@@ -13,7 +13,7 @@ vi.mock("node:child_process", async (importOriginal) => ({
   spawn: childProcesses.spawn,
 }));
 
-import { codexAgent } from "../src/index.js";
+import { codexAgent } from "../src/connector.js";
 
 interface SentMessage {
   id?: number;
@@ -119,6 +119,7 @@ function request(cwd = process.cwd()) {
       type: "health.failed",
       environment: "staging",
       occurredAt: "2026-08-24T12:00:00.000Z",
+      investigation: { cooldownMs: 0 },
       payload: { reason: "latency threshold" },
     },
   };

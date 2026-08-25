@@ -15,6 +15,8 @@ interface TaskRow {
   event_type: string;
   environment: string;
   occurred_at: Date;
+  investigation_cooldown_ms: string;
+  investigation_group: string | null;
   repository_key: string;
   prompt: string;
   payload: unknown;
@@ -26,6 +28,12 @@ function taskFromRow(row: TaskRow): RelayTask {
     type: row.event_type,
     environment: row.environment,
     occurredAt: row.occurred_at.toISOString(),
+    investigation: {
+      cooldownMs: Number(row.investigation_cooldown_ms),
+      ...(row.investigation_group === null
+        ? {}
+        : { group: row.investigation_group }),
+    },
     repositoryKey: row.repository_key,
     prompt: row.prompt,
     payload: row.payload,
@@ -52,6 +60,8 @@ export class PostgresRelayStore implements RelayStore {
         occurred_at TIMESTAMPTZ NOT NULL,
         repository_key TEXT NOT NULL,
         connector_id TEXT NOT NULL,
+        investigation_cooldown_ms BIGINT NOT NULL DEFAULT 0,
+        investigation_group TEXT,
         payload JSONB NOT NULL,
         outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'queued', 'cooldown')),
         received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -69,12 +79,21 @@ export class PostgresRelayStore implements RelayStore {
       CREATE INDEX IF NOT EXISTS pagent_tasks_connector_id_id_idx
         ON pagent_tasks (connector_id, id);
 
-      CREATE INDEX IF NOT EXISTS pagent_events_cooldown_idx
+      ALTER TABLE pagent_events
+        ADD COLUMN IF NOT EXISTS investigation_cooldown_ms BIGINT NOT NULL DEFAULT 0;
+
+      ALTER TABLE pagent_events
+        ADD COLUMN IF NOT EXISTS investigation_group TEXT;
+
+      DROP INDEX IF EXISTS pagent_events_cooldown_idx;
+
+      CREATE INDEX IF NOT EXISTS pagent_events_policy_cooldown_idx
         ON pagent_events (
           connector_id,
           repository_key,
           event_type,
           environment,
+          investigation_group,
           received_at DESC
         )
         WHERE outcome = 'queued';
@@ -92,14 +111,16 @@ export class PostgresRelayStore implements RelayStore {
         input.source.repositoryKey,
         input.event.type,
         input.event.environment,
+        input.event.investigation.group ?? null,
       ]);
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [routeKey]);
 
       const inserted = await client.query<{ event_id: string }>(
         `INSERT INTO pagent_events (
           event_id, event_type, environment, occurred_at, repository_key,
-          connector_id, payload, outcome
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+          connector_id, investigation_cooldown_ms, investigation_group, payload,
+          outcome
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
         ON CONFLICT (event_id) DO NOTHING
         RETURNING event_id`,
         [
@@ -109,6 +130,8 @@ export class PostgresRelayStore implements RelayStore {
           input.event.occurredAt,
           input.source.repositoryKey,
           input.source.connectorId,
+          input.event.investigation.cooldownMs,
+          input.event.investigation.group ?? null,
           JSON.stringify(input.event.payload ?? null),
         ],
       );
@@ -116,6 +139,7 @@ export class PostgresRelayStore implements RelayStore {
       if (inserted.rowCount === 0) {
         const existing = await client.query<TaskRow>(
           `SELECT t.id::text, e.event_type, e.environment, e.occurred_at,
+                  e.investigation_cooldown_ms::text, e.investigation_group,
                   e.repository_key, t.prompt, e.payload
              FROM pagent_events e
              JOIN pagent_tasks t ON t.event_id = e.event_id
@@ -129,7 +153,7 @@ export class PostgresRelayStore implements RelayStore {
           : { status: "duplicate" };
       }
 
-      if (input.source.cooldownMs > 0) {
+      if (input.event.investigation.cooldownMs > 0) {
         const coolingDown = await client.query(
           `SELECT 1
              FROM pagent_events
@@ -137,15 +161,17 @@ export class PostgresRelayStore implements RelayStore {
               AND repository_key = $2
               AND event_type = $3
               AND environment = $4
+              AND investigation_group IS NOT DISTINCT FROM $5::text
               AND outcome = 'queued'
-              AND received_at > NOW() - ($5::bigint * INTERVAL '1 millisecond')
+              AND received_at > NOW() - ($6::bigint * INTERVAL '1 millisecond')
             LIMIT 1`,
           [
             input.source.connectorId,
             input.source.repositoryKey,
             input.event.type,
             input.event.environment,
-            input.source.cooldownMs,
+            input.event.investigation.group ?? null,
+            input.event.investigation.cooldownMs,
           ],
         );
         if ((coolingDown.rowCount ?? 0) > 0) {
@@ -166,9 +192,11 @@ export class PostgresRelayStore implements RelayStore {
            $5::text AS event_type,
            $6::text AS environment,
            $7::timestamptz AS occurred_at,
+           $8::bigint::text AS investigation_cooldown_ms,
+           $9::text AS investigation_group,
            repository_key,
            prompt,
-           $8::jsonb AS payload`,
+           $10::jsonb AS payload`,
         [
           input.event.id,
           input.source.connectorId,
@@ -177,6 +205,8 @@ export class PostgresRelayStore implements RelayStore {
           input.event.type,
           input.event.environment,
           input.event.occurredAt,
+          input.event.investigation.cooldownMs,
+          input.event.investigation.group ?? null,
           JSON.stringify(input.event.payload ?? null),
         ],
       );
@@ -209,6 +239,7 @@ export class PostgresRelayStore implements RelayStore {
   ): Promise<RelayTask[]> {
     const result = await this.#pool.query<TaskRow>(
       `SELECT t.id::text, e.event_type, e.environment, e.occurred_at,
+              e.investigation_cooldown_ms::text, e.investigation_group,
               e.repository_key, t.prompt, e.payload
          FROM pagent_tasks t
          JOIN pagent_events e ON e.event_id = t.event_id

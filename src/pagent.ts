@@ -1,14 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
 
-import { createRelayEmitter, type RelayEmitter } from "./relay.js";
+import {
+  asDeliveryError,
+  createRelayEmitter,
+  type RelayEmitter,
+} from "./relay.js";
 import type {
-  AgentAdapter,
   ErrorObservation,
   EventDefinition,
   ObserveErrorOptions,
   ObserveOptions,
   ObserveResultOptions,
+  PagentClient,
   PagentEvent,
   PagentOptions,
   ResultObservation,
@@ -23,33 +26,37 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
   );
 }
 
-export class Pagent {
-  readonly #agent: AgentAdapter | undefined;
-  readonly #cwd: string;
+function investigationGroup(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const group = value.trim();
+  if (group === "" || group.length > 200) {
+    throw new Error(
+      "Pagent investigation group must be a non-empty string up to 200 characters.",
+    );
+  }
+  return group;
+}
+
+class Pagent implements PagentClient {
   readonly #enabled: boolean;
   readonly #environment: string | undefined;
-  readonly #inFlightEvents = new Set<EventDefinition<unknown>>();
-  readonly #lastTriggeredAt = new Map<EventDefinition<unknown>, number>();
-  readonly #onAgentResult: PagentOptions["onAgentResult"];
-  readonly #onError: PagentOptions["onError"];
+  readonly #onDeliveryError: PagentOptions["onDeliveryError"];
   readonly #pending = new Set<Promise<void>>();
   readonly #relay: RelayEmitter | undefined;
 
   constructor(options: PagentOptions) {
-    this.#agent = options.agent;
-    this.#relay =
-      options.relay === undefined ? undefined : createRelayEmitter(options.relay);
-    this.#cwd = resolve(options.cwd ?? process.cwd());
-    this.#enabled = options.enabled === true;
     this.#environment = options.environment?.trim() || undefined;
-    this.#onAgentResult = options.onAgentResult;
-    this.#onError = options.onError;
+    this.#enabled = options.enabled === true && this.#environment !== undefined;
+    this.#relay =
+      !this.#enabled || options.relay === undefined
+        ? undefined
+        : createRelayEmitter(options.relay);
+    this.#onDeliveryError = options.onDeliveryError;
 
-    if (this.#enabled && this.#agent === undefined && this.#relay === undefined) {
-      throw new Error("Pagent requires an agent or relay when enabled.");
-    }
-    if (this.#agent !== undefined && this.#relay !== undefined) {
-      throw new Error("Pagent accepts either an agent or relay, not both.");
+    if (this.#enabled && this.#relay === undefined) {
+      throw new Error("Pagent requires a relay when enabled.");
     }
   }
 
@@ -71,7 +78,7 @@ export class Pagent {
         if (isPromiseLike(result)) {
           return result.then(
             (value) => {
-              if (options.on !== "error") {
+              if (options.on === "result") {
                 pagent.#scheduleResult(options, {
                   args,
                   result: value as Awaited<TResult>,
@@ -88,7 +95,7 @@ export class Pagent {
           ) as TResult;
         }
 
-        if (options.on !== "error") {
+        if (options.on === "result") {
           pagent.#scheduleResult(options, {
             args,
             result: result as Awaited<TResult>,
@@ -104,7 +111,7 @@ export class Pagent {
     };
   }
 
-  async drain(): Promise<void> {
+  async flush(): Promise<void> {
     while (this.#pending.size > 0) {
       await Promise.allSettled(this.#pending);
     }
@@ -127,7 +134,10 @@ export class Pagent {
   #schedule<TObservation, TPayload>(
     options: {
       event: EventDefinition<TPayload>;
-      when(observation: TObservation): boolean | Promise<boolean>;
+      triggerWhen(observation: TObservation): boolean | Promise<boolean>;
+      group?(
+        observation: TObservation,
+      ): string | undefined | Promise<string | undefined>;
       context(observation: TObservation): TPayload | Promise<TPayload>;
     },
     observation: TObservation,
@@ -156,73 +166,45 @@ export class Pagent {
   async #dispatch<TObservation, TPayload>(
     options: {
       event: EventDefinition<TPayload>;
-      when(observation: TObservation): boolean | Promise<boolean>;
+      triggerWhen(observation: TObservation): boolean | Promise<boolean>;
+      group?(
+        observation: TObservation,
+      ): string | undefined | Promise<string | undefined>;
       context(observation: TObservation): TPayload | Promise<TPayload>;
     },
     observation: TObservation,
   ): Promise<void> {
-    if (!(await options.when(observation))) {
+    if (!(await options.triggerWhen(observation))) {
       return;
     }
 
     const now = Date.now();
-    const cooldownMs = options.event.cooldownMs ?? 0;
-    const lastTriggeredAt = this.#lastTriggeredAt.get(options.event);
-
-    if (
-      this.#inFlightEvents.has(options.event) ||
-      (cooldownMs > 0 &&
-        lastTriggeredAt !== undefined &&
-        now - lastTriggeredAt < cooldownMs)
-    ) {
-      return;
-    }
-
-    this.#inFlightEvents.add(options.event);
-
-    try {
-      const payload = await options.context(observation);
-      const event: PagentEvent<TPayload> = {
-        id: randomUUID(),
-        type: options.event.name,
-        environment: this.#environment!,
-        occurredAt: new Date(now).toISOString(),
-        payload,
-      };
-      if (this.#relay !== undefined) {
-        await this.#relay(event);
-      } else {
-        const prompt = options.event.prompt;
-        if (prompt === undefined) {
-          throw new Error(
-            `Pagent event ${options.event.name} requires a prompt when using an agent.`,
-          );
-        }
-        const result = await this.#agent!.run({
-          cwd: this.#cwd,
-          prompt: await prompt(event),
-          event,
-        });
-
-        if (this.#onAgentResult !== undefined) {
-          await this.#onAgentResult(result, event);
-        }
-      }
-    } finally {
-      this.#lastTriggeredAt.set(options.event, Date.now());
-      this.#inFlightEvents.delete(options.event);
-    }
+    const group = investigationGroup(await options.group?.(observation));
+    const payload = await options.context(observation);
+    const investigation = {
+      cooldownMs: options.event.investigation?.cooldownMs ?? 0,
+      ...(group === undefined ? {} : { group }),
+    };
+    const event: PagentEvent<TPayload> = {
+      id: randomUUID(),
+      type: options.event.name,
+      environment: this.#environment!,
+      occurredAt: new Date(now).toISOString(),
+      investigation,
+      payload,
+    };
+    await this.#relay!(event);
   }
 
   #reportError(error: unknown): void {
     try {
-      this.#onError?.(error);
+      this.#onDeliveryError?.(asDeliveryError(error));
     } catch {
       // Pagent callbacks must not affect the observed application.
     }
   }
 }
 
-export function createPagent(options: PagentOptions): Pagent {
+export function createPagent(options: PagentOptions): PagentClient {
   return new Pagent(options);
 }

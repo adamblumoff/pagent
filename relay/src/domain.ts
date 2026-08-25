@@ -12,7 +12,19 @@ function boundedString(value: unknown, name: string): string {
     value.trim() === "" ||
     value.length > MAX_NAME_LENGTH
   ) {
-    throw new Error(`${name} must be a non-empty string up to ${MAX_NAME_LENGTH} characters`);
+    throw new Error(
+      `${name} must be a non-empty string up to ${MAX_NAME_LENGTH} characters`,
+    );
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: unknown, name: string): number {
+  if (value === undefined) {
+    return 0;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
   }
   return value;
 }
@@ -29,6 +41,21 @@ export function parseEventEnvelope(value: unknown): EventEnvelope {
   if (Number.isNaN(Date.parse(occurredAt))) {
     throw new Error("event.occurredAt must be an ISO-8601 timestamp");
   }
+  const investigation = event.investigation ?? {};
+  if (!isRecord(investigation)) {
+    throw new Error("event.investigation must be an object");
+  }
+  const cooldownMs = nonNegativeInteger(
+    investigation.cooldownMs,
+    "event.investigation.cooldownMs",
+  );
+  const group =
+    investigation.group === undefined
+      ? undefined
+      : boundedString(
+          investigation.group,
+          "event.investigation.group",
+        ).trim();
 
   return {
     version: 1,
@@ -37,6 +64,10 @@ export function parseEventEnvelope(value: unknown): EventEnvelope {
       type: boundedString(event.type, "event.type"),
       environment: boundedString(event.environment, "event.environment"),
       occurredAt,
+      investigation: {
+        cooldownMs,
+        ...(group === undefined ? {} : { group }),
+      },
       payload: event.payload,
     },
   };

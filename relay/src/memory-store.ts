@@ -32,15 +32,19 @@ export class MemoryRelayStore implements RelayStore {
     }
 
     const receivedAt = Date.now();
-    const cooldownStart = receivedAt - input.source.cooldownMs;
-    const isCoolingDown = this.#tasks.some(
-      (task) =>
-        task.receivedAt > cooldownStart &&
-        task.connectorId === input.source.connectorId &&
-        task.task.repositoryKey === input.source.repositoryKey &&
-        task.task.type === input.event.type &&
-        task.task.environment === input.event.environment,
-    );
+    const { cooldownMs, group } = input.event.investigation;
+    const cooldownStart = receivedAt - cooldownMs;
+    const isCoolingDown =
+      cooldownMs > 0 &&
+      this.#tasks.some(
+        (task) =>
+          task.receivedAt > cooldownStart &&
+          task.connectorId === input.source.connectorId &&
+          task.task.repositoryKey === input.source.repositoryKey &&
+          task.task.type === input.event.type &&
+          task.task.environment === input.event.environment &&
+          task.task.investigation.group === group,
+      );
 
     if (isCoolingDown) {
       const result: EnqueueResult = { status: "cooldown" };
@@ -53,6 +57,7 @@ export class MemoryRelayStore implements RelayStore {
       type: input.event.type,
       environment: input.event.environment,
       occurredAt: input.event.occurredAt,
+      investigation: input.event.investigation,
       repositoryKey: input.source.repositoryKey,
       prompt: input.prompt,
       payload: input.event.payload,

@@ -5,6 +5,10 @@ export interface EventEnvelope {
     type: string;
     environment: string;
     occurredAt: string;
+    investigation: {
+      cooldownMs: number;
+      group?: string | undefined;
+    };
     payload: unknown;
   };
 }
@@ -14,7 +18,6 @@ export interface SourceRoute {
   repositoryKey: string;
   connectorId: string;
   allowedEnvironments: readonly string[];
-  cooldownMs: number;
 }
 
 export interface ConnectorCredential {
@@ -40,6 +43,7 @@ export interface RelayTask {
   type: string;
   environment: string;
   occurredAt: string;
+  investigation: EventEnvelope["event"]["investigation"];
   repositoryKey: string;
   prompt: string;
   payload: unknown;

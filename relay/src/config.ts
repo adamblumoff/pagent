@@ -27,17 +27,6 @@ function positiveInteger(
   return result;
 }
 
-function nonNegativeInteger(value: unknown, fallback: number, name: string): number {
-  if (value === undefined) {
-    return fallback;
-  }
-  const result = Number(value);
-  if (!Number.isSafeInteger(result) || result < 0) {
-    throw new Error(`${name} must be a non-negative integer`);
-  }
-  return result;
-}
-
 function stringArray(value: unknown, name: string): string[] {
   if (
     !Array.isArray(value) ||
@@ -84,11 +73,6 @@ function sourcesFromEnvironment(env: NodeJS.ProcessEnv): SourceRoute[] {
             item.allowedEnvironments,
             `PAGENT_SOURCES_JSON[${index}].allowedEnvironments`,
           ),
-          cooldownMs: nonNegativeInteger(
-            item.cooldownMs,
-            60_000,
-            `PAGENT_SOURCES_JSON[${index}].cooldownMs`,
-          ),
         };
       },
     );
@@ -109,11 +93,6 @@ function sourcesFromEnvironment(env: NodeJS.ProcessEnv): SourceRoute[] {
         .split(",")
         .map((value) => value.trim())
         .filter(Boolean),
-      cooldownMs: nonNegativeInteger(
-        env.PAGENT_COOLDOWN_MS,
-        60_000,
-        "PAGENT_COOLDOWN_MS",
-      ),
     },
   ];
 }

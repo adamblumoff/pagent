@@ -1,26 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  createPagent,
-  defineEvent,
-  type AgentAdapter,
-  type AgentRequest,
-} from "../src/index.js";
-
-function recordingAgent(requests: AgentRequest[]): AgentAdapter {
-  return {
-    async run(request) {
-      requests.push(request);
-      return { threadId: "thread-1", finalResponse: "done" };
-    },
-  };
-}
+import { createPagent, defineEvent } from "../src/index.js";
 
 const healthFailed = defineEvent<{ reason: string }>({
   name: "health.failed",
   enabledIn: ["staging"],
-  cooldownMs: 60_000,
-  prompt: (event) => `Investigate: ${event.payload.reason}`,
+  investigation: { cooldownMs: 60_000 },
 });
 
 afterEach(() => {
@@ -29,23 +14,19 @@ afterEach(() => {
 });
 
 describe("Pagent", () => {
-  it("starts an agent in the background when an observation matches", async () => {
-    const requests: AgentRequest[] = [];
-    const results: string[] = [];
+  it("sends a developer-approved result trigger in the background", async () => {
+    const relayFetch = successfulRelay();
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      cwd: ".",
-      agent: recordingAgent(requests),
-      onAgentResult: (result) => {
-        results.push(result.threadId ?? "missing");
-      },
+      relay: relayOptions(),
     });
     const checkHealth = pagent.observe(
       () => ({ status: "unhealthy" as const, reason: "pool exhausted" }),
       {
         event: healthFailed,
-        when: ({ result }) => result.status === "unhealthy",
+        on: "result",
+        triggerWhen: ({ result }) => result.status === "unhealthy",
         context: ({ result }) => ({ reason: result.reason }),
       },
     );
@@ -54,21 +35,16 @@ describe("Pagent", () => {
       status: "unhealthy",
       reason: "pool exhausted",
     });
-    expect(requests).toHaveLength(0);
+    expect(relayFetch).not.toHaveBeenCalled();
+    await pagent.flush();
 
-    await pagent.drain();
-
-    expect(requests).toHaveLength(1);
-    expect(requests[0]).toMatchObject({
-      prompt: "Investigate: pool exhausted",
-      event: {
-        type: "health.failed",
-        environment: "staging",
-        payload: { reason: "pool exhausted" },
-      },
+    expect(relayFetch).toHaveBeenCalledTimes(1);
+    expect(eventBody(relayFetch)).toMatchObject({
+      type: "health.failed",
+      environment: "staging",
+      investigation: { cooldownMs: 60_000 },
+      payload: { reason: "pool exhausted" },
     });
-    expect(requests[0]?.cwd).toMatch(/pagent$/);
-    expect(results).toEqual(["thread-1"]);
   });
 
   it.each([
@@ -76,98 +52,108 @@ describe("Pagent", () => {
     { name: "missing environment", enabled: true, environment: undefined },
     { name: "unlisted environment", enabled: true, environment: "local" },
   ])("fails closed when $name", async ({ enabled, environment }) => {
-    const requests: AgentRequest[] = [];
-    const when = vi.fn(() => true);
+    const relayFetch = successfulRelay();
+    const triggerWhen = vi.fn(() => true);
     const pagent = createPagent({
       enabled,
       environment,
-      agent: recordingAgent(requests),
+      relay: relayOptions(),
     });
     const observed = pagent.observe(() => "unchanged", {
       event: healthFailed,
-      when,
+      on: "result",
+      triggerWhen,
       context: () => ({ reason: "should not run" }),
     });
 
     expect(observed()).toBe("unchanged");
-    await pagent.drain();
+    await pagent.flush();
 
-    expect(when).not.toHaveBeenCalled();
-    expect(requests).toHaveLength(0);
+    expect(triggerWhen).not.toHaveBeenCalled();
+    expect(relayFetch).not.toHaveBeenCalled();
   });
 
-  it("suppresses matching events during the cooldown", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-08-24T12:00:00Z"));
-    const requests: AgentRequest[] = [];
-    const pagent = createPagent({
-      enabled: true,
-      environment: "staging",
-      agent: recordingAgent(requests),
-    });
-    const observed = pagent.observe(() => "failed", {
-      event: healthFailed,
-      when: () => true,
-      context: () => ({ reason: "still unhealthy" }),
-    });
-
-    observed();
-    observed();
-    await pagent.drain();
-    expect(requests).toHaveLength(1);
-
-    vi.advanceTimersByTime(60_000);
-    observed();
-    await pagent.drain();
-    expect(requests).toHaveLength(2);
-
-    vi.useRealTimers();
-  });
-
-  it("does not overlap runs for the same event", async () => {
-    let finishRun: (() => void) | undefined;
-    const run = vi.fn(
+  it("delivers every qualifying trigger even while the same event is in flight", async () => {
+    const responses: Array<(response: Response) => void> = [];
+    const relayFetch = vi.fn(
       () =>
-        new Promise<{}>((resolve) => {
-          finishRun = () => resolve({});
+        new Promise<Response>((resolve) => {
+          responses.push(resolve);
         }),
     );
+    vi.stubGlobal("fetch", relayFetch);
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      agent: { run },
+      relay: relayOptions(),
     });
     const observed = pagent.observe(() => "failed", {
       event: healthFailed,
-      when: () => true,
+      on: "result",
+      triggerWhen: () => true,
       context: () => ({ reason: "still unhealthy" }),
     });
 
     observed();
-    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(1));
     observed();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(run).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(relayFetch).toHaveBeenCalledTimes(2));
 
-    finishRun?.();
-    await pagent.drain();
+    for (const respond of responses) {
+      respond(new Response(null, { status: 202 }));
+    }
+    await pagent.flush();
+  });
+
+  it("does not let a failed delivery suppress a later trigger", async () => {
+    const errors: unknown[] = [];
+    const relayFetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", relayFetch);
+    const pagent = createPagent({
+      enabled: true,
+      environment: "staging",
+      relay: relayOptions(),
+      onDeliveryError: (error) => errors.push(error),
+    });
+    const observed = pagent.observe(() => "failed", {
+      event: healthFailed,
+      on: "result",
+      triggerWhen: () => true,
+      context: () => ({ reason: "still unhealthy" }),
+    });
+
+    observed();
+    await pagent.flush();
+    observed();
+    await pagent.flush();
+
+    expect(relayFetch).toHaveBeenCalledTimes(2);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      name: "PagentDeliveryError",
+      code: "relay_rejected",
+      retryable: true,
+      statusCode: 503,
+    });
   });
 
   it("preserves async resolutions and rejections", async () => {
-    const requests: AgentRequest[] = [];
+    const relayFetch = successfulRelay();
     const event = defineEvent<{ message: string }>({
       name: "operation.failed",
       enabledIn: ["staging"],
-      prompt: (pagentEvent) => pagentEvent.payload.message,
     });
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      agent: recordingAgent(requests),
+      relay: relayOptions(),
     });
     const successful = pagent.observe(async () => 42, {
       event,
-      when: () => false,
+      on: "result",
+      triggerWhen: () => false,
       context: () => ({ message: "not used" }),
     });
     const failure = new Error("database offline");
@@ -178,7 +164,7 @@ describe("Pagent", () => {
       {
         event,
         on: "error",
-        when: () => true,
+        triggerWhen: () => true,
         context: (observation) => ({
           message:
             observation.error instanceof Error
@@ -190,19 +176,19 @@ describe("Pagent", () => {
 
     await expect(successful()).resolves.toBe(42);
     await expect(failing()).rejects.toBe(failure);
-    await pagent.drain();
+    await pagent.flush();
 
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.event.payload).toEqual({ message: "database offline" });
+    expect(relayFetch).toHaveBeenCalledTimes(1);
+    expect(eventBody(relayFetch).payload).toEqual({ message: "database offline" });
   });
 
   it("preserves synchronous errors while observing them", async () => {
-    const requests: AgentRequest[] = [];
+    const relayFetch = successfulRelay();
     const failure = new Error("synchronous failure");
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      agent: recordingAgent(requests),
+      relay: relayOptions(),
     });
     const observed = pagent.observe(
       () => {
@@ -211,86 +197,41 @@ describe("Pagent", () => {
       {
         event: healthFailed,
         on: "error",
-        when: () => true,
+        triggerWhen: () => true,
         context: () => ({ reason: failure.message }),
       },
     );
 
     expect(observed).toThrow(failure);
-    await pagent.drain();
-    expect(requests).toHaveLength(1);
+    await pagent.flush();
+    expect(relayFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("reports background failures without changing application behavior", async () => {
-    const failure = new Error("agent unavailable");
-    const errors: unknown[] = [];
+  it("adds a dynamic group to the relay investigation policy", async () => {
+    const relayFetch = successfulRelay();
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      agent: {
-        async run() {
-          throw failure;
-        },
-      },
-      onError: (error) => errors.push(error),
+      relay: relayOptions(),
     });
-    const observed = pagent.observe(() => "application result", {
+    const observed = pagent.observe(() => ({ region: "us-east-1" }), {
       event: healthFailed,
-      when: () => true,
+      on: "result",
+      triggerWhen: () => true,
+      group: ({ result }) => ` ${result.region} `,
       context: () => ({ reason: "unhealthy" }),
     });
 
-    expect(observed()).toBe("application result");
-    await pagent.drain();
-    expect(errors).toEqual([failure]);
-  });
+    observed();
+    await pagent.flush();
 
-  it("emits a versioned event envelope to a relay", async () => {
-    const relayFetch = vi.fn(
-      async (_input: string | URL | Request, _init?: RequestInit) =>
-        new Response(null, { status: 202 }),
-    );
-    vi.stubGlobal("fetch", relayFetch);
-    const pagent = createPagent({
-      enabled: true,
-      environment: "production",
-      relay: {
-        url: "https://relay.example.test/v1/events",
-        token: "relay-secret",
-      },
-    });
-    const observed = pagent.observe(() => ({ status: "failed" as const }), {
-      event: defineEvent<{ reason: string }>({ name: "job.failed" }),
-      when: ({ result }) => result.status === "failed",
-      context: () => ({ reason: "worker exited" }),
-    });
-
-    expect(observed()).toEqual({ status: "failed" });
-    expect(relayFetch).not.toHaveBeenCalled();
-    await pagent.drain();
-
-    expect(relayFetch).toHaveBeenCalledTimes(1);
-    const [url, request] = relayFetch.mock.calls[0]!;
-    expect(request).toBeDefined();
-    expect(url.toString()).toBe("https://relay.example.test/v1/events");
-    expect(request).toMatchObject({
-      method: "POST",
-      headers: {
-        authorization: "Bearer relay-secret",
-        "content-type": "application/json",
-      },
-    });
-    expect(JSON.parse(request!.body as string)).toMatchObject({
-      version: 1,
-      event: {
-        type: "job.failed",
-        environment: "production",
-        payload: { reason: "worker exited" },
-      },
+    expect(eventBody(relayFetch).investigation).toEqual({
+      cooldownMs: 60_000,
+      group: "us-east-1",
     });
   });
 
-  it("isolates relay failures from the observed application", async () => {
+  it("reports background failures without changing application behavior", async () => {
     const errors: unknown[] = [];
     vi.stubGlobal(
       "fetch",
@@ -299,25 +240,46 @@ describe("Pagent", () => {
     const pagent = createPagent({
       enabled: true,
       environment: "production",
-      relay: {
-        url: "https://relay.example.test/v1/events",
-        token: "relay-secret",
-      },
-      onError: (error) => errors.push(error),
+      relay: relayOptions(),
+      onDeliveryError: (error) => errors.push(error),
     });
     const observed = pagent.observe(() => "application result", {
       event: defineEvent({ name: "job.failed" }),
-      when: () => true,
+      on: "result",
+      triggerWhen: () => true,
       context: () => ({ reason: "worker exited" }),
     });
 
     expect(observed()).toBe("application result");
-    await pagent.drain();
+    await pagent.flush();
 
     expect(errors).toHaveLength(1);
-    expect(errors[0]).toEqual(
-      new Error("Pagent relay rejected the event with HTTP 503."),
-    );
+    expect(errors[0]).toMatchObject({
+      message: "Pagent relay rejected the event with HTTP 503.",
+      code: "relay_rejected",
+      retryable: true,
+      statusCode: 503,
+    });
+  });
+
+  it("uses zero cooldown by default", async () => {
+    const relayFetch = successfulRelay();
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      relay: relayOptions(),
+    });
+    const observed = pagent.observe(() => "application result", {
+      event: defineEvent({ name: "job.failed" }),
+      on: "result",
+      triggerWhen: () => true,
+      context: () => ({ reason: "worker exited" }),
+    });
+
+    observed();
+    await pagent.flush();
+
+    expect(eventBody(relayFetch).investigation).toEqual({ cooldownMs: 0 });
   });
 
   it("rejects oversized relay envelopes before sending them", async () => {
@@ -327,25 +289,25 @@ describe("Pagent", () => {
     const pagent = createPagent({
       enabled: true,
       environment: "production",
-      relay: {
-        url: "https://relay.example.test/v1/events",
-        token: "relay-secret",
-        maxEnvelopeBytes: 128,
-      },
-      onError: (error) => errors.push(error),
+      relay: { ...relayOptions(), maxEnvelopeBytes: 128 },
+      onDeliveryError: (error) => errors.push(error),
     });
     const observed = pagent.observe(() => "application result", {
       event: defineEvent({ name: "job.failed" }),
-      when: () => true,
+      on: "result",
+      triggerWhen: () => true,
       context: () => ({ detail: "x".repeat(256) }),
     });
 
     expect(observed()).toBe("application result");
-    await pagent.drain();
+    await pagent.flush();
 
     expect(relayFetch).not.toHaveBeenCalled();
     expect(errors).toHaveLength(1);
-    expect(errors[0]).toBeInstanceOf(Error);
+    expect(errors[0]).toMatchObject({
+      code: "payload_too_large",
+      retryable: false,
+    });
     expect((errors[0] as Error).message).toMatch(/the limit is 128 bytes/);
   });
 
@@ -364,25 +326,78 @@ describe("Pagent", () => {
     const pagent = createPagent({
       enabled: true,
       environment: "production",
-      relay: {
-        url: "https://relay.example.test/v1/events",
-        token: "relay-secret",
-        timeoutMs: 25,
-      },
-      onError: (error) => errors.push(error),
+      relay: { ...relayOptions(), timeoutMs: 25 },
+      onDeliveryError: (error) => errors.push(error),
     });
     const observed = pagent.observe(() => "application result", {
       event: defineEvent({ name: "job.failed" }),
-      when: () => true,
+      on: "result",
+      triggerWhen: () => true,
       context: () => ({}),
     });
 
     expect(observed()).toBe("application result");
     await vi.advanceTimersByTimeAsync(25);
-    await pagent.drain();
+    await pagent.flush();
 
     expect(relayFetch).toHaveBeenCalledTimes(1);
     expect(errors).toHaveLength(1);
-    expect(errors[0]).toMatchObject({ name: "AbortError" });
+    expect(errors[0]).toMatchObject({
+      name: "PagentDeliveryError",
+      code: "timeout",
+      retryable: true,
+    });
+  });
+
+  it("requires relay configuration when enabled", () => {
+    expect(() =>
+      createPagent({ enabled: true, environment: "production" }),
+    ).toThrow("Pagent requires a relay when enabled.");
+  });
+
+  it("does not require or validate relay configuration while inert", () => {
+    expect(() => createPagent({ enabled: true })).not.toThrow();
+    expect(() =>
+      createPagent({
+        enabled: false,
+        environment: "production",
+        relay: { url: "not a URL", token: "" },
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects invalid event definitions when they are declared", () => {
+    expect(() => defineEvent({ name: " health.failed" })).toThrow(
+      /event name must be a trimmed, non-empty string/,
+    );
+    expect(() =>
+      defineEvent({
+        name: "health.failed",
+        investigation: { cooldownMs: -1 },
+      }),
+    ).toThrow(/cooldownMs must be a non-negative integer/);
   });
 });
+
+function relayOptions() {
+  return {
+    url: "https://relay.example.test/v1/events",
+    token: "relay-secret",
+  };
+}
+
+function successfulRelay() {
+  const relayFetch = vi.fn(
+    async () => new Response(null, { status: 202 }),
+  );
+  vi.stubGlobal("fetch", relayFetch);
+  return relayFetch;
+}
+
+function eventBody(relayFetch: ReturnType<typeof vi.fn>) {
+  const request = relayFetch.mock.calls[0]?.[1] as RequestInit | undefined;
+  if (typeof request?.body !== "string") {
+    throw new Error("Expected a JSON request body");
+  }
+  return (JSON.parse(request.body) as { event: Record<string, unknown> }).event;
+}

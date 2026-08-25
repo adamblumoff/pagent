@@ -25,8 +25,16 @@ There is no polling, WebSocket, execution acknowledgement, or cloud-side reposit
 ```ts
 import { createPagent, defineEvent } from "pagent";
 
-const healthFailed = defineEvent<{ latencyMs: number; thresholdMs: number }>({
+const healthFailed = defineEvent<{
+  errorRate: number;
+  sampleSize: number;
+  region: string;
+}>({
   name: "health.failed",
+  enabledIn: ["staging", "production"],
+  investigation: {
+    cooldownMs: 30 * 60_000,
+  },
 });
 
 const pagent = createPagent({
@@ -36,20 +44,36 @@ const pagent = createPagent({
     url: `${process.env.PAGENT_RELAY_URL}/v1/events`,
     token: process.env.PAGENT_RELAY_TOKEN!,
   },
-  onError: (error) => console.error("Pagent emission failed", error),
+  onDeliveryError: (error) =>
+    console.error("Pagent emission failed", error),
 });
 
 const checkHealth = pagent.observe(rawHealthCheck, {
   event: healthFailed,
-  when: ({ result }) => result.status === "unhealthy",
+  on: "result",
+  triggerWhen: ({ result }) =>
+    result.sampleSize >= 100 && result.errorRate >= 0.05,
+  group: ({ result }) => result.region,
   context: ({ result }) => ({
-    latencyMs: result.latencyMs,
-    thresholdMs: result.thresholdMs,
+    errorRate: result.errorRate,
+    sampleSize: result.sampleSize,
+    region: result.region,
   }),
 });
 ```
 
-`context` is the application's explicit data boundary: include the diagnostic fields the agent needs and leave secrets out. Pagent does nothing unless `enabled` is exactly `true` and an environment is present. Emission runs in the background, times out after two seconds by default, and cannot change the observed function's return value or thrown error.
+Pagent does not wrap every endpoint or decide that every HTTP 500 deserves an
+investigation. The developer chooses the function, outcome, and
+`triggerWhen` condition. A qualifying observation becomes one relay event;
+relay cooldown is explicit in the event definition rather than silently
+imposed by the SDK.
+
+`context` is the application's explicit data boundary: include the diagnostic fields the agent needs and leave secrets out. `group` optionally creates independent cooldown scopes such as regions or tenants. Pagent does nothing unless `enabled` is exactly `true` and an environment is present. Delivery runs in the background, times out after two seconds by default, and cannot change the observed function's return value or thrown error. Call `await pagent.flush()` during graceful shutdown when the process must wait for pending deliveries.
+
+`onDeliveryError` receives a typed error with a stable `code`, a `retryable`
+flag, and an HTTP `statusCode` when the relay returned one. The callback is for
+application logging and metrics; throwing from it never changes application
+behavior.
 
 The SDK POST contract is:
 
@@ -61,6 +85,10 @@ The SDK POST contract is:
     "type": "health.failed",
     "environment": "staging",
     "occurredAt": "2026-08-24T12:00:00.000Z",
+    "investigation": {
+      "cooldownMs": 1800000,
+      "group": "us-central"
+    },
     "payload": {}
   }
 }
@@ -79,7 +107,6 @@ PAGENT_CONNECTOR_TOKEN=...
 PAGENT_REPOSITORY_KEY=pagent-demo
 PAGENT_CONNECTOR_ID=demo-laptop
 PAGENT_ALLOWED_ENVIRONMENTS=staging
-PAGENT_COOLDOWN_MS=60000
 ```
 
 Then run:
@@ -92,6 +119,17 @@ npm --prefix relay run dev
 For multiple routes, use `PAGENT_SOURCES_JSON` and `PAGENT_CONNECTORS_JSON`, as documented in `relay/.env.example`.
 
 ## Local connector
+
+Connector and Codex APIs live under the local-only `pagent/connector` entry
+point. They are not part of the cloud application's import surface:
+
+```ts
+import {
+  codexAgent,
+  createRelayConnector,
+  defineConnectorConfig,
+} from "pagent/connector";
+```
 
 The connector requires the repository and the existing Codex CLI on the same machine:
 
@@ -129,21 +167,6 @@ For Railway, deploy two separate projects:
 
 The demo is successful when one staging failure creates exactly one local, read-only Codex thread in the `pagent-demo` repository.
 
-## Direct local mode
-
-The original direct adapter remains available for tests and local-only integrations:
-
-```ts
-createPagent({
-  enabled: true,
-  environment: "staging",
-  cwd: process.cwd(),
-  agent: codexAgent({ sandboxMode: "read-only" }),
-});
-```
-
-An enabled Pagent instance accepts either `agent` or `relay`, never both.
-
 ## Development
 
 ```bash
@@ -152,7 +175,20 @@ pnpm typecheck
 pnpm build
 ```
 
-Prerequisites are Node.js 20 or newer and pnpm. Only the local connector requires an installed and authenticated `codex` command.
+Prerequisites are Node.js 22 or newer and pnpm. Only the local connector requires an installed and authenticated `codex` command.
+
+## SDK distribution
+
+Pagent is private and workspace-local while its API is evolving. Applications in
+the same workspace depend on it with `"pagent": "workspace:*"`; the SDK is not
+published to npm and the repository has no registry or publishing automation.
+
+The package boundary still matters. Cloud applications import only from
+`pagent`, while the machine running Codex imports from `pagent/connector`.
+Workspace builds must run `pnpm build` before executing compiled consumers.
+When an external application needs the SDK, distribute an immutable private
+artifact built from this same boundary rather than granting access to the whole
+repository. A registry remains deferred until there is demand for one.
 
 ## MVP limits
 

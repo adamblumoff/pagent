@@ -1,15 +1,12 @@
 import type { CodexAgentOptions } from "./codex.js";
-import type { RelayOptions } from "./types.js";
 
-export interface PagentConfig {
-  enabled?: boolean | undefined;
-  environment?: string | undefined;
-  cwd?: string | undefined;
+/** Local settings for the connector process that launches Codex. */
+export interface ConnectorConfig {
   codex?: CodexAgentOptions | undefined;
-  relay?: RelayOptions | undefined;
 }
 
-export function defineConfig<const TConfig extends PagentConfig>(
+/** Defines local connector settings without widening their inferred types. */
+export function defineConnectorConfig<const TConfig extends ConnectorConfig>(
   config: TConfig,
 ): TConfig {
   return config;

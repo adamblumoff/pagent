@@ -1,26 +1,40 @@
 import { createServer } from "node:http";
 
-import { createPagent, defineEvent } from "../src/index.js";
+import { createPagent, defineEvent } from "pagent";
 import { checkHealth, type HealthResult } from "./health.js";
 
 const port = readPositiveNumber("PORT", 3_000);
-const relayUrl = requireEnvironment("PAGENT_RELAY_URL");
-const relayToken = requireEnvironment("PAGENT_RELAY_TOKEN");
+const enabled = process.env.PAGENT_ENABLED === "true";
+const environment = process.env.PAGENT_ENV;
+const active = enabled && Boolean(environment?.trim());
 
-const healthFailed = defineEvent<HealthResult>({ name: "health.failed" });
+const healthFailed = defineEvent<HealthResult>({
+  name: "health.failed",
+  enabledIn: ["staging"],
+  investigation: { cooldownMs: 60_000 },
+});
 const pagent = createPagent({
-  enabled: process.env.PAGENT_ENABLED === "true",
-  environment: process.env.PAGENT_ENV,
-  relay: {
-    url: new URL("/v1/events", relayUrl).toString(),
-    token: relayToken,
-  },
-  onError: (error) => console.error("[pagent] relay emission failed", error),
+  enabled,
+  environment,
+  ...(active
+    ? {
+        relay: {
+          url: new URL(
+            "/v1/events",
+            requireEnvironment("PAGENT_RELAY_URL"),
+          ).toString(),
+          token: requireEnvironment("PAGENT_RELAY_TOKEN"),
+        },
+      }
+    : {}),
+  onDeliveryError: (error) =>
+    console.error("[pagent] relay emission failed", error),
 });
 
 const observedHealthCheck = pagent.observe(checkHealth, {
   event: healthFailed,
-  when: ({ result }) => result.status === "unhealthy",
+  on: "result",
+  triggerWhen: ({ result }) => result.status === "unhealthy",
   context: ({ result }) => result,
 });
 
@@ -53,7 +67,7 @@ server.listen(port, "0.0.0.0", () => {
 
 async function shutdown(): Promise<void> {
   server.close();
-  await pagent.drain();
+  await pagent.flush();
 }
 
 process.on("SIGINT", () => void shutdown());
