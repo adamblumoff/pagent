@@ -20,11 +20,14 @@ export interface EventEnvelope {
   };
 }
 
-export interface SourceRoute {
-  token: string;
+export interface SourceAuthorization {
   repositoryKey: string;
   connectorId: string;
   allowedEnvironments: readonly string[];
+}
+
+export interface SourceRoute extends SourceAuthorization {
+  token: string;
 }
 
 export interface ConnectorCredential {
@@ -37,12 +40,26 @@ export interface RelayConfig {
   heartbeatMs: number;
   sources: readonly SourceRoute[];
   connectors: readonly ConnectorCredential[];
+  enrollmentToken?: string;
 }
 
 export interface EnqueueInput {
-  source: SourceRoute;
+  source: SourceAuthorization;
   event: EventEnvelope["event"];
 }
+
+export interface EnrollmentInput {
+  connectorId: string;
+  repositoryKey: string;
+  allowedEnvironments: readonly string[];
+  sourceTokenHash: string;
+  connectorTokenHash: string;
+}
+
+export type EnrollmentResult =
+  | { status: "enrolled" }
+  | { status: "existing" }
+  | { status: "conflict" };
 
 export interface RelayTask {
   id: string;
@@ -62,6 +79,12 @@ export type EnqueueResult =
 
 export interface RelayStore {
   initialize(): Promise<void>;
+  enroll(input: EnrollmentInput): Promise<EnrollmentResult>;
+  findSource(sourceTokenHash: string): Promise<SourceAuthorization | undefined>;
+  authorizeConnector(
+    connectorId: string,
+    connectorTokenHash: string,
+  ): Promise<boolean>;
   enqueue(input: EnqueueInput): Promise<EnqueueResult>;
   tasksAfter(
     connectorId: string,

@@ -1,8 +1,9 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 import {
   assertEnvironmentAllowed,
+  parseEnrollment,
   parseEventEnvelope,
 } from "./domain.js";
 import type {
@@ -11,6 +12,7 @@ import type {
   RelayConfig,
   RelayStore,
   RelayTask,
+  SourceAuthorization,
   SourceRoute,
 } from "./types.js";
 
@@ -38,24 +40,50 @@ function tokensEqual(actual: string | undefined, expected: string): boolean {
   );
 }
 
-function findSource(
-  request: IncomingMessage,
-  sources: readonly SourceRoute[],
-): SourceRoute | undefined {
-  const token = bearerToken(request);
-  return sources.find((source) => tokensEqual(token, source.token));
+function tokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("base64url");
 }
 
-function findConnector(
+async function findSource(
+  request: IncomingMessage,
+  sources: readonly SourceRoute[],
+  store: RelayStore,
+): Promise<SourceAuthorization | undefined> {
+  const token = bearerToken(request);
+  if (token === undefined) {
+    return undefined;
+  }
+  const source = sources.find((candidate) =>
+    tokensEqual(token, candidate.token),
+  );
+  if (source) {
+    return {
+      repositoryKey: source.repositoryKey,
+      connectorId: source.connectorId,
+      allowedEnvironments: source.allowedEnvironments,
+    };
+  }
+  return store.findSource(tokenHash(token));
+}
+
+async function connectorIsAuthorized(
   request: IncomingMessage,
   connectorId: string,
   connectors: readonly ConnectorCredential[],
-): ConnectorCredential | undefined {
+  store: RelayStore,
+): Promise<boolean> {
   const token = bearerToken(request);
-  return connectors.find(
+  if (token === undefined) {
+    return false;
+  }
+  const connector = connectors.find(
     (connector) =>
       connector.id === connectorId && tokensEqual(token, connector.token),
   );
+  if (connector) {
+    return true;
+  }
+  return store.authorizeConnector(connectorId, tokenHash(token));
 }
 
 function sendJson(
@@ -196,8 +224,37 @@ export function createRelayServer(options: {
         return;
       }
 
+      if (request.method === "POST" && url.pathname === "/v1/enroll") {
+        if (!config.enrollmentToken) {
+          sendJson(response, 404, { error: "not found" });
+          return;
+        }
+        if (!tokensEqual(bearerToken(request), config.enrollmentToken)) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        let enrollment;
+        try {
+          enrollment = parseEnrollment(await readJson(request));
+        } catch (error) {
+          sendJson(response, 400, {
+            error: error instanceof Error ? error.message : "invalid enrollment",
+          });
+          return;
+        }
+        const result = await store.enroll(enrollment);
+        if (result.status === "conflict") {
+          sendJson(response, 409, {
+            error: `connector ${enrollment.connectorId} is already enrolled`,
+          });
+          return;
+        }
+        sendJson(response, result.status === "enrolled" ? 201 : 200, result);
+        return;
+      }
+
       if (request.method === "POST" && url.pathname === "/v1/events") {
-        const source = findSource(request, config.sources);
+        const source = await findSource(request, config.sources, store);
         if (!source) {
           sendJson(response, 401, { error: "unauthorized" });
           return;
@@ -237,7 +294,14 @@ export function createRelayServer(options: {
           : null;
       if (match) {
         const connectorId = decodeURIComponent(match[1] ?? "");
-        if (!findConnector(request, connectorId, config.connectors)) {
+        if (
+          !(await connectorIsAuthorized(
+            request,
+            connectorId,
+            config.connectors,
+            store,
+          ))
+        ) {
           sendJson(response, 401, { error: "unauthorized" });
           return;
         }

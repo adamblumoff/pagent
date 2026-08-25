@@ -1,4 +1,5 @@
 export const cliCommandNames = [
+  "init",
   "start",
   "stop",
   "status",
@@ -11,6 +12,15 @@ export const cliCommandNames = [
 export type CliCommandName = (typeof cliCommandNames)[number];
 
 export type CliCommand =
+  | {
+      name: "init";
+      relay: string | undefined;
+      enrollment: string | undefined;
+      environments: string[];
+      yes: boolean;
+      noStart: boolean;
+      reset: boolean;
+    }
   | {
       name: "start";
       foreground: boolean;
@@ -50,6 +60,18 @@ export class CliUsageError extends Error {
 }
 
 const helpByCommand: Record<CliCommandName, string> = {
+  init: `Usage: pagent init [options]
+
+Enroll this repository and write its local configuration.
+
+Options:
+  --relay <url>           Relay URL
+  --enrollment <token>   Relay enrollment token
+  --environments <list>  Comma-separated environments (default: staging)
+  --yes                   Skip the confirmation prompt
+  --no-start              Do not start the connector after setup
+  --reset                 Replace an existing Pagent setup
+  -h, --help              Show help for init`,
   start: `Usage: pagent start [options]
 
 Start the local connector in the background.
@@ -99,6 +121,7 @@ const generalHelp = `Usage: pagent <command> [options]
 Run and inspect the local Pagent connector.
 
 Commands:
+  init     Enroll this repository and write its configuration
   start    Start the connector (background by default)
   stop     Stop the connector gracefully
   status   Show connector state
@@ -148,6 +171,8 @@ export function parseCliArgs(args: readonly string[]): CliCommand {
   }
 
   switch (first) {
+    case "init":
+      return parseInit(rest);
     case "start":
       return parseStart(rest);
     case "stop":
@@ -165,6 +190,107 @@ export function parseCliArgs(args: readonly string[]): CliCommand {
       requireNoCommandArgs(first, rest);
       return { name: "version" };
   }
+}
+
+function parseInit(args: readonly string[]): CliCommand {
+  let relay: string | undefined;
+  let enrollment: string | undefined;
+  let environments = ["staging"];
+  let hasEnvironments = false;
+  let yes = false;
+  let noStart = false;
+  let reset = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+
+    if (arg === "--yes") {
+      yes = setOnce("init", arg, yes);
+      continue;
+    }
+    if (arg === "--no-start") {
+      noStart = setOnce("init", arg, noStart);
+      continue;
+    }
+    if (arg === "--reset") {
+      reset = setOnce("init", arg, reset);
+      continue;
+    }
+
+    const option = initValueOption(arg);
+    if (option !== undefined) {
+      const duplicate =
+        (option.flag === "--relay" && relay !== undefined) ||
+        (option.flag === "--enrollment" && enrollment !== undefined) ||
+        (option.flag === "--environments" && hasEnvironments);
+      if (duplicate) {
+        throw duplicateOption("init", option.flag);
+      }
+
+      const inlineValue = option.inlineValue;
+      const value = inlineValue ?? args[index + 1];
+      if (
+        value === undefined ||
+        value.trim() === "" ||
+        (inlineValue === undefined && value.startsWith("-"))
+      ) {
+        throw new CliUsageError(`Option "${option.flag}" requires a value.`);
+      }
+
+      if (option.flag === "--relay") {
+        relay = value;
+      } else if (option.flag === "--enrollment") {
+        enrollment = value;
+      } else {
+        environments = parseEnvironmentList(value);
+        hasEnvironments = true;
+      }
+
+      if (inlineValue === undefined) {
+        index += 1;
+      }
+      continue;
+    }
+
+    rejectCommandArg("init", arg);
+  }
+
+  return {
+    name: "init",
+    relay,
+    enrollment,
+    environments,
+    yes,
+    noStart,
+    reset,
+  };
+}
+
+function initValueOption(
+  arg: string,
+): { flag: "--relay" | "--enrollment" | "--environments"; inlineValue?: string } | undefined {
+  for (const flag of ["--relay", "--enrollment", "--environments"] as const) {
+    if (arg === flag) {
+      return { flag };
+    }
+    if (arg.startsWith(`${flag}=`)) {
+      return { flag, inlineValue: arg.slice(flag.length + 1) };
+    }
+  }
+  return undefined;
+}
+
+function parseEnvironmentList(value: string): string[] {
+  const environments = value.split(",").map((environment) => environment.trim());
+  if (
+    environments.some((environment) => environment === "") ||
+    new Set(environments).size !== environments.length
+  ) {
+    throw new CliUsageError(
+      'Option "--environments" requires a comma-separated list of unique, non-empty names.',
+    );
+  }
+  return environments;
 }
 
 function parseStart(args: readonly string[]): CliCommand {

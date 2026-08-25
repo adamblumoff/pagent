@@ -1,8 +1,11 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { basename, delimiter, join, resolve } from "node:path";
+
+import { parseEnv } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -17,6 +20,108 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
+  it("enrolls a repository, writes private settings, and runs doctor", async () => {
+    const root = await temporaryDirectory();
+    const binDirectory = join(root, "bin");
+    await mkdir(binDirectory, { recursive: true });
+    await fakeCodex(join(binDirectory, "codex"));
+    await runProcess("git", ["init", "--quiet"], root);
+    await fakeInstalledPackage(root);
+
+    let enrollment: Record<string, unknown> | undefined;
+    const relay = createServer(async (request, response) => {
+      if (request.method === "POST" && request.url === "/v1/enroll") {
+        if (request.headers.authorization !== "Bearer enrollment-secret") {
+          response.writeHead(401).end();
+          return;
+        }
+        let body = "";
+        request.setEncoding("utf8");
+        for await (const chunk of request) body += chunk;
+        enrollment = JSON.parse(body) as Record<string, unknown>;
+        response.writeHead(201, { "content-type": "application/json" });
+        response.end('{"status":"enrolled"}\n');
+        return;
+      }
+      if (request.url === "/health") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end('{"status":"ok"}\n');
+        return;
+      }
+      if (
+        request.method === "GET" &&
+        request.url ===
+          `/v1/connectors/${encodeURIComponent(String(enrollment?.connectorId))}/events`
+      ) {
+        const token = request.headers.authorization?.replace(/^Bearer /u, "");
+        if (
+          token === undefined ||
+          sha256(token) !== enrollment?.connectorTokenHash
+        ) {
+          response.writeHead(401).end();
+          return;
+        }
+        response.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+        });
+        response.write(": connected\n\n");
+        return;
+      }
+      response.writeHead(404).end();
+    });
+    relay.listen(0, "127.0.0.1");
+    await new Promise<void>((resolveListen) =>
+      relay.once("listening", resolveListen),
+    );
+    const address = relay.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("Test relay did not bind to a port.");
+    }
+
+    try {
+      const result = await runCli(
+        [
+          "init",
+          "--relay",
+          `http://127.0.0.1:${address.port}`,
+          "--enrollment",
+          "enrollment-secret",
+          "--yes",
+          "--no-start",
+        ],
+        {
+          ...process.env,
+          PATH: `${binDirectory}${delimiter}${process.env.PATH ?? ""}`,
+        },
+        root,
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("Pagent initialized for");
+      expect(result.stdout).toContain("Relay authentication");
+      expect(result.stdout).toContain("The connector is stopped");
+      expect(result.stdout).not.toContain("enrollment-secret");
+      expect(result.stderr).toBe("");
+
+      const local = parseEnv(await readFile(join(root, ".pagent/local.env"), "utf8"));
+      const cloud = parseEnv(await readFile(join(root, ".pagent/cloud.env"), "utf8"));
+      expect(enrollment).toMatchObject({
+        version: 1,
+        repositoryKey: basename(root).toLowerCase(),
+        allowedEnvironments: ["staging"],
+        sourceTokenHash: sha256(cloud.PAGENT_RELAY_TOKEN!),
+        connectorTokenHash: sha256(local.PAGENT_CONNECTOR_TOKEN!),
+      });
+      expect(await readFile(join(root, ".gitignore"), "utf8")).toContain(
+        ".pagent/",
+      );
+    } finally {
+      relay.closeAllConnections();
+      await new Promise<void>((resolveClose) => relay.close(() => resolveClose()));
+    }
+  }, 30_000);
+
   it("starts in the background, reports live state, logs, and stops", async () => {
     const root = await temporaryDirectory();
     const stateDirectory = join(root, "state");
@@ -115,11 +220,12 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
 async function runCli(
   args: string[],
   environment: NodeJS.ProcessEnv,
+  cwd = process.cwd(),
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const child = spawn(
     resolve("node_modules/.bin/tsx"),
     [resolve("src/cli.ts"), ...args],
-    { cwd: process.cwd(), env: environment, stdio: ["ignore", "pipe", "pipe"] },
+    { cwd, env: environment, stdio: ["ignore", "pipe", "pipe"] },
   );
   let stdout = "";
   let stderr = "";
@@ -132,6 +238,36 @@ async function runCli(
     child.once("exit", resolveExit);
   });
   return { code, stdout, stderr };
+}
+
+async function fakeInstalledPackage(root: string): Promise<void> {
+  const directory = join(root, "node_modules", "pagent");
+  await mkdir(directory, { recursive: true });
+  await writeFile(
+    join(directory, "package.json"),
+    JSON.stringify({
+      name: "pagent",
+      type: "module",
+      exports: { "./connector": "./connector.mjs" },
+    }),
+  );
+  await writeFile(
+    join(directory, "connector.mjs"),
+    "export const defineConnectorConfig = (config) => config;\n",
+  );
+}
+
+async function runProcess(command: string, args: string[], cwd: string): Promise<void> {
+  const child = spawn(command, args, { cwd, stdio: "ignore" });
+  const code = await new Promise<number | null>((resolveExit, rejectExit) => {
+    child.once("error", rejectExit);
+    child.once("exit", resolveExit);
+  });
+  if (code !== 0) throw new Error(`${command} exited with code ${code}.`);
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
 }
 
 async function fakeCodex(path: string): Promise<void> {

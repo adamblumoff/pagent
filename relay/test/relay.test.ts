@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -19,7 +20,27 @@ const config: RelayConfig = {
     },
   ],
   connectors: [{ id: "local-1", token: "connector-secret" }],
+  enrollmentToken: "enrollment-secret",
 };
+
+const dynamicSourceToken = "dynamic-source-secret";
+const dynamicConnectorToken = "dynamic-connector-secret";
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
+}
+
+function enrollment(overrides: Record<string, unknown> = {}) {
+  return {
+    version: 1,
+    connectorId: "dynamic-1",
+    repositoryKey: "dynamic-repo",
+    allowedEnvironments: ["staging"],
+    sourceTokenHash: sha256(dynamicSourceToken),
+    connectorTokenHash: sha256(dynamicConnectorToken),
+    ...overrides,
+  };
+}
 
 function event(id: string, overrides: Record<string, unknown> = {}) {
   return {
@@ -104,6 +125,173 @@ describe("relay HTTP API", () => {
     server.close();
     await once(server, "close");
     await store.close();
+  });
+
+  it("authenticates and idempotently registers an enrollment", async () => {
+    const enroll = (body: unknown, token = "enrollment-secret") =>
+      fetch(`${baseUrl}/v1/enroll`, {
+        method: "POST",
+        body: JSON.stringify(body),
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+      });
+
+    const unauthorized = await enroll({ not: "json enrollment" }, "wrong");
+    assert.equal(unauthorized.status, 401);
+    assert.equal(store.enrollments.length, 0);
+
+    const first = await enroll(enrollment());
+    assert.equal(first.status, 201);
+    assert.deepEqual(await first.json(), { status: "enrolled" });
+    assert.deepEqual(store.enrollments, [
+      {
+        connectorId: "dynamic-1",
+        repositoryKey: "dynamic-repo",
+        allowedEnvironments: ["staging"],
+        sourceTokenHash: sha256(dynamicSourceToken),
+        connectorTokenHash: sha256(dynamicConnectorToken),
+      },
+    ]);
+
+    const repeated = await enroll(enrollment());
+    assert.equal(repeated.status, 200);
+    assert.deepEqual(await repeated.json(), { status: "existing" });
+    assert.equal(store.enrollments.length, 1);
+
+    const conflict = await enroll(enrollment({ repositoryKey: "other-repo" }));
+    assert.equal(conflict.status, 409);
+    assert.match(JSON.stringify(await conflict.json()), /already enrolled/);
+  });
+
+  it("does not expose enrollment when it is not configured", async () => {
+    const disabledConfig = { ...config };
+    delete disabledConfig.enrollmentToken;
+    const disabledServer = createRelayServer({ config: disabledConfig, store });
+    disabledServer.listen(0, "127.0.0.1");
+    await once(disabledServer, "listening");
+    const address = disabledServer.address() as AddressInfo;
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${address.port}/v1/enroll`,
+        {
+          method: "POST",
+          body: JSON.stringify(enrollment()),
+          headers: {
+            authorization: "Bearer enrollment-secret",
+            "content-type": "application/json",
+          },
+        },
+      );
+      assert.equal(response.status, 404);
+      assert.equal(store.enrollments.length, 0);
+    } finally {
+      disabledServer.close();
+      await once(disabledServer, "close");
+    }
+  });
+
+  it("rejects malformed enrollment fields", async () => {
+    const invalidBodies = [
+      { ...enrollment(), version: 2 },
+      { ...enrollment(), unexpected: true },
+      enrollment({ connectorId: " dynamic-1" }),
+      enrollment({ allowedEnvironments: [] }),
+      enrollment({ allowedEnvironments: ["staging", "staging"] }),
+      enrollment({ sourceTokenHash: "not-a-sha256-hash" }),
+      enrollment({ connectorTokenHash: Buffer.alloc(31).toString("base64url") }),
+      enrollment({ connectorTokenHash: sha256(dynamicSourceToken) }),
+    ];
+
+    for (const body of invalidBodies) {
+      const response = await fetch(`${baseUrl}/v1/enroll`, {
+        method: "POST",
+        body: JSON.stringify(body),
+        headers: {
+          authorization: "Bearer enrollment-secret",
+          "content-type": "application/json",
+        },
+      });
+      assert.equal(response.status, 400);
+    }
+    assert.equal(store.enrollments.length, 0);
+  });
+
+  it("accepts events and SSE connections with enrolled credentials", async () => {
+    const enrolled = await fetch(`${baseUrl}/v1/enroll`, {
+      method: "POST",
+      body: JSON.stringify(enrollment()),
+      headers: {
+        authorization: "Bearer enrollment-secret",
+        "content-type": "application/json",
+      },
+    });
+    assert.equal(enrolled.status, 201);
+
+    const ingested = await fetch(`${baseUrl}/v1/events`, {
+      method: "POST",
+      body: JSON.stringify(event("dynamic-event")),
+      headers: {
+        authorization: `Bearer ${dynamicSourceToken}`,
+        "content-type": "application/json",
+      },
+    });
+    assert.equal(ingested.status, 201);
+    assert.equal(store.enqueues[0]?.source.connectorId, "dynamic-1");
+    assert.equal(store.enqueues[0]?.source.repositoryKey, "dynamic-repo");
+
+    const rejectedEnvironment = await fetch(`${baseUrl}/v1/events`, {
+      method: "POST",
+      body: JSON.stringify(
+        event("dynamic-production-event", { environment: "production" }),
+      ),
+      headers: {
+        authorization: `Bearer ${dynamicSourceToken}`,
+        "content-type": "application/json",
+      },
+    });
+    assert.equal(rejectedEnvironment.status, 422);
+
+    const wrongSource = await fetch(`${baseUrl}/v1/events`, {
+      method: "POST",
+      body: JSON.stringify(event("wrong-source-event")),
+      headers: {
+        authorization: "Bearer wrong-dynamic-source",
+        "content-type": "application/json",
+      },
+    });
+    assert.equal(wrongSource.status, 401);
+
+    const wrongConnector = await fetch(
+      `${baseUrl}/v1/connectors/dynamic-1/events`,
+      { headers: { authorization: "Bearer wrong-dynamic-connector" } },
+    );
+    assert.equal(wrongConnector.status, 401);
+
+    store.publish(
+      "dynamic-1",
+      task("1", "dynamic-event", { repositoryKey: "dynamic-repo" }),
+    );
+    const abort = new AbortController();
+    const stream = await fetch(
+      `${baseUrl}/v1/connectors/dynamic-1/events`,
+      {
+        headers: { authorization: `Bearer ${dynamicConnectorToken}` },
+        signal: abort.signal,
+      },
+    );
+    assert.equal(stream.status, 200);
+    const reader = stream.body?.getReader();
+    assert.ok(reader);
+    let text = "";
+    while (!text.includes("event: task")) {
+      const result = await reader.read();
+      assert.equal(result.done, false);
+      text += new TextDecoder().decode(result.value);
+    }
+    abort.abort();
+    assert.match(text, /"repositoryKey":"dynamic-repo"/);
   });
 
   it("rejects unauthenticated ingest without reading application data", async () => {

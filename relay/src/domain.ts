@@ -1,7 +1,8 @@
 import type {
   EncryptedContext,
+  EnrollmentInput,
   EventEnvelope,
-  SourceRoute,
+  SourceAuthorization,
 } from "./types.js";
 
 const MAX_NAME_LENGTH = 200;
@@ -35,6 +36,14 @@ function boundedString(value: unknown, name: string): string {
     );
   }
   return value;
+}
+
+function canonicalBoundedString(value: unknown, name: string): string {
+  const result = boundedString(value, name);
+  if (result !== result.trim()) {
+    throw new Error(`${name} must not contain surrounding whitespace`);
+  }
+  return result;
 }
 
 function nonNegativeInteger(value: unknown, name: string): number {
@@ -158,8 +167,69 @@ export function parseEventEnvelope(value: unknown): EventEnvelope {
   };
 }
 
+export function parseEnrollment(value: unknown): EnrollmentInput {
+  if (!isRecord(value) || value.version !== 1) {
+    throw new Error("body must contain enrollment version 1");
+  }
+  assertOnlyKeys(
+    value,
+    [
+      "version",
+      "connectorId",
+      "repositoryKey",
+      "allowedEnvironments",
+      "sourceTokenHash",
+      "connectorTokenHash",
+    ],
+    "body",
+  );
+  if (
+    !Array.isArray(value.allowedEnvironments) ||
+    value.allowedEnvironments.length === 0
+  ) {
+    throw new Error("body.allowedEnvironments must be a non-empty string array");
+  }
+  const allowedEnvironments = value.allowedEnvironments.map(
+    (environment, index) =>
+      canonicalBoundedString(
+        environment,
+        `body.allowedEnvironments[${index}]`,
+      ),
+  );
+  if (new Set(allowedEnvironments).size !== allowedEnvironments.length) {
+    throw new Error("body.allowedEnvironments values must be unique");
+  }
+  const sourceTokenHash = parseBase64Url(
+    value.sourceTokenHash,
+    "body.sourceTokenHash",
+  );
+  const connectorTokenHash = parseBase64Url(
+    value.connectorTokenHash,
+    "body.connectorTokenHash",
+  );
+  if (sourceTokenHash.bytes.length !== 32) {
+    throw new Error("body.sourceTokenHash must be a SHA-256 hash");
+  }
+  if (connectorTokenHash.bytes.length !== 32) {
+    throw new Error("body.connectorTokenHash must be a SHA-256 hash");
+  }
+  if (sourceTokenHash.encoded === connectorTokenHash.encoded) {
+    throw new Error("source and connector credentials must be different");
+  }
+  return {
+    connectorId: canonicalBoundedString(value.connectorId, "body.connectorId"),
+    repositoryKey: canonicalBoundedString(
+      value.repositoryKey,
+      "body.repositoryKey",
+    ),
+    allowedEnvironments,
+    sourceTokenHash: sourceTokenHash.encoded,
+    connectorTokenHash: connectorTokenHash.encoded,
+  };
+}
+
 export function assertEnvironmentAllowed(
-  source: SourceRoute,
+  source: SourceAuthorization,
   environment: string,
 ): void {
   if (!source.allowedEnvironments.includes(environment)) {

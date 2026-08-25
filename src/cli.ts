@@ -3,6 +3,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { open, readFile } from "node:fs/promises";
 import { watch } from "node:fs";
+import { createInterface } from "node:readline/promises";
+import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -12,6 +14,7 @@ import {
   type CliCommand,
 } from "./cli-args.js";
 import { runDoctor, type DoctorReport } from "./doctor.js";
+import { runProjectInit } from "./init.js";
 import { loadConnectorConfig, type LoadedConnectorConfig } from "./local-config.js";
 import {
   requestLocalControl,
@@ -60,6 +63,9 @@ async function main(): Promise<void> {
     case "version":
       console.log(VERSION);
       return;
+    case "init":
+      await initCommand(command);
+      return;
     case "doctor":
       await doctorCommand(command.json);
       return;
@@ -75,6 +81,103 @@ async function main(): Promise<void> {
     case "logs":
       await logsCommand(command.lines, command.follow);
       return;
+  }
+}
+
+async function initCommand(
+  command: Extract<CliCommand, { name: "init" }>,
+): Promise<void> {
+  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+  const relayUrl = await initValue({
+    value: command.relay ?? process.env.PAGENT_RELAY_URL,
+    interactive,
+    prompt: "Relay URL: ",
+    missing:
+      "Relay URL is required. Pass `--relay <url>` or set PAGENT_RELAY_URL.",
+  });
+  const enrollmentToken = await initValue({
+    value: command.enrollment ?? process.env.PAGENT_ENROLLMENT_TOKEN,
+    interactive,
+    prompt: "Enrollment token: ",
+    hidden: true,
+    missing:
+      "Enrollment token is required. Pass `--enrollment <token>` or set PAGENT_ENROLLMENT_TOKEN.",
+  });
+
+  if (!command.yes) {
+    if (!interactive) {
+      throw new Error(
+        "Pagent init needs confirmation in a non-interactive shell. Review the options, then add `--yes`.",
+      );
+    }
+    const answer = await question(
+      `Enroll this repository for ${command.environments.join(", ")} and ${
+        command.noStart ? "leave the connector stopped" : "start the connector"
+      }? [y/N] `,
+    );
+    if (answer.toLowerCase() !== "y" && answer.toLowerCase() !== "yes") {
+      console.log("Pagent init cancelled.");
+      return;
+    }
+  }
+
+  console.log("Checking Git, Codex, and relay enrollment.");
+  const initialized = await runProjectInit({
+    relayUrl,
+    enrollmentToken,
+    environments: command.environments,
+    reset: command.reset,
+  });
+  process.chdir(initialized.projectDirectory);
+
+  console.log(`\nPagent initialized for ${initialized.repositoryKey}.`);
+  console.log(`Connector config: ${initialized.configPath}`);
+  console.log(`Cloud environment: ${initialized.cloudEnvironmentPath}`);
+
+  if (command.noStart) {
+    await doctorCommand(false);
+    if (process.exitCode === undefined) {
+      console.log("\nThe connector is stopped. Run `pagent start` when you are ready.");
+    }
+    return;
+  }
+  await startCommand(false, false);
+}
+
+async function initValue(options: {
+  value: string | undefined;
+  interactive: boolean;
+  prompt: string;
+  missing: string;
+  hidden?: boolean;
+}): Promise<string> {
+  const value = options.value?.trim();
+  if (value) return value;
+  if (!options.interactive) throw new Error(options.missing);
+  const answer = (await question(options.prompt, options.hidden === true)).trim();
+  if (!answer) throw new Error(options.missing);
+  return answer;
+}
+
+async function question(prompt: string, hidden = false): Promise<string> {
+  let muted = false;
+  const output = hidden
+    ? new Writable({
+        write(chunk, _encoding, callback) {
+          if (!muted) process.stdout.write(chunk);
+          callback();
+        },
+      })
+    : process.stdout;
+  const input = createInterface({ input: process.stdin, output, terminal: true });
+  try {
+    const answer = input.question(prompt);
+    muted = hidden;
+    const value = await answer;
+    if (hidden) process.stdout.write("\n");
+    return value;
+  } finally {
+    input.close();
   }
 }
 

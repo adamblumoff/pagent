@@ -60,11 +60,17 @@ export async function loadConnectorConfig(options: {
 }
 
 function loadProjectEnvironment(directory: string): void {
-  try {
-    loadEnvFile(join(directory, ".env"));
-  } catch (error) {
-    if (!isNodeError(error) || error.code !== "ENOENT") {
-      throw error;
+  const paths = [
+    join(directory, ".pagent", "local.env"),
+    join(directory, ".env"),
+  ];
+  for (const path of paths) {
+    try {
+      loadEnvFile(path);
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== "ENOENT") {
+        throw error;
+      }
     }
   }
 }

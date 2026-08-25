@@ -2,10 +2,13 @@ import pg from "pg";
 
 import type {
   EncryptedContext,
+  EnrollmentInput,
+  EnrollmentResult,
   EnqueueInput,
   EnqueueResult,
   RelayStore,
   RelayTask,
+  SourceAuthorization,
 } from "./types.js";
 
 const { Pool } = pg;
@@ -21,6 +24,14 @@ interface TaskRow {
   investigation_group: string | null;
   repository_key: string;
   encrypted_context: EncryptedContext;
+}
+
+interface EnrollmentRow {
+  connector_id: string;
+  repository_key: string;
+  allowed_environments: string[];
+  source_token_hash: string;
+  connector_token_hash: string;
 }
 
 function taskFromRow(row: TaskRow): RelayTask {
@@ -54,6 +65,16 @@ export class PostgresRelayStore implements RelayStore {
 
   async initialize(): Promise<void> {
     await this.#pool.query(`
+      CREATE TABLE IF NOT EXISTS pagent_enrollments (
+        connector_id TEXT PRIMARY KEY,
+        repository_key TEXT NOT NULL,
+        allowed_environments TEXT[] NOT NULL,
+        source_token_hash TEXT NOT NULL UNIQUE CHECK (length(source_token_hash) = 43),
+        connector_token_hash TEXT NOT NULL UNIQUE CHECK (length(connector_token_hash) = 43),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK (cardinality(allowed_environments) > 0)
+      );
+
       CREATE TABLE IF NOT EXISTS pagent_events (
         event_id TEXT PRIMARY KEY,
         event_type TEXT NOT NULL,
@@ -134,6 +155,82 @@ export class PostgresRelayStore implements RelayStore {
     `);
 
     await this.#connectListener();
+  }
+
+  async enroll(input: EnrollmentInput): Promise<EnrollmentResult> {
+    const inserted = await this.#pool.query<{ connector_id: string }>(
+      `INSERT INTO pagent_enrollments (
+         connector_id, repository_key, allowed_environments,
+         source_token_hash, connector_token_hash
+       ) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT DO NOTHING
+       RETURNING connector_id`,
+      [
+        input.connectorId,
+        input.repositoryKey,
+        input.allowedEnvironments,
+        input.sourceTokenHash,
+        input.connectorTokenHash,
+      ],
+    );
+    if ((inserted.rowCount ?? 0) > 0) {
+      return { status: "enrolled" };
+    }
+
+    const existing = await this.#pool.query<EnrollmentRow>(
+      `SELECT connector_id, repository_key, allowed_environments,
+              source_token_hash, connector_token_hash
+         FROM pagent_enrollments
+        WHERE connector_id = $1`,
+      [input.connectorId],
+    );
+    const row = existing.rows[0];
+    if (
+      row &&
+      row.repository_key === input.repositoryKey &&
+      row.source_token_hash === input.sourceTokenHash &&
+      row.connector_token_hash === input.connectorTokenHash &&
+      row.allowed_environments.length === input.allowedEnvironments.length &&
+      row.allowed_environments.every(
+        (environment, index) => environment === input.allowedEnvironments[index],
+      )
+    ) {
+      return { status: "existing" };
+    }
+    return { status: "conflict" };
+  }
+
+  async findSource(
+    sourceTokenHash: string,
+  ): Promise<SourceAuthorization | undefined> {
+    const result = await this.#pool.query<EnrollmentRow>(
+      `SELECT connector_id, repository_key, allowed_environments,
+              source_token_hash, connector_token_hash
+         FROM pagent_enrollments
+        WHERE source_token_hash = $1`,
+      [sourceTokenHash],
+    );
+    const row = result.rows[0];
+    return row
+      ? {
+          connectorId: row.connector_id,
+          repositoryKey: row.repository_key,
+          allowedEnvironments: row.allowed_environments,
+        }
+      : undefined;
+  }
+
+  async authorizeConnector(
+    connectorId: string,
+    connectorTokenHash: string,
+  ): Promise<boolean> {
+    const result = await this.#pool.query(
+      `SELECT 1
+         FROM pagent_enrollments
+        WHERE connector_id = $1 AND connector_token_hash = $2`,
+      [connectorId, connectorTokenHash],
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   async enqueue(input: EnqueueInput): Promise<EnqueueResult> {

@@ -78,6 +78,15 @@ function sourcesFromEnvironment(env: NodeJS.ProcessEnv): SourceRoute[] {
     );
   }
 
+  if (
+    env.PAGENT_SOURCE_TOKEN === undefined &&
+    env.PAGENT_REPOSITORY_KEY === undefined &&
+    env.PAGENT_CONNECTOR_ID === undefined &&
+    env.PAGENT_ALLOWED_ENVIRONMENTS === undefined
+  ) {
+    return [];
+  }
+
   return [
     {
       token: required(env.PAGENT_SOURCE_TOKEN, "PAGENT_SOURCE_TOKEN"),
@@ -117,6 +126,13 @@ function connectorsFromEnvironment(env: NodeJS.ProcessEnv): ConnectorCredential[
     });
   }
 
+  if (
+    env.PAGENT_CONNECTOR_ID === undefined &&
+    env.PAGENT_CONNECTOR_TOKEN === undefined
+  ) {
+    return [];
+  }
+
   return [
     {
       id: required(env.PAGENT_CONNECTOR_ID, "PAGENT_CONNECTOR_ID"),
@@ -141,6 +157,12 @@ function assertUnique(values: readonly string[], name: string): void {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
   const sources = sourcesFromEnvironment(env);
   const connectors = connectorsFromEnvironment(env);
+  const enrollmentToken = env.PAGENT_ENROLLMENT_TOKEN?.trim() || undefined;
+  if (sources.length === 0 && connectors.length === 0 && !enrollmentToken) {
+    throw new Error(
+      "configure static source and connector credentials or PAGENT_ENROLLMENT_TOKEN",
+    );
+  }
   assertUnique(
     sources.map((source) => source.token),
     "source token",
@@ -177,5 +199,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
     ),
     sources,
     connectors,
+    ...(enrollmentToken === undefined ? {} : { enrollmentToken }),
   };
 }

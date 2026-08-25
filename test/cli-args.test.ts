@@ -7,6 +7,42 @@ import {
 } from "../src/cli-args.js";
 
 describe("CLI arguments", () => {
+  it("uses safe init defaults", () => {
+    expect(parseCliArgs(["init"])).toEqual({
+      name: "init",
+      relay: undefined,
+      enrollment: undefined,
+      environments: ["staging"],
+      yes: false,
+      noStart: false,
+      reset: false,
+    });
+  });
+
+  it("parses init values and switches", () => {
+    expect(
+      parseCliArgs([
+        "init",
+        "--relay",
+        "https://relay.example.com",
+        "--enrollment=secret",
+        "--environments",
+        "staging, production",
+        "--yes",
+        "--no-start",
+        "--reset",
+      ]),
+    ).toEqual({
+      name: "init",
+      relay: "https://relay.example.com",
+      enrollment: "secret",
+      environments: ["staging", "production"],
+      yes: true,
+      noStart: true,
+      reset: true,
+    });
+  });
+
   it("starts in the background with doctor checks by default", () => {
     expect(parseCliArgs(["start"])).toEqual({
       name: "start",
@@ -78,6 +114,14 @@ describe("CLI arguments", () => {
 
   it("rejects duplicate and conflicting flags", () => {
     expectUsageError(
+      ["init", "--relay=one", "--relay", "two"],
+      'Option "--relay" was provided more than once for "init".',
+    );
+    expectUsageError(
+      ["init", "--yes", "--yes"],
+      'Option "--yes" was provided more than once for "init".',
+    );
+    expectUsageError(
       ["start", "--foreground", "--foreground"],
       'Option "--foreground" was provided more than once for "start".',
     );
@@ -92,6 +136,29 @@ describe("CLI arguments", () => {
     expectUsageError(
       ["--help", "--version"],
       'Option "--help" cannot be combined with other arguments.',
+    );
+  });
+
+  it("rejects missing and malformed init values", () => {
+    expectUsageError(
+      ["init", "--relay"],
+      'Option "--relay" requires a value.',
+    );
+    expectUsageError(
+      ["init", "--enrollment="],
+      'Option "--enrollment" requires a value.',
+    );
+    expectUsageError(
+      ["init", "--environments", "staging,,production"],
+      'Option "--environments" requires a comma-separated list of unique, non-empty names.',
+    );
+    expectUsageError(
+      ["init", "--environments=staging,staging"],
+      'Option "--environments" requires a comma-separated list of unique, non-empty names.',
+    );
+    expectUsageError(
+      ["init", "--help", "--yes"],
+      'Help for "init" cannot be combined with other arguments.',
     );
   });
 
@@ -112,7 +179,9 @@ describe("CLI arguments", () => {
 
   it("renders concise general and command help", () => {
     expect(renderCliHelp()).toContain("Usage: pagent <command> [options]");
+    expect(renderCliHelp()).toContain("init     Enroll this repository");
     expect(renderCliHelp()).toContain("start    Start the connector");
+    expect(renderCliHelp("init")).toContain("--enrollment <token>");
     expect(renderCliHelp("start")).toContain("--foreground");
     expect(renderCliHelp("logs")).toContain("--lines <count>");
   });

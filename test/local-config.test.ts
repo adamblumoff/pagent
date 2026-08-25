@@ -44,6 +44,32 @@ describe("local connector config", () => {
     expect(loaded.config.relay.url).toBe("https://relay.example.test");
   });
 
+  it("loads local connector secrets before the project .env", async () => {
+    const root = await temporaryDirectory();
+    await mkdir(join(root, ".pagent"), { recursive: true });
+    await writeFile(
+      join(root, ".pagent", "local.env"),
+      "PAGENT_TEST_RELAY_URL=https://local.example.test\n",
+    );
+    await writeFile(
+      join(root, ".env"),
+      "PAGENT_TEST_RELAY_URL=https://project.example.test\n",
+    );
+    await writeFile(
+      join(root, "pagent.config.mjs"),
+      `export default {
+        relay: { url: process.env.PAGENT_TEST_RELAY_URL, token: "secret", connectorId: "local" },
+        repositories: { pagent: ${JSON.stringify(root)} },
+        environments: ["staging"],
+        encryption: { keys: { current: ${JSON.stringify(KEY)} } }
+      };\n`,
+    );
+
+    const loaded = await loadConnectorConfig({ cwd: root });
+
+    expect(loaded.config.relay.url).toBe("https://local.example.test");
+  });
+
   it("rejects a config without the local connector contract", async () => {
     const root = await temporaryDirectory();
     const path = join(root, "pagent.config.mjs");

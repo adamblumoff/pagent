@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
 
 import pg from "pg";
 
 import { PostgresRelayStore } from "../src/postgres-store.js";
-import type { EnqueueInput, SourceRoute } from "../src/types.js";
+import type {
+  EnrollmentInput,
+  EnqueueInput,
+  SourceRoute,
+} from "../src/types.js";
 
 const { Pool } = pg;
 const databaseUrl = process.env.PAGENT_TEST_DATABASE_URL?.trim();
@@ -15,6 +19,18 @@ const source: SourceRoute = {
   repositoryKey: "pagent-demo",
   connectorId: "local-1",
   allowedEnvironments: ["staging"],
+};
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
+}
+
+const enrollment: EnrollmentInput = {
+  connectorId: "enrolled-1",
+  repositoryKey: "enrolled-repo",
+  allowedEnvironments: ["staging", "production"],
+  sourceTokenHash: sha256("enrolled-source-secret"),
+  connectorTokenHash: sha256("enrolled-connector-secret"),
 };
 
 function input(
@@ -84,6 +100,41 @@ describe(
         : false,
   },
   () => {
+    it("persists idempotent enrollment credentials for dynamic auth", async () => {
+      await withStore(async (store) => {
+        assert.deepEqual(await store.enroll(enrollment), {
+          status: "enrolled",
+        });
+        assert.deepEqual(await store.enroll(enrollment), {
+          status: "existing",
+        });
+        assert.deepEqual(
+          await store.enroll({ ...enrollment, repositoryKey: "other-repo" }),
+          { status: "conflict" },
+        );
+        assert.deepEqual(
+          await store.findSource(enrollment.sourceTokenHash),
+          {
+            connectorId: "enrolled-1",
+            repositoryKey: "enrolled-repo",
+            allowedEnvironments: ["staging", "production"],
+          },
+        );
+        assert.equal(
+          await store.authorizeConnector(
+            "enrolled-1",
+            enrollment.connectorTokenHash,
+          ),
+          true,
+        );
+        assert.equal(
+          await store.authorizeConnector("enrolled-1", sha256("wrong")),
+          false,
+        );
+        assert.equal(await store.findSource(sha256("wrong")), undefined);
+      });
+    });
+
     it("owns deduplication and developer-defined cooldown policy", async () => {
       await withStore(async (store) => {
         const first = await store.enqueue(
