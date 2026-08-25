@@ -23,7 +23,7 @@ threshold. This is a simulated incident, so do not change files.
 `.trim(),
 });
 
-const { codex, ...runtimeConfig } = pagentConfig;
+const { codex, relay: _relay, ...runtimeConfig } = pagentConfig;
 const pagent = createPagent({
   ...runtimeConfig,
   agent: codexAgent(codex),

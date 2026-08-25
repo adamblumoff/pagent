@@ -13,10 +13,12 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "demo": "tsx demo/server.ts",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "build": "tsc -p tsconfig.build.json && npm --prefix relay run build",
+    "connector": "tsx demo/connector.ts",
+    "demo": "tsx demo/cloud-server.ts",
+    "demo:local": "tsx demo/server.ts",
+    "test": "vitest run && npm --prefix relay test",
+    "typecheck": "tsc --noEmit && npm --prefix relay run typecheck"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

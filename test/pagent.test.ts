@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createPagent,
@@ -21,6 +21,11 @@ const healthFailed = defineEvent<{ reason: string }>({
   enabledIn: ["staging"],
   cooldownMs: 60_000,
   prompt: (event) => `Investigate: ${event.payload.reason}`,
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("Pagent", () => {
@@ -238,5 +243,146 @@ describe("Pagent", () => {
     expect(observed()).toBe("application result");
     await pagent.drain();
     expect(errors).toEqual([failure]);
+  });
+
+  it("emits a versioned event envelope to a relay", async () => {
+    const relayFetch = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) =>
+        new Response(null, { status: 202 }),
+    );
+    vi.stubGlobal("fetch", relayFetch);
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      relay: {
+        url: "https://relay.example.test/v1/events",
+        token: "relay-secret",
+      },
+    });
+    const observed = pagent.observe(() => ({ status: "failed" as const }), {
+      event: defineEvent<{ reason: string }>({ name: "job.failed" }),
+      when: ({ result }) => result.status === "failed",
+      context: () => ({ reason: "worker exited" }),
+    });
+
+    expect(observed()).toEqual({ status: "failed" });
+    expect(relayFetch).not.toHaveBeenCalled();
+    await pagent.drain();
+
+    expect(relayFetch).toHaveBeenCalledTimes(1);
+    const [url, request] = relayFetch.mock.calls[0]!;
+    expect(request).toBeDefined();
+    expect(url.toString()).toBe("https://relay.example.test/v1/events");
+    expect(request).toMatchObject({
+      method: "POST",
+      headers: {
+        authorization: "Bearer relay-secret",
+        "content-type": "application/json",
+      },
+    });
+    expect(JSON.parse(request!.body as string)).toMatchObject({
+      version: 1,
+      event: {
+        type: "job.failed",
+        environment: "production",
+        payload: { reason: "worker exited" },
+      },
+    });
+  });
+
+  it("isolates relay failures from the observed application", async () => {
+    const errors: unknown[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(null, { status: 503 })),
+    );
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      relay: {
+        url: "https://relay.example.test/v1/events",
+        token: "relay-secret",
+      },
+      onError: (error) => errors.push(error),
+    });
+    const observed = pagent.observe(() => "application result", {
+      event: defineEvent({ name: "job.failed" }),
+      when: () => true,
+      context: () => ({ reason: "worker exited" }),
+    });
+
+    expect(observed()).toBe("application result");
+    await pagent.drain();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toEqual(
+      new Error("Pagent relay rejected the event with HTTP 503."),
+    );
+  });
+
+  it("rejects oversized relay envelopes before sending them", async () => {
+    const relayFetch = vi.fn();
+    const errors: unknown[] = [];
+    vi.stubGlobal("fetch", relayFetch);
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      relay: {
+        url: "https://relay.example.test/v1/events",
+        token: "relay-secret",
+        maxEnvelopeBytes: 128,
+      },
+      onError: (error) => errors.push(error),
+    });
+    const observed = pagent.observe(() => "application result", {
+      event: defineEvent({ name: "job.failed" }),
+      when: () => true,
+      context: () => ({ detail: "x".repeat(256) }),
+    });
+
+    expect(observed()).toBe("application result");
+    await pagent.drain();
+
+    expect(relayFetch).not.toHaveBeenCalled();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(Error);
+    expect((errors[0] as Error).message).toMatch(/the limit is 128 bytes/);
+  });
+
+  it("aborts relay requests after the configured timeout", async () => {
+    vi.useFakeTimers();
+    const errors: unknown[] = [];
+    const relayFetch = vi.fn(
+      (_url: URL, request: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          request.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        }),
+    );
+    vi.stubGlobal("fetch", relayFetch);
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      relay: {
+        url: "https://relay.example.test/v1/events",
+        token: "relay-secret",
+        timeoutMs: 25,
+      },
+      onError: (error) => errors.push(error),
+    });
+    const observed = pagent.observe(() => "application result", {
+      event: defineEvent({ name: "job.failed" }),
+      when: () => true,
+      context: () => ({}),
+    });
+
+    expect(observed()).toBe("application result");
+    await vi.advanceTimersByTimeAsync(25);
+    await pagent.drain();
+
+    expect(relayFetch).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ name: "AbortError" });
   });
 });

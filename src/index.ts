@@ -1,6 +1,13 @@
 export { codexAgent, type CodexAgentOptions } from "./codex.js";
 export { defineConfig, type PagentConfig } from "./config.js";
+export {
+  createRelayConnector,
+  type RelayConnector,
+  type RelayConnectorOptions,
+  type RelayTask,
+} from "./connector.js";
 export { createPagent, Pagent } from "./pagent.js";
+export { createRelayEmitter, type RelayEmitter } from "./relay.js";
 export {
   defineEvent,
   type AgentAdapter,
@@ -13,5 +20,7 @@ export {
   type ObserveResultOptions,
   type PagentEvent,
   type PagentOptions,
+  type RelayEventEnvelope,
+  type RelayOptions,
   type ResultObservation,
 } from "./types.js";

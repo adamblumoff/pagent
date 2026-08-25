@@ -23,9 +23,21 @@ export interface AgentAdapter {
 
 export interface EventDefinition<TPayload> {
   name: string;
-  enabledIn: readonly string[];
+  enabledIn?: readonly string[];
   cooldownMs?: number;
-  prompt(event: PagentEvent<TPayload>): string | Promise<string>;
+  prompt?(event: PagentEvent<TPayload>): string | Promise<string>;
+}
+
+export interface RelayOptions {
+  url: string;
+  token: string;
+  timeoutMs?: number | undefined;
+  maxEnvelopeBytes?: number | undefined;
+}
+
+export interface RelayEventEnvelope<TPayload = unknown> {
+  version: 1;
+  event: PagentEvent<TPayload>;
 }
 
 export interface ResultObservation<
@@ -80,7 +92,8 @@ export interface PagentOptions {
   enabled?: boolean | undefined;
   environment?: string | undefined;
   cwd?: string | undefined;
-  agent: AgentAdapter;
+  agent?: AgentAdapter | undefined;
+  relay?: RelayOptions | undefined;
   onError?: ((error: unknown) => void) | undefined;
   onAgentResult?:
     | ((result: AgentResult, event: PagentEvent) => void | Promise<void>)

@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 
+import { createRelayEmitter, type RelayEmitter } from "./relay.js";
 import type {
+  AgentAdapter,
   ErrorObservation,
   EventDefinition,
   ObserveErrorOptions,
@@ -22,7 +24,7 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
 }
 
 export class Pagent {
-  readonly #agent: PagentOptions["agent"];
+  readonly #agent: AgentAdapter | undefined;
   readonly #cwd: string;
   readonly #enabled: boolean;
   readonly #environment: string | undefined;
@@ -31,14 +33,24 @@ export class Pagent {
   readonly #onAgentResult: PagentOptions["onAgentResult"];
   readonly #onError: PagentOptions["onError"];
   readonly #pending = new Set<Promise<void>>();
+  readonly #relay: RelayEmitter | undefined;
 
   constructor(options: PagentOptions) {
     this.#agent = options.agent;
+    this.#relay =
+      options.relay === undefined ? undefined : createRelayEmitter(options.relay);
     this.#cwd = resolve(options.cwd ?? process.cwd());
     this.#enabled = options.enabled === true;
     this.#environment = options.environment?.trim() || undefined;
     this.#onAgentResult = options.onAgentResult;
     this.#onError = options.onError;
+
+    if (this.#enabled && this.#agent === undefined && this.#relay === undefined) {
+      throw new Error("Pagent requires an agent or relay when enabled.");
+    }
+    if (this.#agent !== undefined && this.#relay !== undefined) {
+      throw new Error("Pagent accepts either an agent or relay, not both.");
+    }
   }
 
   observe<
@@ -136,7 +148,8 @@ export class Pagent {
     return (
       this.#enabled &&
       this.#environment !== undefined &&
-      event.enabledIn.includes(this.#environment)
+      (event.enabledIn === undefined ||
+        event.enabledIn.includes(this.#environment))
     );
   }
 
@@ -176,15 +189,24 @@ export class Pagent {
         occurredAt: new Date(now).toISOString(),
         payload,
       };
-      const prompt = await options.event.prompt(event);
-      const result = await this.#agent.run({
-        cwd: this.#cwd,
-        prompt,
-        event,
-      });
+      if (this.#relay !== undefined) {
+        await this.#relay(event);
+      } else {
+        const prompt = options.event.prompt;
+        if (prompt === undefined) {
+          throw new Error(
+            `Pagent event ${options.event.name} requires a prompt when using an agent.`,
+          );
+        }
+        const result = await this.#agent!.run({
+          cwd: this.#cwd,
+          prompt: await prompt(event),
+          event,
+        });
 
-      if (this.#onAgentResult !== undefined) {
-        await this.#onAgentResult(result, event);
+        if (this.#onAgentResult !== undefined) {
+          await this.#onAgentResult(result, event);
+        }
       }
     } finally {
       this.#lastTriggeredAt.set(options.event, Date.now());

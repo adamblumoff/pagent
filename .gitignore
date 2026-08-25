@@ -1,6 +1,8 @@
 node_modules/
 dist/
+dist-demo/
 coverage/
+.pagent/
 *.log
 .env*
 !.env.example
