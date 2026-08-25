@@ -1,0 +1,681 @@
+import { execFile } from "node:child_process";
+import { constants } from "node:fs";
+import { access, readFile, stat } from "node:fs/promises";
+import { dirname, parse, resolve } from "node:path";
+
+import {
+  probeCodexAppServer,
+  type CodexAgentOptions,
+  type CodexProbeOptions,
+} from "./codex.js";
+import type { ConnectorEncryptionConfig } from "./config.js";
+import { decodeBase64Url } from "./encoding.js";
+
+export type DoctorStatus = "pass" | "warn" | "fail";
+
+export interface DoctorCheck {
+  id: DoctorCheckId;
+  label: string;
+  status: DoctorStatus;
+  detail: string;
+}
+
+export type DoctorCheckId =
+  | "runtime"
+  | "config"
+  | "repositories"
+  | "inbox"
+  | "state"
+  | "relay.health"
+  | "relay.sse"
+  | "codex"
+  | "worktree"
+  | "sandbox";
+
+export interface DoctorReport {
+  checks: DoctorCheck[];
+  ok: boolean;
+  warnings: number;
+}
+
+/** Flattened, resolved settings used by both `doctor` and the `start` preflight. */
+export interface DoctorInput {
+  relayUrl: string;
+  connectorId: string;
+  connectorToken: string;
+  inboxPath: string;
+  statePath: string;
+  repositories: Readonly<Record<string, string>>;
+  environments: readonly string[];
+  encryption: ConnectorEncryptionConfig;
+  codex?: CodexAgentOptions | undefined;
+  timeoutMs?: number | undefined;
+  includeAdvisories?: boolean | undefined;
+}
+
+interface FileInfo {
+  isDirectory(): boolean;
+  isFile(): boolean;
+}
+
+export interface DoctorDependencies {
+  fetch: typeof fetch;
+  runtimeCapabilities(): readonly string[];
+  stat(path: string): Promise<FileInfo>;
+  access(path: string, mode: number): Promise<void>;
+  readFile(path: string): Promise<string>;
+  gitStatus(path: string): Promise<string>;
+  probeCodex(options?: CodexProbeOptions): Promise<void>;
+}
+
+const defaultDependencies: DoctorDependencies = {
+  fetch: globalThis.fetch,
+  runtimeCapabilities,
+  stat,
+  access: (path, mode) => access(path, mode),
+  readFile: (path) => readFile(path, "utf8"),
+  gitStatus,
+  probeCodex: probeCodexAppServer,
+};
+
+/** Runs a non-destructive connector preflight. Result details never contain credentials. */
+export async function runDoctor(
+  input: DoctorInput,
+  dependencies: Partial<DoctorDependencies> = {},
+): Promise<DoctorReport> {
+  const deps = { ...defaultDependencies, ...dependencies };
+  const timeoutMs = validTimeout(input.timeoutMs) ? input.timeoutMs : 5_000;
+  const checks: DoctorCheck[] = [];
+
+  const missingCapabilities = deps.runtimeCapabilities();
+  checks.push(
+    missingCapabilities.length === 0
+      ? check("runtime", "Runtime APIs", "pass", "Required Web APIs are available.")
+      : check(
+          "runtime",
+          "Runtime APIs",
+          "fail",
+          `Missing required runtime APIs: ${missingCapabilities.join(", ")}.`,
+        ),
+  );
+
+  const configValid = connectorConfigIsValid(input);
+  checks.push(
+    configValid
+      ? check(
+          "config",
+          "Connector configuration",
+          "pass",
+          "Relay, policy, and encryption settings are valid.",
+        )
+      : check(
+          "config",
+          "Connector configuration",
+          "fail",
+          "Connector settings are incomplete or invalid.",
+        ),
+  );
+
+  checks.push(await checkRepositories(input.repositories, deps));
+  checks.push(await checkInbox(input.inboxPath, deps));
+  checks.push(await checkState(input.statePath, deps));
+
+  if (configValid && missingCapabilities.length === 0) {
+    checks.push(await checkRelayHealth(input.relayUrl, timeoutMs, deps));
+    checks.push(await checkRelaySse(input, timeoutMs, deps));
+  } else {
+    checks.push(
+      check(
+        "relay.health",
+        "Relay health",
+        "warn",
+        "Skipped until the runtime and connector configuration are valid.",
+      ),
+      check(
+        "relay.sse",
+        "Relay authentication",
+        "warn",
+        "Skipped until the runtime and connector configuration are valid.",
+      ),
+    );
+  }
+
+  checks.push(await checkCodex(timeoutMs, deps));
+  if (input.includeAdvisories !== false) {
+    checks.push(await checkWorktrees(input.repositories, deps));
+    checks.push(checkSandbox(input.codex));
+  }
+
+  return {
+    checks,
+    ok: !checks.some(({ status }) => status === "fail"),
+    warnings: checks.filter(({ status }) => status === "warn").length,
+  };
+}
+
+function check(
+  id: DoctorCheckId,
+  label: string,
+  status: DoctorStatus,
+  detail: string,
+): DoctorCheck {
+  return { id, label, status, detail };
+}
+
+function connectorConfigIsValid(input: DoctorInput): boolean {
+  try {
+    const relay = new URL(input.relayUrl);
+    if (
+      (relay.protocol !== "http:" && relay.protocol !== "https:") ||
+      relay.username !== "" ||
+      relay.password !== ""
+    ) {
+      return false;
+    }
+    if (
+      !trimmed(input.connectorId) ||
+      !trimmed(input.connectorToken) ||
+      /[\r\n]/u.test(input.connectorToken) ||
+      !Array.isArray(input.environments) ||
+      input.environments.length === 0 ||
+      !input.environments.every(trimmed)
+    ) {
+      return false;
+    }
+
+    const repositories = record(input.repositories);
+    if (
+      repositories === undefined ||
+      Object.keys(repositories).length === 0 ||
+      !Object.entries(repositories).every(
+        ([key, path]) => trimmed(key) && trimmed(path),
+      )
+    ) {
+      return false;
+    }
+
+    const keys = record(input.encryption?.keys);
+    if (keys === undefined || Object.keys(keys).length === 0) {
+      return false;
+    }
+    return Object.entries(keys).every(([keyId, key]) => {
+      if (!trimmed(keyId) || keyId.length > 200 || typeof key !== "string") {
+        return false;
+      }
+      try {
+        return decodeBase64Url(key, "Connector encryption key").byteLength === 32;
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function checkRepositories(
+  repositories: Readonly<Record<string, string>>,
+  deps: DoctorDependencies,
+): Promise<DoctorCheck> {
+  const paths = Object.values(record(repositories) ?? {}).filter(
+    (value): value is string => typeof value === "string",
+  );
+  if (paths.length === 0) {
+    return check(
+      "repositories",
+      "Local repositories",
+      "fail",
+      "At least one local repository mapping is required.",
+    );
+  }
+
+  let valid = 0;
+  for (const path of paths) {
+    try {
+      const info = await deps.stat(resolve(path));
+      if (!info.isDirectory()) {
+        continue;
+      }
+      await deps.access(resolve(path), constants.R_OK | constants.X_OK);
+      valid += 1;
+    } catch {
+      // The aggregate result avoids disclosing paths from shared diagnostics.
+    }
+  }
+  return valid === paths.length
+    ? check(
+        "repositories",
+        "Local repositories",
+        "pass",
+        `${valid} local repository mapping${valid === 1 ? " is" : "s are"} accessible.`,
+      )
+    : check(
+        "repositories",
+        "Local repositories",
+        "fail",
+        `${paths.length - valid} of ${paths.length} repository mappings are missing or inaccessible.`,
+      );
+}
+
+async function checkInbox(
+  inboxPath: string,
+  deps: DoctorDependencies,
+): Promise<DoctorCheck> {
+  const storage = await inspectJsonFile(inboxPath, deps);
+  if (storage.kind === "missing") {
+    return storage.parentWritable
+      ? check(
+          "inbox",
+          "Encrypted inbox",
+          "pass",
+          "Inbox will be created in an accessible location.",
+        )
+      : check(
+          "inbox",
+          "Encrypted inbox",
+          "fail",
+          "Inbox location is not writable.",
+        );
+  }
+  if (storage.kind === "inaccessible") {
+    return check(
+      "inbox",
+      "Encrypted inbox",
+      "fail",
+      "Inbox is not a readable and writable regular file.",
+    );
+  }
+  const value = record(storage.value);
+  if (value?.version !== 2) {
+    return check(
+      "inbox",
+      "Encrypted inbox",
+      "fail",
+      value?.version === 1
+        ? "Inbox uses v1; archive or remove it before starting Pagent."
+        : "Inbox has an unsupported or invalid format.",
+    );
+  }
+  if (!Array.isArray(value.pending) || !Array.isArray(value.completed)) {
+    return check(
+      "inbox",
+      "Encrypted inbox",
+      "fail",
+      "Inbox v2 is malformed.",
+    );
+  }
+  return check(
+    "inbox",
+    "Encrypted inbox",
+    "pass",
+    "Inbox v2 is readable and writable.",
+  );
+}
+
+async function checkState(
+  statePath: string,
+  deps: DoctorDependencies,
+): Promise<DoctorCheck> {
+  const storage = await inspectJsonFile(statePath, deps);
+  if (storage.kind === "missing") {
+    return storage.parentWritable
+      ? check(
+          "state",
+          "Local process state",
+          "pass",
+          "Process state will be created in an accessible location.",
+        )
+      : check(
+          "state",
+          "Local process state",
+          "fail",
+          "Process state location is not writable.",
+        );
+  }
+  if (storage.kind === "inaccessible") {
+    return check(
+      "state",
+      "Local process state",
+      "fail",
+      "Process state is not a readable and writable regular file.",
+    );
+  }
+  if (record(storage.value)?.version !== 1) {
+    return check(
+      "state",
+      "Local process state",
+      "fail",
+      "Process state has an unsupported or invalid format.",
+    );
+  }
+  return check(
+    "state",
+    "Local process state",
+    "pass",
+    "Process state v1 is readable and writable.",
+  );
+}
+
+type InspectedJsonFile =
+  | { kind: "missing"; parentWritable: boolean }
+  | { kind: "inaccessible" }
+  | { kind: "json"; value: unknown };
+
+async function inspectJsonFile(
+  path: string,
+  deps: DoctorDependencies,
+): Promise<InspectedJsonFile> {
+  const absolute = resolve(path);
+  try {
+    const info = await deps.stat(absolute);
+    if (!info.isFile()) {
+      return { kind: "inaccessible" };
+    }
+    await deps.access(absolute, constants.R_OK | constants.W_OK);
+    try {
+      return { kind: "json", value: JSON.parse(await deps.readFile(absolute)) };
+    } catch {
+      return { kind: "json", value: undefined };
+    }
+  } catch (error) {
+    if (!isMissing(error)) {
+      return { kind: "inaccessible" };
+    }
+    return {
+      kind: "missing",
+      parentWritable: await nearestParentIsWritable(absolute, deps),
+    };
+  }
+}
+
+async function nearestParentIsWritable(
+  path: string,
+  deps: DoctorDependencies,
+): Promise<boolean> {
+  let candidate = dirname(path);
+  const root = parse(candidate).root;
+
+  while (true) {
+    try {
+      const info = await deps.stat(candidate);
+      if (!info.isDirectory()) {
+        return false;
+      }
+      await deps.access(candidate, constants.R_OK | constants.W_OK | constants.X_OK);
+      return true;
+    } catch (error) {
+      if (!isMissing(error)) {
+        return false;
+      }
+      if (candidate === root) {
+        return false;
+      }
+      candidate = dirname(candidate);
+    }
+  }
+}
+
+async function checkRelayHealth(
+  relayUrl: string,
+  timeoutMs: number,
+  deps: DoctorDependencies,
+): Promise<DoctorCheck> {
+  try {
+    const response = await fetchWithTimeout(
+      deps.fetch,
+      new URL("/health", relayUrl),
+      { method: "GET", headers: { accept: "application/json" } },
+      timeoutMs,
+    );
+    const result = response.ok
+      ? check("relay.health", "Relay health", "pass", "Relay is healthy.")
+      : check(
+          "relay.health",
+          "Relay health",
+          "fail",
+          `Relay health returned HTTP ${response.status}.`,
+        );
+    await response.body?.cancel().catch(() => undefined);
+    return result;
+  } catch {
+    return check(
+      "relay.health",
+      "Relay health",
+      "fail",
+      "Relay health could not be reached before the timeout.",
+    );
+  }
+}
+
+async function checkRelaySse(
+  input: DoctorInput,
+  timeoutMs: number,
+  deps: DoctorDependencies,
+): Promise<DoctorCheck> {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const url = new URL(
+      `/v1/connectors/${encodeURIComponent(input.connectorId)}/events`,
+      input.relayUrl,
+    );
+    const response = await deps.fetch(url, {
+      method: "GET",
+      headers: {
+        accept: "text/event-stream",
+        authorization: `Bearer ${input.connectorToken}`,
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return check(
+        "relay.sse",
+        "Relay authentication",
+        "fail",
+        `Relay connector authentication returned HTTP ${response.status}.`,
+      );
+    }
+    if (!response.headers.get("content-type")?.includes("text/event-stream")) {
+      return check(
+        "relay.sse",
+        "Relay authentication",
+        "fail",
+        "Relay connector endpoint did not return an SSE stream.",
+      );
+    }
+    if (response.body === null) {
+      return check(
+        "relay.sse",
+        "Relay authentication",
+        "fail",
+        "Relay connector endpoint returned no SSE body.",
+      );
+    }
+    return check(
+      "relay.sse",
+      "Relay authentication",
+      "pass",
+      "Connector credentials opened an SSE stream.",
+    );
+  } catch {
+    return check(
+      "relay.sse",
+      "Relay authentication",
+      "fail",
+      "Relay connector stream could not be opened before the timeout.",
+    );
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+    controller.abort();
+  }
+}
+
+async function fetchWithTimeout(
+  fetchImpl: typeof fetch,
+  url: URL,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchImpl(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function checkCodex(
+  timeoutMs: number,
+  deps: DoctorDependencies,
+): Promise<DoctorCheck> {
+  try {
+    await deps.probeCodex({ timeoutMs });
+    return check(
+      "codex",
+      "Codex app server",
+      "pass",
+      "Installed Codex app server initialized without creating a thread.",
+    );
+  } catch {
+    return check(
+      "codex",
+      "Codex app server",
+      "fail",
+      "Codex app server could not be found or initialized.",
+    );
+  }
+}
+
+async function checkWorktrees(
+  repositories: Readonly<Record<string, string>>,
+  deps: DoctorDependencies,
+): Promise<DoctorCheck> {
+  const paths = Object.values(record(repositories) ?? {}).filter(
+    (value): value is string => typeof value === "string",
+  );
+  let dirty = 0;
+  let unavailable = 0;
+  for (const path of paths) {
+    try {
+      if ((await deps.gitStatus(resolve(path))).trim() !== "") {
+        dirty += 1;
+      }
+    } catch {
+      unavailable += 1;
+    }
+  }
+  if (dirty > 0) {
+    return check(
+      "worktree",
+      "Repository worktrees",
+      "warn",
+      `${dirty} mapped repositor${dirty === 1 ? "y has" : "ies have"} uncommitted changes.`,
+    );
+  }
+  if (unavailable > 0 || paths.length === 0) {
+    return check(
+      "worktree",
+      "Repository worktrees",
+      "warn",
+      "Git status could not be checked for every repository.",
+    );
+  }
+  return check(
+    "worktree",
+    "Repository worktrees",
+    "pass",
+    "Mapped repository worktrees are clean.",
+  );
+}
+
+function checkSandbox(codex: CodexAgentOptions | undefined): DoctorCheck {
+  const mode = codex?.sandboxMode;
+  if (mode === "read-only") {
+    return check(
+      "sandbox",
+      "Codex sandbox",
+      "pass",
+      "Codex investigations are explicitly read-only.",
+    );
+  }
+  if (mode === "danger-full-access") {
+    return check(
+      "sandbox",
+      "Codex sandbox",
+      "warn",
+      "Codex investigations have unrestricted filesystem access.",
+    );
+  }
+  if (mode === "workspace-write") {
+    return check(
+      "sandbox",
+      "Codex sandbox",
+      "warn",
+      "Codex investigations can modify the mapped repository.",
+    );
+  }
+  return check(
+    "sandbox",
+    "Codex sandbox",
+    "warn",
+    "Codex sandbox inherits the local Codex default; set read-only explicitly.",
+  );
+}
+
+function runtimeCapabilities(): readonly string[] {
+  const missing: string[] = [];
+  if (typeof globalThis.fetch !== "function") missing.push("fetch");
+  if (typeof globalThis.crypto?.subtle !== "object") missing.push("Web Crypto");
+  if (typeof globalThis.AbortController !== "function") missing.push("AbortController");
+  if (typeof globalThis.Headers !== "function") missing.push("Headers");
+  if (typeof globalThis.TextDecoder !== "function") missing.push("TextDecoder");
+  if (typeof globalThis.ReadableStream !== "function") missing.push("ReadableStream");
+  return missing;
+}
+
+async function gitStatus(path: string): Promise<string> {
+  return new Promise((resolveStatus, rejectStatus) => {
+    execFile(
+      "git",
+      ["status", "--porcelain"],
+      { cwd: path, encoding: "utf8", maxBuffer: 1024 * 1024 },
+      (error, stdout) => {
+        if (error) {
+          rejectStatus(error);
+        } else {
+          resolveStatus(stdout);
+        }
+      },
+    );
+  });
+}
+
+function validTimeout(value: number | undefined): value is number {
+  return value !== undefined && Number.isFinite(value) && value > 0;
+}
+
+function nonempty(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+function trimmed(value: unknown): value is string {
+  return nonempty(value) && value === value.trim();
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function isMissing(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "ENOENT"
+  );
+}

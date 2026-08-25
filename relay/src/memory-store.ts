@@ -54,13 +54,13 @@ export class MemoryRelayStore implements RelayStore {
 
     const task: RelayTask = {
       id: String(this.#nextId++),
+      eventId: input.event.id,
       type: input.event.type,
       environment: input.event.environment,
       occurredAt: input.event.occurredAt,
       investigation: input.event.investigation,
       repositoryKey: input.source.repositoryKey,
-      prompt: input.prompt,
-      payload: input.event.payload,
+      context: input.event.context,
     };
     const storedTask: StoredTask = {
       task,

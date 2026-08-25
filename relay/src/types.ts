@@ -1,5 +1,12 @@
+export interface EncryptedContext {
+  algorithm: "A256GCM";
+  keyId: string;
+  iv: string;
+  ciphertext: string;
+}
+
 export interface EventEnvelope {
-  version: 1;
+  version: 2;
   event: {
     id: string;
     type: string;
@@ -9,7 +16,7 @@ export interface EventEnvelope {
       cooldownMs: number;
       group?: string | undefined;
     };
-    payload: unknown;
+    context: EncryptedContext;
   };
 }
 
@@ -35,18 +42,17 @@ export interface RelayConfig {
 export interface EnqueueInput {
   source: SourceRoute;
   event: EventEnvelope["event"];
-  prompt: string;
 }
 
 export interface RelayTask {
   id: string;
+  eventId: string;
   type: string;
   environment: string;
   occurredAt: string;
   investigation: EventEnvelope["event"]["investigation"];
   repositoryKey: string;
-  prompt: string;
-  payload: unknown;
+  context: EncryptedContext;
 }
 
 export type EnqueueResult =

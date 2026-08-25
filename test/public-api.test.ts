@@ -32,6 +32,20 @@ const invalidObservation = {
 
 void invalidObservation;
 
+const bigintEvent = cloudSdk.defineEvent<{ value: bigint }>({
+  name: "typed.bigint",
+});
+
+const invalidBigintContext = {
+  event: bigintEvent,
+  on: "result",
+  triggerWhen: () => true,
+  // @ts-expect-error BigInt cannot be preserved in JSON event context.
+  context: () => ({ value: 1n }),
+} satisfies ObserveResultOptions<[], string, { value: bigint }>;
+
+void invalidBigintContext;
+
 describe("public API boundaries", () => {
   it("keeps the cloud entry point minimal", () => {
     expect(Object.keys(cloudSdk).sort()).toEqual([

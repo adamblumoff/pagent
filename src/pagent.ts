@@ -1,5 +1,7 @@
-import { randomUUID } from "node:crypto";
-
+import {
+  createEventContextEncryptor,
+  type EventContextEncryptor,
+} from "./crypto.js";
 import {
   asDeliveryError,
   createRelayEmitter,
@@ -8,22 +10,18 @@ import {
 import type {
   ErrorObservation,
   EventDefinition,
+  JsonCompatible,
   ObserveErrorOptions,
   ObserveOptions,
   ObserveResultOptions,
   PagentClient,
-  PagentEvent,
+  PagentEventMetadata,
   PagentOptions,
   ResultObservation,
 } from "./types.js";
 
-function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "then" in value &&
-    typeof value.then === "function"
-  );
+function isNativePromise(value: unknown): value is Promise<unknown> {
+  return value instanceof Promise;
 }
 
 function investigationGroup(value: string | undefined): string | undefined {
@@ -42,6 +40,7 @@ function investigationGroup(value: string | undefined): string | undefined {
 class Pagent implements PagentClient {
   readonly #enabled: boolean;
   readonly #environment: string | undefined;
+  readonly #encrypt: EventContextEncryptor | undefined;
   readonly #onDeliveryError: PagentOptions["onDeliveryError"];
   readonly #pending = new Set<Promise<void>>();
   readonly #relay: RelayEmitter | undefined;
@@ -49,6 +48,10 @@ class Pagent implements PagentClient {
   constructor(options: PagentOptions) {
     this.#environment = options.environment?.trim() || undefined;
     this.#enabled = options.enabled === true && this.#environment !== undefined;
+    this.#encrypt =
+      this.#enabled && options.encryption !== undefined
+        ? createEventContextEncryptor(options.encryption)
+        : undefined;
     this.#relay =
       !this.#enabled || options.relay === undefined
         ? undefined
@@ -57,6 +60,9 @@ class Pagent implements PagentClient {
 
     if (this.#enabled && this.#relay === undefined) {
       throw new Error("Pagent requires a relay when enabled.");
+    }
+    if (this.#enabled && this.#encrypt === undefined) {
+      throw new Error("Pagent requires encryption when enabled.");
     }
   }
 
@@ -75,7 +81,7 @@ class Pagent implements PagentClient {
       try {
         const result = fn.apply(this, args);
 
-        if (isPromiseLike(result)) {
+        if (isNativePromise(result)) {
           return result.then(
             (value) => {
               if (options.on === "result") {
@@ -112,9 +118,8 @@ class Pagent implements PagentClient {
   }
 
   async flush(): Promise<void> {
-    while (this.#pending.size > 0) {
-      await Promise.allSettled(this.#pending);
-    }
+    const snapshot = [...this.#pending];
+    await Promise.allSettled(snapshot);
   }
 
   #scheduleResult<TArgs extends unknown[], TResult, TPayload>(
@@ -138,7 +143,9 @@ class Pagent implements PagentClient {
       group?(
         observation: TObservation,
       ): string | undefined | Promise<string | undefined>;
-      context(observation: TObservation): TPayload | Promise<TPayload>;
+      context(
+        observation: TObservation,
+      ): JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
     },
     observation: TObservation,
   ): void {
@@ -170,7 +177,9 @@ class Pagent implements PagentClient {
       group?(
         observation: TObservation,
       ): string | undefined | Promise<string | undefined>;
-      context(observation: TObservation): TPayload | Promise<TPayload>;
+      context(
+        observation: TObservation,
+      ): JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
     },
     observation: TObservation,
   ): Promise<void> {
@@ -185,13 +194,16 @@ class Pagent implements PagentClient {
       cooldownMs: options.event.investigation?.cooldownMs ?? 0,
       ...(group === undefined ? {} : { group }),
     };
-    const event: PagentEvent<TPayload> = {
-      id: randomUUID(),
+    const metadata: PagentEventMetadata = {
+      id: crypto.randomUUID(),
       type: options.event.name,
       environment: this.#environment!,
       occurredAt: new Date(now).toISOString(),
       investigation,
-      payload,
+    };
+    const event = {
+      ...metadata,
+      context: await this.#encrypt!(metadata, payload),
     };
     await this.#relay!(event);
   }

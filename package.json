@@ -7,6 +7,9 @@
   "engines": {
     "node": ">=22"
   },
+  "bin": {
+    "pagent": "./dist/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -19,11 +22,14 @@
   },
   "scripts": {
     "build:sdk": "tsc -p tsconfig.build.json",
+    "typecheck:cloud": "tsc -p tsconfig.cloud.json",
+    "typecheck:consumers": "tsc -p test/consumers/nodenext && tsc -p test/consumers/bundler && tsc -p test/consumers/worker && tsc -p test/consumers/deno && tsc -p test/consumers/vercel",
     "build": "pnpm build:sdk && pnpm --filter pagent-demo build && npm --prefix relay run build",
-    "connector": "pnpm build:sdk && pnpm --filter pagent-demo connector",
+    "cli": "pnpm build:sdk && node dist/cli.js",
     "demo": "pnpm build:sdk && pnpm --filter pagent-demo dev",
     "test": "vitest run && npm --prefix relay test",
-    "typecheck": "pnpm build:sdk && tsc --noEmit && pnpm --filter pagent-demo typecheck && npm --prefix relay run typecheck"
+    "smoke:bun": "pnpm build:sdk && bun test/runtime/bun-smoke.mjs",
+    "typecheck": "pnpm typecheck:cloud && pnpm build:sdk && pnpm typecheck:consumers && tsc --noEmit && pnpm --filter pagent-demo typecheck && npm --prefix relay run typecheck"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

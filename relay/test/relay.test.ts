@@ -23,15 +23,42 @@ const config: RelayConfig = {
 
 function event(id: string, overrides: Record<string, unknown> = {}) {
   return {
-    version: 1,
+    version: 2,
     event: {
       id,
       type: "health.failed",
       environment: "staging",
       occurredAt: "2026-08-24T12:00:00.000Z",
-      payload: { reason: "database pool exhausted" },
+      context: {
+        algorithm: "A256GCM",
+        keyId: "staging-2026-08",
+        iv: "AAECAwQFBgcICQoL",
+        ciphertext: "AAECAwQFBgcICQoLDA0ODw",
+      },
       ...overrides,
     },
+  };
+}
+
+async function encryptedContextFor(value: unknown) {
+  const iv = Uint8Array.from({ length: 12 }, (_, index) => index);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new Uint8Array(32),
+    "AES-GCM",
+    false,
+    ["encrypt"],
+  );
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    new TextEncoder().encode(JSON.stringify(value)),
+  );
+  return {
+    algorithm: "A256GCM",
+    keyId: "staging-2026-08",
+    iv: Buffer.from(iv).toString("base64url"),
+    ciphertext: Buffer.from(ciphertext).toString("base64url"),
   };
 }
 
@@ -67,7 +94,7 @@ describe("relay HTTP API", () => {
     assert.deepEqual(await response.json(), { error: "unauthorized" });
   });
 
-  it("routes an event and constructs the read-only investigation task", async () => {
+  it("routes encrypted context without constructing a prompt", async () => {
     const response = await fetch(`${baseUrl}/v1/events`, {
       method: "POST",
       body: JSON.stringify(event("event-1")),
@@ -86,10 +113,15 @@ describe("relay HTTP API", () => {
     assert.equal(body.taskId, "1");
     const [task] = await store.tasksAfter("local-1", "0", 10);
     assert.equal(task?.repositoryKey, "pagent-demo");
+    assert.equal(task?.eventId, "event-1");
     assert.deepEqual(task?.investigation, { cooldownMs: 0 });
-    assert.match(task?.prompt ?? "", /Find the root cause/);
-    assert.match(task?.prompt ?? "", /Do not modify files/);
-    assert.match(task?.prompt ?? "", /database pool exhausted/);
+    assert.deepEqual(task?.context, {
+      algorithm: "A256GCM",
+      keyId: "staging-2026-08",
+      iv: "AAECAwQFBgcICQoL",
+      ciphertext: "AAECAwQFBgcICQoLDA0ODw",
+    });
+    assert.doesNotMatch(JSON.stringify(task), /payload|prompt/);
   });
 
   it("fails closed for an environment outside the source policy", async () => {
@@ -106,9 +138,66 @@ describe("relay HTTP API", () => {
     assert.match(JSON.stringify(await response.json()), /not enabled/);
   });
 
-  it("rejects an event without an explicit payload", async () => {
-    const body = event("event-without-payload");
-    delete (body.event as { payload?: unknown }).payload;
+  it("rejects malformed encrypted context", async () => {
+    const invalidContexts = [
+      undefined,
+      {},
+      {
+        algorithm: "AES-GCM",
+        keyId: "staging-2026-08",
+        iv: "AAECAwQFBgcICQoL",
+        ciphertext: "AAECAwQFBgcICQoLDA0ODw",
+      },
+      {
+        algorithm: "A256GCM",
+        keyId: " ",
+        iv: "AAECAwQFBgcICQoL",
+        ciphertext: "AAECAwQFBgcICQoLDA0ODw",
+      },
+      {
+        algorithm: "A256GCM",
+        keyId: " staging-2026-08 ",
+        iv: "AAECAwQFBgcICQoL",
+        ciphertext: "AAECAwQFBgcICQoLDA0ODw",
+      },
+      {
+        algorithm: "A256GCM",
+        keyId: "staging-2026-08",
+        iv: "not+base64url",
+        ciphertext: "AAECAwQFBgcICQoLDA0ODw",
+      },
+      {
+        algorithm: "A256GCM",
+        keyId: "staging-2026-08",
+        iv: "AAECAwQFBgcICQo",
+        ciphertext: "AAECAwQFBgcICQoLDA0ODw",
+      },
+      {
+        algorithm: "A256GCM",
+        keyId: "staging-2026-08",
+        iv: "AAECAwQFBgcICQoL",
+        ciphertext: "too-short",
+      },
+    ];
+
+    for (const [index, context] of invalidContexts.entries()) {
+      const response = await fetch(`${baseUrl}/v1/events`, {
+        method: "POST",
+        body: JSON.stringify(event(`invalid-context-${index}`, { context })),
+        headers: {
+          authorization: "Bearer source-secret",
+          "content-type": "application/json",
+        },
+      });
+
+      assert.equal(response.status, 400);
+      assert.match(JSON.stringify(await response.json()), /context/);
+    }
+  });
+
+  it("rejects version 1 envelopes", async () => {
+    const body = event("legacy-event") as { version: number };
+    body.version = 1;
     const response = await fetch(`${baseUrl}/v1/events`, {
       method: "POST",
       body: JSON.stringify(body),
@@ -119,7 +208,37 @@ describe("relay HTTP API", () => {
     });
 
     assert.equal(response.status, 400);
-    assert.match(JSON.stringify(await response.json()), /payload is required/);
+    assert.match(JSON.stringify(await response.json()), /version 2/);
+  });
+
+  it("rejects plaintext and unknown event fields", async () => {
+    for (const overrides of [
+      { payload: { reason: "plaintext must not reach the relay" } },
+      { prompt: "plaintext must not reach the relay" },
+      {
+        context: {
+          algorithm: "A256GCM",
+          keyId: "staging-2026-08",
+          iv: "AAECAwQFBgcICQoL",
+          ciphertext: "AAECAwQFBgcICQoLDA0ODw",
+          plaintext: "plaintext must not reach the relay",
+        },
+      },
+    ]) {
+      const response = await fetch(`${baseUrl}/v1/events`, {
+        method: "POST",
+        body: JSON.stringify(
+          event(`unknown-${Object.keys(overrides)[0]}`, overrides),
+        ),
+        headers: {
+          authorization: "Bearer source-secret",
+          "content-type": "application/json",
+        },
+      });
+
+      assert.equal(response.status, 400);
+      assert.match(JSON.stringify(await response.json()), /not allowed/);
+    }
   });
 
   it("rejects invalid investigation policies", async () => {
@@ -223,15 +342,44 @@ describe("relay HTTP API", () => {
       .find((line) => line.startsWith("data: "));
     assert.ok(dataLine);
     assert.deepEqual(Object.keys(JSON.parse(dataLine.slice(6))).sort(), [
+      "context",
       "environment",
+      "eventId",
       "id",
       "investigation",
       "occurredAt",
-      "payload",
-      "prompt",
       "repositoryKey",
       "type",
     ]);
+  });
+
+  it("never exposes plaintext context and relays tampered ciphertext unchanged", async () => {
+    const plaintextProbe = "relay-must-never-see-this-context-field-7f5a";
+    const context = await encryptedContextFor({ plaintextProbe });
+    const tamperedFirstByte = context.ciphertext.startsWith("A") ? "B" : "A";
+    const tamperedCiphertext = `${tamperedFirstByte}${context.ciphertext.slice(1)}`;
+    const response = await fetch(`${baseUrl}/v1/events`, {
+      method: "POST",
+      body: JSON.stringify(
+        event("opaque-event", {
+          context: {
+            ...context,
+            ciphertext: tamperedCiphertext,
+          },
+        }),
+      ),
+      headers: {
+        authorization: "Bearer source-secret",
+        "content-type": "application/json",
+      },
+    });
+
+    assert.equal(response.status, 201);
+    const [task] = await store.tasksAfter("local-1", "0", 10);
+    assert.equal(task?.context.ciphertext, tamperedCiphertext);
+    const relayRepresentation = JSON.stringify(task);
+    assert.doesNotMatch(relayRepresentation, new RegExp(plaintextProbe));
+    assert.doesNotMatch(relayRepresentation, /payload|prompt/);
   });
 
   it("pushes a new task to an already-connected SSE client", async () => {

@@ -1,9 +1,27 @@
-import type { EventEnvelope, SourceRoute } from "./types.js";
+import type {
+  EncryptedContext,
+  EventEnvelope,
+  SourceRoute,
+} from "./types.js";
 
 const MAX_NAME_LENGTH = 200;
+const AES_GCM_IV_BYTES = 12;
+const AES_GCM_TAG_BYTES = 16;
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assertOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  name: string,
+): void {
+  const unexpected = Object.keys(value).find((key) => !allowed.includes(key));
+  if (unexpected !== undefined) {
+    throw new Error(`${name}.${unexpected} is not allowed`);
+  }
 }
 
 function boundedString(value: unknown, name: string): string {
@@ -29,14 +47,76 @@ function nonNegativeInteger(value: unknown, name: string): number {
   return value;
 }
 
+function parseBase64Url(
+  value: unknown,
+  name: string,
+): { encoded: string; bytes: Buffer } {
+  if (
+    typeof value !== "string" ||
+    value === "" ||
+    value.includes("=") ||
+    value.length % 4 === 1 ||
+    !BASE64URL_PATTERN.test(value)
+  ) {
+    throw new Error(`${name} must be unpadded base64url`);
+  }
+  const bytes = Buffer.from(value, "base64url");
+  if (bytes.toString("base64url") !== value) {
+    throw new Error(`${name} must be canonical unpadded base64url`);
+  }
+  return { encoded: value, bytes };
+}
+
+function parseEncryptedContext(value: unknown): EncryptedContext {
+  if (!isRecord(value)) {
+    throw new Error("event.context must be an object");
+  }
+  assertOnlyKeys(
+    value,
+    ["algorithm", "keyId", "iv", "ciphertext"],
+    "event.context",
+  );
+  if (value.algorithm !== "A256GCM") {
+    throw new Error("event.context.algorithm must be A256GCM");
+  }
+  const keyId = boundedString(value.keyId, "event.context.keyId");
+  if (keyId !== keyId.trim()) {
+    throw new Error("event.context.keyId must not contain surrounding whitespace");
+  }
+  const iv = parseBase64Url(value.iv, "event.context.iv");
+  if (iv.bytes.length !== AES_GCM_IV_BYTES) {
+    throw new Error(
+      `event.context.iv must encode ${AES_GCM_IV_BYTES} bytes`,
+    );
+  }
+  const ciphertext = parseBase64Url(
+    value.ciphertext,
+    "event.context.ciphertext",
+  );
+  if (ciphertext.bytes.length < AES_GCM_TAG_BYTES) {
+    throw new Error(
+      `event.context.ciphertext must include a ${AES_GCM_TAG_BYTES}-byte authentication tag`,
+    );
+  }
+  return {
+    algorithm: "A256GCM",
+    keyId,
+    iv: iv.encoded,
+    ciphertext: ciphertext.encoded,
+  };
+}
+
 export function parseEventEnvelope(value: unknown): EventEnvelope {
-  if (!isRecord(value) || value.version !== 1 || !isRecord(value.event)) {
-    throw new Error("body must contain version 1 and an event object");
+  if (!isRecord(value) || value.version !== 2 || !isRecord(value.event)) {
+    throw new Error("body must contain version 2 and an event object");
   }
+  assertOnlyKeys(value, ["version", "event"], "body");
   const event = value.event;
-  if (!("payload" in event)) {
-    throw new Error("event.payload is required");
-  }
+  assertOnlyKeys(
+    event,
+    ["id", "type", "environment", "occurredAt", "investigation", "context"],
+    "event",
+  );
   const occurredAt = boundedString(event.occurredAt, "event.occurredAt");
   if (Number.isNaN(Date.parse(occurredAt))) {
     throw new Error("event.occurredAt must be an ISO-8601 timestamp");
@@ -45,6 +125,11 @@ export function parseEventEnvelope(value: unknown): EventEnvelope {
   if (!isRecord(investigation)) {
     throw new Error("event.investigation must be an object");
   }
+  assertOnlyKeys(
+    investigation,
+    ["cooldownMs", "group"],
+    "event.investigation",
+  );
   const cooldownMs = nonNegativeInteger(
     investigation.cooldownMs,
     "event.investigation.cooldownMs",
@@ -58,7 +143,7 @@ export function parseEventEnvelope(value: unknown): EventEnvelope {
         ).trim();
 
   return {
-    version: 1,
+    version: 2,
     event: {
       id: boundedString(event.id, "event.id"),
       type: boundedString(event.type, "event.type"),
@@ -68,7 +153,7 @@ export function parseEventEnvelope(value: unknown): EventEnvelope {
         cooldownMs,
         ...(group === undefined ? {} : { group }),
       },
-      payload: event.payload,
+      context: parseEncryptedContext(event.context),
     },
   };
 }
@@ -80,21 +165,4 @@ export function assertEnvironmentAllowed(
   if (!source.allowedEnvironments.includes(environment)) {
     throw new Error(`environment ${environment} is not enabled for this source`);
   }
-}
-
-export function buildPrompt(
-  source: SourceRoute,
-  event: EventEnvelope["event"],
-): string {
-  const payload = JSON.stringify(event.payload, null, 2) ?? "null";
-  return [
-    `Investigate a ${event.environment} ${event.type} event in repository ${source.repositoryKey}.`,
-    "Use the local checkout provided as your working directory; do not inspect a remote copy of the repository.",
-    "Find the root cause and report the supporting evidence. Do not modify files.",
-    "",
-    `Event ID: ${event.id}`,
-    `Occurred at: ${event.occurredAt}`,
-    "Event context:",
-    payload,
-  ].join("\n");
 }

@@ -18,6 +18,10 @@ const pagent = createPagent({
   environment,
   ...(active
     ? {
+        encryption: {
+          keyId: requireEnvironment("PAGENT_ENCRYPTION_KEY_ID"),
+          key: requireEnvironment("PAGENT_ENCRYPTION_KEY"),
+        },
         relay: {
           url: new URL(
             "/v1/events",

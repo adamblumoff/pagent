@@ -1,6 +1,7 @@
 import pg from "pg";
 
 import type {
+  EncryptedContext,
   EnqueueInput,
   EnqueueResult,
   RelayStore,
@@ -12,19 +13,20 @@ const NOTIFY_CHANNEL = "pagent_tasks";
 
 interface TaskRow {
   id: string;
+  event_id: string;
   event_type: string;
   environment: string;
   occurred_at: Date;
   investigation_cooldown_ms: string;
   investigation_group: string | null;
   repository_key: string;
-  prompt: string;
-  payload: unknown;
+  encrypted_context: EncryptedContext;
 }
 
 function taskFromRow(row: TaskRow): RelayTask {
   return {
     id: row.id,
+    eventId: row.event_id,
     type: row.event_type,
     environment: row.environment,
     occurredAt: row.occurred_at.toISOString(),
@@ -35,8 +37,7 @@ function taskFromRow(row: TaskRow): RelayTask {
         : { group: row.investigation_group }),
     },
     repositoryKey: row.repository_key,
-    prompt: row.prompt,
-    payload: row.payload,
+    context: row.encrypted_context,
   };
 }
 
@@ -62,7 +63,7 @@ export class PostgresRelayStore implements RelayStore {
         connector_id TEXT NOT NULL,
         investigation_cooldown_ms BIGINT NOT NULL DEFAULT 0,
         investigation_group TEXT,
-        payload JSONB NOT NULL,
+        encrypted_context JSONB NOT NULL,
         outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'queued', 'cooldown')),
         received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
@@ -72,7 +73,6 @@ export class PostgresRelayStore implements RelayStore {
         event_id TEXT NOT NULL UNIQUE REFERENCES pagent_events(event_id),
         connector_id TEXT NOT NULL,
         repository_key TEXT NOT NULL,
-        prompt TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
@@ -84,6 +84,38 @@ export class PostgresRelayStore implements RelayStore {
 
       ALTER TABLE pagent_events
         ADD COLUMN IF NOT EXISTS investigation_group TEXT;
+
+      ALTER TABLE pagent_events
+        ADD COLUMN IF NOT EXISTS encrypted_context JSONB;
+
+      DO $migration$
+      BEGIN
+        IF EXISTS (
+          SELECT 1
+            FROM information_schema.columns
+           WHERE table_schema = current_schema()
+             AND table_name = 'pagent_events'
+             AND column_name = 'payload'
+        ) OR EXISTS (
+          SELECT 1
+            FROM information_schema.columns
+           WHERE table_schema = current_schema()
+             AND table_name = 'pagent_tasks'
+             AND column_name = 'prompt'
+        ) THEN
+          TRUNCATE pagent_tasks, pagent_events RESTART IDENTITY;
+        END IF;
+      END
+      $migration$;
+
+      ALTER TABLE pagent_events
+        DROP COLUMN IF EXISTS payload;
+
+      ALTER TABLE pagent_events
+        ALTER COLUMN encrypted_context SET NOT NULL;
+
+      ALTER TABLE pagent_tasks
+        DROP COLUMN IF EXISTS prompt;
 
       DROP INDEX IF EXISTS pagent_events_cooldown_idx;
 
@@ -118,7 +150,8 @@ export class PostgresRelayStore implements RelayStore {
       const inserted = await client.query<{ event_id: string }>(
         `INSERT INTO pagent_events (
           event_id, event_type, environment, occurred_at, repository_key,
-          connector_id, investigation_cooldown_ms, investigation_group, payload,
+          connector_id, investigation_cooldown_ms, investigation_group,
+          encrypted_context,
           outcome
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
         ON CONFLICT (event_id) DO NOTHING
@@ -132,15 +165,15 @@ export class PostgresRelayStore implements RelayStore {
           input.source.connectorId,
           input.event.investigation.cooldownMs,
           input.event.investigation.group ?? null,
-          JSON.stringify(input.event.payload ?? null),
+          JSON.stringify(input.event.context),
         ],
       );
 
       if (inserted.rowCount === 0) {
         const existing = await client.query<TaskRow>(
-          `SELECT t.id::text, e.event_type, e.environment, e.occurred_at,
+          `SELECT t.id::text, e.event_id, e.event_type, e.environment, e.occurred_at,
                   e.investigation_cooldown_ms::text, e.investigation_group,
-                  e.repository_key, t.prompt, e.payload
+                  e.repository_key, e.encrypted_context
              FROM pagent_events e
              JOIN pagent_tasks t ON t.event_id = e.event_id
             WHERE e.event_id = $1`,
@@ -186,28 +219,27 @@ export class PostgresRelayStore implements RelayStore {
 
       const created = await client.query<TaskRow>(
         `INSERT INTO pagent_tasks (
-           event_id, connector_id, repository_key, prompt
-         ) VALUES ($1, $2, $3, $4)
+           event_id, connector_id, repository_key
+         ) VALUES ($1, $2, $3)
          RETURNING id::text,
-           $5::text AS event_type,
-           $6::text AS environment,
-           $7::timestamptz AS occurred_at,
-           $8::bigint::text AS investigation_cooldown_ms,
-           $9::text AS investigation_group,
+           event_id,
+           $4::text AS event_type,
+           $5::text AS environment,
+           $6::timestamptz AS occurred_at,
+           $7::bigint::text AS investigation_cooldown_ms,
+           $8::text AS investigation_group,
            repository_key,
-           prompt,
-           $10::jsonb AS payload`,
+           $9::jsonb AS encrypted_context`,
         [
           input.event.id,
           input.source.connectorId,
           input.source.repositoryKey,
-          input.prompt,
           input.event.type,
           input.event.environment,
           input.event.occurredAt,
           input.event.investigation.cooldownMs,
           input.event.investigation.group ?? null,
-          JSON.stringify(input.event.payload ?? null),
+          JSON.stringify(input.event.context),
         ],
       );
       await client.query(
@@ -238,9 +270,9 @@ export class PostgresRelayStore implements RelayStore {
     limit: number,
   ): Promise<RelayTask[]> {
     const result = await this.#pool.query<TaskRow>(
-      `SELECT t.id::text, e.event_type, e.environment, e.occurred_at,
+      `SELECT t.id::text, e.event_id, e.event_type, e.environment, e.occurred_at,
               e.investigation_cooldown_ms::text, e.investigation_group,
-              e.repository_key, t.prompt, e.payload
+              e.repository_key, e.encrypted_context
          FROM pagent_tasks t
          JOIN pagent_events e ON e.event_id = t.event_id
         WHERE t.connector_id = $1 AND t.id > $2::bigint

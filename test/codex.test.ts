@@ -14,6 +14,7 @@ vi.mock("node:child_process", async (importOriginal) => ({
 }));
 
 import { codexAgent } from "../src/connector.js";
+import { probeCodexAppServer } from "../src/codex.js";
 
 interface SentMessage {
   id?: number;
@@ -85,6 +86,24 @@ describe("codexAgent", () => {
     });
   });
 
+  it("kills an active app-server run when the connector stops", async () => {
+    const server = fakeAppServer(false);
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => server.child.emit("spawn"));
+      return server.child;
+    });
+    const abort = new AbortController();
+    const run = codexAgent().run({ ...request(), signal: abort.signal });
+
+    await vi.waitFor(() => {
+      expect(server.message("turn/start")).toBeDefined();
+    });
+    abort.abort();
+
+    await expect(run).rejects.toMatchObject({ name: "AbortError" });
+    expect(server.child.kill).toHaveBeenCalled();
+  });
+
   it("fails clearly when Codex is not installed", async () => {
     const child = fakeChild();
     childProcesses.spawn.mockImplementation(() => {
@@ -108,6 +127,27 @@ describe("codexAgent", () => {
     ).rejects.toThrow("Clone or download it before starting Pagent");
     expect(childProcesses.spawn).not.toHaveBeenCalled();
   });
+
+  it("probes app-server initialization without creating a thread", async () => {
+    const server = fakeAppServer();
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => server.child.emit("spawn"));
+      return server.child;
+    });
+
+    await probeCodexAppServer({ timeoutMs: 100 });
+
+    expect(server.message("initialize")?.params).toEqual({
+      clientInfo: {
+        name: "pagent-doctor",
+        title: "Pagent Doctor",
+        version: "0.0.0",
+      },
+    });
+    expect(server.message("initialized")).toBeDefined();
+    expect(server.message("thread/start")).toBeUndefined();
+    expect(server.child.kill).toHaveBeenCalled();
+  });
 });
 
 function request(cwd = process.cwd()) {
@@ -125,7 +165,7 @@ function request(cwd = process.cwd()) {
   };
 }
 
-function fakeAppServer() {
+function fakeAppServer(completeTurn = true) {
   const child = fakeChild();
   const sent: SentMessage[] = [];
   let input = "";
@@ -139,7 +179,7 @@ function fakeAppServer() {
       input = input.slice(newline + 1);
       const message = JSON.parse(line) as SentMessage;
       sent.push(message);
-      respond(child, message);
+      respond(child, message, completeTurn);
       newline = input.indexOf("\n");
     }
   });
@@ -166,6 +206,7 @@ function fakeChild(): ChildProcessWithoutNullStreams {
 function respond(
   child: ChildProcessWithoutNullStreams,
   message: SentMessage,
+  completeTurn: boolean,
 ): void {
   const send = (value: unknown) => {
     (child.stdout as PassThrough).write(`${JSON.stringify(value)}\n`);
@@ -180,6 +221,9 @@ function respond(
     });
   } else if (message.method === "turn/start") {
     send({ id: message.id, result: { turn: { id: "turn-1" } } });
+    if (!completeTurn) {
+      return;
+    }
     send({
       method: "item/completed",
       params: {

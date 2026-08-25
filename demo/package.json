@@ -8,7 +8,6 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "connector": "tsx connector.ts",
     "dev": "tsx cloud-server.ts",
     "start": "node dist/cloud-server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"

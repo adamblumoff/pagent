@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM"],
+    "noEmit": true,
+    "types": []
+  },
+  "include": [
+    "src/crypto.ts",
+    "src/encoding.ts",
+    "src/index.ts",
+    "src/pagent.ts",
+    "src/relay.ts",
+    "src/types.ts"
+  ]
+}

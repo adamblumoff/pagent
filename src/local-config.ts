@@ -1,0 +1,123 @@
+import { access } from "node:fs/promises";
+import { dirname, join, parse, resolve } from "node:path";
+import { loadEnvFile } from "node:process";
+import { pathToFileURL } from "node:url";
+
+import type { ConnectorConfig } from "./config.js";
+
+const CONFIG_NAMES = [
+  "pagent.config.ts",
+  "pagent.config.mts",
+  "pagent.config.mjs",
+  "pagent.config.js",
+] as const;
+
+export interface LoadedConnectorConfig {
+  config: ConnectorConfig;
+  path: string;
+  projectDirectory: string;
+}
+
+export async function loadConnectorConfig(options: {
+  cwd?: string;
+  configPath?: string | undefined;
+} = {}): Promise<LoadedConnectorConfig> {
+  const cwd = resolve(options.cwd ?? process.cwd());
+  const configuredPath = options.configPath ?? process.env.PAGENT_CONFIG;
+  const path =
+    configuredPath === undefined
+      ? await findConfig(cwd)
+      : resolve(cwd, configuredPath);
+
+  if (path === undefined) {
+    throw new Error(
+      `No Pagent config was found from ${cwd}. Add pagent.config.ts at the repository root.`,
+    );
+  }
+
+  loadProjectEnvironment(dirname(path));
+
+  let imported: unknown;
+  try {
+    imported = await import(pathToFileURL(path).href);
+  } catch (cause) {
+    throw new Error(`Could not load Pagent config at ${path}.`, { cause });
+  }
+
+  const module = record(imported);
+  const config = module?.default;
+  if (!isConnectorConfig(config)) {
+    throw new Error(
+      `Pagent config at ${path} must default-export defineConnectorConfig(...).`,
+    );
+  }
+
+  return { config, path, projectDirectory: dirname(path) };
+}
+
+function loadProjectEnvironment(directory: string): void {
+  try {
+    loadEnvFile(join(directory, ".env"));
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+
+async function findConfig(start: string): Promise<string | undefined> {
+  let directory = start;
+  const root = parse(start).root;
+
+  while (true) {
+    for (const name of CONFIG_NAMES) {
+      const candidate = join(directory, name);
+      if (await exists(candidate)) {
+        return candidate;
+      }
+    }
+    if (directory === root) {
+      return undefined;
+    }
+    directory = dirname(directory);
+  }
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isConnectorConfig(value: unknown): value is ConnectorConfig {
+  const config = record(value);
+  const relay = record(config?.relay);
+  const encryption = record(config?.encryption);
+  return (
+    config !== undefined &&
+    relay !== undefined &&
+    typeof relay.url === "string" &&
+    typeof relay.token === "string" &&
+    typeof relay.connectorId === "string" &&
+    record(config.repositories) !== undefined &&
+    Array.isArray(config.environments) &&
+    encryption !== undefined &&
+    record(encryption.keys) !== undefined &&
+    (config.stateDirectory === undefined ||
+      (typeof config.stateDirectory === "string" &&
+        config.stateDirectory !== ""))
+  );
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error;
+}

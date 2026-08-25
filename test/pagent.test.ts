@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createPagent, defineEvent } from "../src/index.js";
+import { decryptEventContext } from "../src/crypto.js";
+import {
+  createPagent,
+  defineEvent,
+  type EncryptedRelayEvent,
+} from "../src/index.js";
+
+const TEST_ENCRYPTION_KEY =
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 const healthFailed = defineEvent<{ reason: string }>({
   name: "health.failed",
@@ -9,6 +17,7 @@ const healthFailed = defineEvent<{ reason: string }>({
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -20,6 +29,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "staging",
       relay: relayOptions(),
+      encryption: encryptionOptions(),
     });
     const checkHealth = pagent.observe(
       () => ({ status: "unhealthy" as const, reason: "pool exhausted" }),
@@ -39,11 +49,20 @@ describe("Pagent", () => {
     await pagent.flush();
 
     expect(relayFetch).toHaveBeenCalledTimes(1);
-    expect(eventBody(relayFetch)).toMatchObject({
+    const body = requestBody(relayFetch);
+    expect(body.version).toBe(2);
+    expect(body.event).toMatchObject({
       type: "health.failed",
       environment: "staging",
       investigation: { cooldownMs: 60_000 },
-      payload: { reason: "pool exhausted" },
+    });
+    expect(body.event.context).toMatchObject({
+      algorithm: "A256GCM",
+      keyId: "test-key",
+    });
+    expect(JSON.stringify(body)).not.toContain("pool exhausted");
+    await expect(decryptedPayload(body.event)).resolves.toEqual({
+      reason: "pool exhausted",
     });
   });
 
@@ -58,6 +77,7 @@ describe("Pagent", () => {
       enabled,
       environment,
       relay: relayOptions(),
+      encryption: encryptionOptions(),
     });
     const observed = pagent.observe(() => "unchanged", {
       event: healthFailed,
@@ -86,6 +106,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "staging",
       relay: relayOptions(),
+      encryption: encryptionOptions(),
     });
     const observed = pagent.observe(() => "failed", {
       event: healthFailed,
@@ -115,6 +136,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "staging",
       relay: relayOptions(),
+      encryption: encryptionOptions(),
       onDeliveryError: (error) => errors.push(error),
     });
     const observed = pagent.observe(() => "failed", {
@@ -149,6 +171,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "staging",
       relay: relayOptions(),
+      encryption: encryptionOptions(),
     });
     const successful = pagent.observe(async () => 42, {
       event,
@@ -179,7 +202,9 @@ describe("Pagent", () => {
     await pagent.flush();
 
     expect(relayFetch).toHaveBeenCalledTimes(1);
-    expect(eventBody(relayFetch).payload).toEqual({ message: "database offline" });
+    await expect(decryptedPayload(eventBody(relayFetch))).resolves.toEqual({
+      message: "database offline",
+    });
   });
 
   it("preserves synchronous errors while observing them", async () => {
@@ -189,6 +214,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "staging",
       relay: relayOptions(),
+      encryption: encryptionOptions(),
     });
     const observed = pagent.observe(
       () => {
@@ -213,6 +239,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "staging",
       relay: relayOptions(),
+      encryption: encryptionOptions(),
     });
     const observed = pagent.observe(() => ({ region: "us-east-1" }), {
       event: healthFailed,
@@ -241,6 +268,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "production",
       relay: relayOptions(),
+      encryption: encryptionOptions(),
       onDeliveryError: (error) => errors.push(error),
     });
     const observed = pagent.observe(() => "application result", {
@@ -268,6 +296,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "production",
       relay: relayOptions(),
+      encryption: encryptionOptions(),
     });
     const observed = pagent.observe(() => "application result", {
       event: defineEvent({ name: "job.failed" }),
@@ -282,6 +311,154 @@ describe("Pagent", () => {
     expect(eventBody(relayFetch).investigation).toEqual({ cooldownMs: 0 });
   });
 
+  it("uses an injected host-neutral relay transport", async () => {
+    const transport = vi.fn(async () => ({ ok: true, status: 202 }));
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      encryption: encryptionOptions(),
+      relay: { ...relayOptions(), transport },
+    });
+    const observed = pagent.observe(() => "failed", {
+      event: defineEvent<{ reason: string }>({ name: "job.failed" }),
+      on: "result",
+      triggerWhen: () => true,
+      context: () => ({ reason: "worker exited" }),
+    });
+
+    expect(observed()).toBe("failed");
+    await pagent.flush();
+
+    expect(transport).toHaveBeenCalledTimes(1);
+    expect(transport).toHaveBeenCalledWith(
+      "https://relay.example.test/v1/events",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          authorization: "Bearer relay-secret",
+        }),
+      }),
+    );
+  });
+
+  it("imports the encryption key once per client", async () => {
+    const importKey = vi.spyOn(globalThis.crypto.subtle, "importKey");
+    const transport = vi.fn(async () => ({ ok: true, status: 202 }));
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      encryption: encryptionOptions(),
+      relay: { ...relayOptions(), transport },
+    });
+    const observed = pagent.observe(() => "failed", {
+      event: defineEvent<{ reason: string }>({ name: "job.failed" }),
+      on: "result",
+      triggerWhen: () => true,
+      context: () => ({ reason: "worker exited" }),
+    });
+
+    observed();
+    observed();
+    await pagent.flush();
+
+    expect(importKey).toHaveBeenCalledTimes(1);
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
+  it("flushes only work pending when the snapshot is taken", async () => {
+    const responses: Array<
+      (response: { ok: boolean; status: number }) => void
+    > = [];
+    const transport = vi.fn(
+      () =>
+        new Promise<{ ok: boolean; status: number }>((resolve) => {
+          responses.push(resolve);
+        }),
+    );
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      encryption: encryptionOptions(),
+      relay: { ...relayOptions(), transport },
+    });
+    const observed = pagent.observe(() => "failed", {
+      event: defineEvent<{ reason: string }>({ name: "job.failed" }),
+      on: "result",
+      triggerWhen: () => true,
+      context: () => ({ reason: "worker exited" }),
+    });
+
+    observed();
+    const firstFlush = pagent.flush();
+    observed();
+    await vi.waitFor(() => expect(transport).toHaveBeenCalledTimes(2));
+    responses[0]?.({ ok: true, status: 202 });
+    await firstFlush;
+
+    expect(responses).toHaveLength(2);
+    responses[1]?.({ ok: true, status: 202 });
+    await pagent.flush();
+  });
+
+  it("rejects context that JSON would silently alter", async () => {
+    const errors: unknown[] = [];
+    const relayFetch = successfulRelay();
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      encryption: encryptionOptions(),
+      relay: relayOptions(),
+      onDeliveryError: (error) => errors.push(error),
+    });
+    const observed = pagent.observe(() => "failed", {
+      event: defineEvent<{ metric: number }>({ name: "job.failed" }),
+      on: "result",
+      triggerWhen: () => true,
+      context: () => ({ metric: Number.NaN }),
+    });
+
+    expect(observed()).toBe("failed");
+    await pagent.flush();
+
+    expect(relayFetch).not.toHaveBeenCalled();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      code: "event_preparation_failed",
+      retryable: false,
+    });
+    expect((errors[0] as Error).cause).toMatchObject({
+      message: "context.metric contains a non-finite number.",
+    });
+  });
+
+  it("authenticates visible metadata with the encrypted context", async () => {
+    const relayFetch = successfulRelay();
+    const pagent = createPagent({
+      enabled: true,
+      environment: "production",
+      encryption: encryptionOptions(),
+      relay: relayOptions(),
+    });
+    const observed = pagent.observe(() => "failed", {
+      event: defineEvent<{ reason: string }>({ name: "job.failed" }),
+      on: "result",
+      triggerWhen: () => true,
+      context: () => ({ reason: "worker exited" }),
+    });
+
+    observed();
+    await pagent.flush();
+    const event = eventBody(relayFetch);
+
+    await expect(
+      decryptEventContext(
+        { ...event, environment: "tampered" },
+        event.context,
+        TEST_ENCRYPTION_KEY,
+      ),
+    ).rejects.toThrow("Pagent could not decrypt context");
+  });
+
   it("rejects oversized relay envelopes before sending them", async () => {
     const relayFetch = vi.fn();
     const errors: unknown[] = [];
@@ -290,6 +467,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "production",
       relay: { ...relayOptions(), maxEnvelopeBytes: 128 },
+      encryption: encryptionOptions(),
       onDeliveryError: (error) => errors.push(error),
     });
     const observed = pagent.observe(() => "application result", {
@@ -327,6 +505,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "production",
       relay: { ...relayOptions(), timeoutMs: 25 },
+      encryption: encryptionOptions(),
       onDeliveryError: (error) => errors.push(error),
     });
     const observed = pagent.observe(() => "application result", {
@@ -337,10 +516,10 @@ describe("Pagent", () => {
     });
 
     expect(observed()).toBe("application result");
+    await vi.waitFor(() => expect(relayFetch).toHaveBeenCalledTimes(1));
     await vi.advanceTimersByTimeAsync(25);
     await pagent.flush();
 
-    expect(relayFetch).toHaveBeenCalledTimes(1);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({
       name: "PagentDeliveryError",
@@ -351,8 +530,33 @@ describe("Pagent", () => {
 
   it("requires relay configuration when enabled", () => {
     expect(() =>
-      createPagent({ enabled: true, environment: "production" }),
+      createPagent({
+        enabled: true,
+        environment: "production",
+        encryption: encryptionOptions(),
+      }),
     ).toThrow("Pagent requires a relay when enabled.");
+  });
+
+  it("requires encryption configuration when enabled", () => {
+    expect(() =>
+      createPagent({
+        enabled: true,
+        environment: "production",
+        relay: relayOptions(),
+      }),
+    ).toThrow("Pagent requires encryption when enabled.");
+  });
+
+  it("rejects an invalid encryption key when enabled", () => {
+    expect(() =>
+      createPagent({
+        enabled: true,
+        environment: "production",
+        relay: relayOptions(),
+        encryption: { keyId: "invalid", key: "AA" },
+      }),
+    ).toThrow("Pagent encryption key must decode to 32 bytes.");
   });
 
   it("does not require or validate relay configuration while inert", () => {
@@ -386,6 +590,10 @@ function relayOptions() {
   };
 }
 
+function encryptionOptions() {
+  return { keyId: "test-key", key: TEST_ENCRYPTION_KEY };
+}
+
 function successfulRelay() {
   const relayFetch = vi.fn(
     async () => new Response(null, { status: 202 }),
@@ -394,10 +602,21 @@ function successfulRelay() {
   return relayFetch;
 }
 
-function eventBody(relayFetch: ReturnType<typeof vi.fn>) {
+function requestBody(relayFetch: ReturnType<typeof vi.fn>) {
   const request = relayFetch.mock.calls[0]?.[1] as RequestInit | undefined;
   if (typeof request?.body !== "string") {
     throw new Error("Expected a JSON request body");
   }
-  return (JSON.parse(request.body) as { event: Record<string, unknown> }).event;
+  return JSON.parse(request.body) as {
+    version: number;
+    event: EncryptedRelayEvent;
+  };
+}
+
+function eventBody(relayFetch: ReturnType<typeof vi.fn>): EncryptedRelayEvent {
+  return requestBody(relayFetch).event;
+}
+
+function decryptedPayload(event: EncryptedRelayEvent) {
+  return decryptEventContext(event, event.context, TEST_ENCRYPTION_KEY);
 }

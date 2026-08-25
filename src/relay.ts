@@ -1,15 +1,17 @@
 import type {
   PagentDeliveryError,
   PagentDeliveryErrorCode,
-  PagentEvent,
+  EncryptedRelayEvent,
   RelayEventEnvelope,
   RelayOptions,
+  RelayTransportRequest,
+  RelayTransportResponse,
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_ENVELOPE_BYTES = 64 * 1024;
 
-export type RelayEmitter = (event: PagentEvent) => Promise<void>;
+export type RelayEmitter = (event: EncryptedRelayEvent) => Promise<void>;
 
 export function asDeliveryError(error: unknown): PagentDeliveryError {
   if (isDeliveryError(error)) {
@@ -38,9 +40,15 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
   if (token.length === 0) {
     throw new Error("Pagent relay token is required.");
   }
+  if (
+    options.transport !== undefined &&
+    typeof options.transport !== "function"
+  ) {
+    throw new Error("Pagent relay transport must be a function.");
+  }
 
   return async (event) => {
-    const envelope: RelayEventEnvelope = { version: 1, event };
+    const envelope: RelayEventEnvelope = { version: 2, event };
     let body: string;
     try {
       body = JSON.stringify(envelope);
@@ -52,7 +60,7 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
         error,
       );
     }
-    const byteLength = Buffer.byteLength(body);
+    const byteLength = new TextEncoder().encode(body).byteLength;
 
     if (byteLength > maxEnvelopeBytes) {
       throw deliveryError(
@@ -63,19 +71,36 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    timeout.unref();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
 
     try {
-      const response = await fetch(url, {
+      const request: RelayTransportRequest = {
         method: "POST",
         headers: {
           authorization: `Bearer ${token}`,
           "content-type": "application/json",
         },
         body,
-        signal: controller.signal,
-      });
+      };
+      const delivery =
+        options.transport === undefined
+          ? nativeRelayTransport(url, request, controller.signal)
+          : options.transport(url.toString(), request);
+      const response = await Promise.race([
+        delivery,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => {
+            controller.abort();
+            reject(
+              deliveryError(
+                "timeout",
+                `Pagent relay delivery timed out after ${timeoutMs}ms.`,
+                true,
+              ),
+            );
+          }, timeoutMs);
+        }),
+      ]);
 
       if (!response.ok) {
         throw deliveryError(
@@ -92,14 +117,6 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
       if (isDeliveryError(error)) {
         throw error;
       }
-      if (controller.signal.aborted) {
-        throw deliveryError(
-          "timeout",
-          `Pagent relay delivery timed out after ${timeoutMs}ms.`,
-          true,
-          error,
-        );
-      }
       throw deliveryError(
         "network",
         "Pagent could not reach the relay.",
@@ -107,9 +124,24 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
         error,
       );
     } finally {
-      clearTimeout(timeout);
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
     }
   };
+}
+
+async function nativeRelayTransport(
+  url: URL,
+  request: RelayTransportRequest,
+  signal: AbortSignal,
+): Promise<RelayTransportResponse> {
+  if (typeof globalThis.fetch !== "function") {
+    throw new Error(
+      "This runtime does not provide fetch; configure relay.transport.",
+    );
+  }
+  return globalThis.fetch(url, { ...request, signal });
 }
 
 function deliveryError(

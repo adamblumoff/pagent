@@ -3,7 +3,11 @@ import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 
-import type { AgentAdapter, AgentResult } from "./types.js";
+import type {
+  AgentAbortSignal,
+  AgentAdapter,
+  AgentResult,
+} from "./types.js";
 
 export type CodexApprovalPolicy = "never" | "on-request" | "untrusted";
 export type CodexSandboxMode =
@@ -14,6 +18,10 @@ export type CodexSandboxMode =
 export interface CodexAgentOptions {
   approvalPolicy?: CodexApprovalPolicy;
   sandboxMode?: CodexSandboxMode;
+}
+
+export interface CodexProbeOptions {
+  timeoutMs?: number;
 }
 
 interface AppServerMessage {
@@ -30,17 +38,19 @@ interface ThreadStartResponse {
 
 export function codexAgent(options: CodexAgentOptions = {}): AgentAdapter {
   return {
-    run: (request) => runCodex(request.cwd, request.prompt, options),
+    run: (request) =>
+      runCodex(request.cwd, request.prompt, options, request.signal),
   };
 }
 
-async function runCodex(
-  requestedCwd: string,
-  prompt: string,
-  options: CodexAgentOptions,
-): Promise<AgentResult> {
-  const cwd = resolve(requestedCwd);
-  await requireLocalDirectory(cwd);
+/** Verifies that the installed Codex app server can initialize without creating a thread. */
+export async function probeCodexAppServer(
+  options: CodexProbeOptions = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Codex probe timeout must be a positive number.");
+  }
 
   const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -57,6 +67,69 @@ async function runCodex(
     stderr ||= error.message;
   });
 
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      (async () => {
+        await waitForSpawn(child);
+        send(child, {
+          method: "initialize",
+          id: 1,
+          params: {
+            clientInfo: {
+              name: "pagent-doctor",
+              title: "Pagent Doctor",
+              version: "0.0.0",
+            },
+          },
+        });
+        await waitForResponse(messages, 1, "initialize", () => stderr);
+        send(child, { method: "initialized", params: {} });
+      })(),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("Codex app server initialization timed out.")),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+    lines.close();
+    child.stdin.end();
+    child.kill();
+  }
+}
+
+async function runCodex(
+  requestedCwd: string,
+  prompt: string,
+  options: CodexAgentOptions,
+  signal: AgentAbortSignal | undefined,
+): Promise<AgentResult> {
+  const cwd = resolve(requestedCwd);
+  await requireLocalDirectory(cwd);
+  throwIfAborted(signal);
+
+  const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lines = createInterface({ input: child.stdout });
+  const messages = lines[Symbol.asyncIterator]();
+  let stderr = "";
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.stdin.on("error", (error) => {
+    stderr ||= error.message;
+  });
+  const abort = () => child.kill();
+  signal?.addEventListener("abort", abort, { once: true });
+
   try {
     await waitForSpawn(child);
 
@@ -71,7 +144,7 @@ async function runCodex(
         },
       },
     });
-    await waitForResponse(messages, 1, "initialize", () => stderr);
+    await waitForResponse(messages, 1, "initialize", () => stderr, signal);
     send(child, { method: "initialized", params: {} });
 
     const threadParams: Record<string, unknown> = { cwd };
@@ -88,6 +161,7 @@ async function runCodex(
       2,
       "thread/start",
       () => stderr,
+      signal,
     );
     const threadId = thread.thread.id;
 
@@ -103,7 +177,7 @@ async function runCodex(
     let finalResponse: string | undefined;
 
     while (true) {
-      const message = await nextMessage(messages, () => stderr);
+      const message = await nextMessage(messages, () => stderr, signal);
 
       if (message.id === 3 && message.error !== undefined) {
         throw requestError("turn/start", message.error);
@@ -131,6 +205,7 @@ async function runCodex(
         : { threadId, finalResponse };
     }
   } finally {
+    signal?.removeEventListener("abort", abort);
     lines.close();
     child.stdin.end();
     child.kill();
@@ -151,9 +226,10 @@ async function waitForResponse<TResult>(
   id: number,
   method: string,
   stderr: () => string,
+  signal?: AgentAbortSignal,
 ): Promise<TResult> {
   while (true) {
-    const message = await nextMessage(messages, stderr);
+    const message = await nextMessage(messages, stderr, signal);
     if (message.id !== id) {
       continue;
     }
@@ -167,8 +243,9 @@ async function waitForResponse<TResult>(
 async function nextMessage(
   messages: AsyncIterator<string>,
   stderr: () => string,
+  signal?: AgentAbortSignal,
 ): Promise<AppServerMessage> {
-  const next = await messages.next();
+  const next = await abortable(messages.next(), signal);
   if (next.done) {
     const detail = stderr().trim();
     throw new Error(
@@ -180,6 +257,29 @@ async function nextMessage(
     return JSON.parse(next.value) as AppServerMessage;
   } catch {
     throw new Error("Codex app server returned invalid JSON.");
+  }
+}
+
+async function abortable<T>(
+  operation: Promise<T>,
+  signal: AgentAbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) {
+    return operation;
+  }
+  throwIfAborted(signal);
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const abort = () => rejectPromise(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    operation.then(resolvePromise, rejectPromise).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
+}
+
+function throwIfAborted(signal: AgentAbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw signal.reason;
   }
 }
 

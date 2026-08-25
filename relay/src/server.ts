@@ -3,7 +3,6 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 
 import {
   assertEnvironmentAllowed,
-  buildPrompt,
   parseEventEnvelope,
 } from "./domain.js";
 import type {
@@ -223,7 +222,6 @@ export function createRelayServer(options: {
         const result = await store.enqueue({
           source,
           event: envelope.event,
-          prompt: buildPrompt(source, envelope.event),
         });
         const body =
           "task" in result

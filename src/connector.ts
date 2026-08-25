@@ -2,7 +2,23 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
-import type { AgentAdapter, AgentResult, PagentEvent } from "./types.js";
+import {
+  createEventContextDecryptor,
+  type EventContextDecryptor,
+} from "./crypto.js";
+import { decodeBase64Url } from "./encoding.js";
+import type {
+  ConnectorEncryptionConfig,
+  ConnectorKeyring,
+} from "./config.js";
+import type {
+  AgentAdapter,
+  AgentResult,
+  EncryptedContext,
+  JsonValue,
+  PagentEvent,
+  PagentEventMetadata,
+} from "./types.js";
 
 export {
   codexAgent,
@@ -13,11 +29,15 @@ export {
 export {
   defineConnectorConfig,
   type ConnectorConfig,
+  type ConnectorEncryptionConfig,
+  type ConnectorKeyring,
+  type ConnectorRelayConfig,
 } from "./config.js";
 export type { AgentAdapter, AgentRequest, AgentResult } from "./types.js";
 
-export interface RelayTask<TPayload = unknown> {
+export interface RelayTask {
   id: string;
+  eventId: string;
   type: string;
   environment: string;
   occurredAt: string;
@@ -26,8 +46,7 @@ export interface RelayTask<TPayload = unknown> {
     group?: string | undefined;
   };
   repositoryKey: string;
-  prompt: string;
-  payload: TPayload;
+  context: EncryptedContext;
 }
 
 export interface RelayConnectorOptions {
@@ -36,10 +55,12 @@ export interface RelayConnectorOptions {
   inboxPath: string;
   repositories: Readonly<Record<string, string>>;
   environments: readonly string[];
+  encryption: ConnectorEncryptionConfig;
   agent: AgentAdapter;
   fetch?: typeof fetch;
   reconnectDelayMs?: number;
   onError?: (error: unknown) => void;
+  onConnectionChange?: (connected: boolean) => void;
   onAgentResult?: (
     result: AgentResult,
     task: RelayTask,
@@ -52,7 +73,7 @@ export interface RelayConnector {
 }
 
 interface InboxState {
-  version: 1;
+  version: 2;
   cursor?: string;
   pending: RelayTask[];
   completed: string[];
@@ -125,7 +146,7 @@ class FileInbox {
       if (!isNodeError(error) || error.code !== "ENOENT") {
         throw error;
       }
-      this.#state = { version: 1, pending: [], completed: [] };
+      this.#state = { version: 2, pending: [], completed: [] };
     }
 
     return this.#state;
@@ -155,7 +176,9 @@ class DefaultRelayConnector implements RelayConnector {
   readonly #environments: Set<string>;
   readonly #fetch: typeof fetch;
   readonly #inbox: FileInbox;
+  readonly #decryptors: Map<string, EventContextDecryptor>;
   readonly #onAgentResult: RelayConnectorOptions["onAgentResult"];
+  readonly #onConnectionChange: RelayConnectorOptions["onConnectionChange"];
   readonly #onError: ((error: unknown) => void) | undefined;
   readonly #reconnectDelayMs: number;
   readonly #repositories: Map<string, string>;
@@ -169,10 +192,12 @@ class DefaultRelayConnector implements RelayConnector {
     this.#inbox = new FileInbox(options.inboxPath);
     this.#repositories = repositoryAllowlist(options.repositories);
     this.#environments = environmentAllowlist(options.environments);
+    this.#decryptors = decryptionKeyring(options.encryption.keys);
     this.#agent = options.agent;
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#reconnectDelayMs = options.reconnectDelayMs ?? 1_000;
     this.#onAgentResult = options.onAgentResult;
+    this.#onConnectionChange = options.onConnectionChange;
     this.#onError = options.onError;
 
     if (!Number.isFinite(this.#reconnectDelayMs) || this.#reconnectDelayMs < 0) {
@@ -201,8 +226,9 @@ class DefaultRelayConnector implements RelayConnector {
     }
     this.#active = true;
 
+    let connected = false;
     try {
-      await this.#drainInbox();
+      await this.#drainInbox(options.signal);
       const cursor = await this.#inbox.cursor();
       const headers = new Headers({
         accept: "text/event-stream",
@@ -224,16 +250,24 @@ class DefaultRelayConnector implements RelayConnector {
       if (response.body === null) {
         throw new Error("Relay SSE response had no body.");
       }
+      connected = true;
+      this.#reportConnection(true);
 
       for await (const message of readSse(response.body)) {
-        await this.#receive(message);
+        await this.#receive(message, options.signal);
       }
     } finally {
+      if (connected) {
+        this.#reportConnection(false);
+      }
       this.#active = false;
     }
   }
 
-  async #receive(message: SseMessage): Promise<void> {
+  async #receive(
+    message: SseMessage,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
     try {
       const task = relayTask(message);
       await this.#inbox.receive(task);
@@ -243,10 +277,10 @@ class DefaultRelayConnector implements RelayConnector {
       return;
     }
 
-    await this.#drainInbox();
+    await this.#drainInbox(signal);
   }
 
-  async #drainInbox(): Promise<void> {
+  async #drainInbox(signal: AbortSignal | undefined): Promise<void> {
     let task = await this.#inbox.next();
 
     while (task !== undefined) {
@@ -258,18 +292,38 @@ class DefaultRelayConnector implements RelayConnector {
         continue;
       }
 
-      const event: PagentEvent = {
-        id: task.id,
+      const metadata: PagentEventMetadata = {
+        id: task.eventId,
         type: task.type,
         environment: task.environment,
         occurredAt: task.occurredAt,
         investigation: task.investigation,
-        payload: task.payload,
+      };
+      const decrypt = this.#decryptors.get(task.context.keyId);
+      if (decrypt === undefined) {
+        throw new Error(
+          `Relay task ${task.id} uses unknown context key ${task.context.keyId}.`,
+        );
+      }
+
+      let payload: JsonValue;
+      try {
+        payload = await decrypt(metadata, task.context);
+      } catch (cause) {
+        throw new Error(`Relay task ${task.id} context could not be decrypted.`, {
+          cause,
+        });
+      }
+
+      const event: PagentEvent = {
+        ...metadata,
+        payload,
       };
       const result = await this.#agent.run({
         cwd: this.#repositories.get(task.repositoryKey)!,
-        prompt: task.prompt,
+        prompt: investigationPrompt(task.repositoryKey, event),
         event,
+        ...(signal === undefined ? {} : { signal }),
       });
       await this.#inbox.complete(task.id);
       if (this.#onAgentResult !== undefined) {
@@ -300,6 +354,14 @@ class DefaultRelayConnector implements RelayConnector {
   #report(error: unknown): void {
     try {
       this.#onError?.(error);
+    } catch {
+      // Connector callbacks must not stop delivery or agent execution.
+    }
+  }
+
+  #reportConnection(connected: boolean): void {
+    try {
+      this.#onConnectionChange?.(connected);
     } catch {
       // Connector callbacks must not stop delivery or agent execution.
     }
@@ -454,32 +516,32 @@ function relayTask(message: SseMessage): RelayTask {
     value === undefined ||
     value.id !== message.id ||
     !nonempty(value.type) ||
+    !nonempty(value.eventId) ||
     !nonempty(value.environment) ||
     !nonempty(value.occurredAt) ||
     !isInvestigationPolicy(value.investigation) ||
     !nonempty(value.repositoryKey) ||
-    !nonempty(value.prompt) ||
-    !("payload" in value)
+    !isEncryptedContext(value.context)
   ) {
     throw new Error(`Relay task ${message.id} has an invalid shape.`);
   }
 
   return {
     id: message.id,
+    eventId: value.eventId,
     type: value.type,
     environment: value.environment,
     occurredAt: value.occurredAt,
     investigation: value.investigation,
     repositoryKey: value.repositoryKey,
-    prompt: value.prompt,
-    payload: value.payload,
+    context: value.context,
   };
 }
 
 function inboxState(value: unknown): InboxState {
   const state = record(value);
   if (
-    state?.version !== 1 ||
+    state?.version !== 2 ||
     !Array.isArray(state.pending) ||
     !state.pending.every(isRelayTask) ||
     !Array.isArray(state.completed) ||
@@ -490,7 +552,7 @@ function inboxState(value: unknown): InboxState {
   }
 
   return {
-    version: 1,
+    version: 2,
     ...(state.cursor === undefined ? {} : { cursor: state.cursor }),
     pending: state.pending,
     completed: state.completed,
@@ -502,13 +564,29 @@ function isRelayTask(value: unknown): value is RelayTask {
   return (
     task !== undefined &&
     nonempty(task.id) &&
+    nonempty(task.eventId) &&
     nonempty(task.type) &&
     nonempty(task.environment) &&
     nonempty(task.occurredAt) &&
     isInvestigationPolicy(task.investigation) &&
     nonempty(task.repositoryKey) &&
-    nonempty(task.prompt) &&
-    "payload" in task
+    isEncryptedContext(task.context)
+  );
+}
+
+function isEncryptedContext(value: unknown): value is EncryptedContext {
+  const context = record(value);
+  return (
+    context !== undefined &&
+    context.algorithm === "A256GCM" &&
+    nonempty(context.keyId) &&
+    context.keyId === context.keyId.trim() &&
+    context.keyId.length <= 200 &&
+    typeof context.iv === "string" &&
+    /^[A-Za-z0-9_-]{16}$/u.test(context.iv) &&
+    typeof context.ciphertext === "string" &&
+    context.ciphertext.length >= 22 &&
+    /^[A-Za-z0-9_-]+$/u.test(context.ciphertext)
   );
 }
 
@@ -571,6 +649,59 @@ function environmentAllowlist(values: readonly string[]): Set<string> {
     environments.add(environment);
   }
   return environments;
+}
+
+function decryptionKeyring(
+  values: ConnectorKeyring,
+): Map<string, EventContextDecryptor> {
+  const decryptors = new Map<string, EventContextDecryptor>();
+  for (const [keyId, key] of Object.entries(values)) {
+    if (
+      !nonempty(keyId) ||
+      keyId !== keyId.trim() ||
+      keyId.length > 200 ||
+      typeof key !== "string"
+    ) {
+      throw new Error(
+        "Connector encryption keys must map a trimmed key ID to a 32-byte base64url key.",
+      );
+    }
+    let decoded: Uint8Array;
+    try {
+      decoded = decodeBase64Url(key, `Connector encryption key ${keyId}`);
+    } catch (cause) {
+      throw new Error(
+        "Connector encryption keys must map a trimmed key ID to a 32-byte base64url key.",
+        { cause },
+      );
+    }
+    if (decoded.byteLength !== 32) {
+      throw new Error(
+        "Connector encryption keys must map a trimmed key ID to a 32-byte base64url key.",
+      );
+    }
+    decryptors.set(keyId, createEventContextDecryptor(key));
+  }
+  if (decryptors.size === 0) {
+    throw new Error("Connector encryption requires at least one decryption key.");
+  }
+  return decryptors;
+}
+
+function investigationPrompt(
+  repositoryKey: string,
+  event: PagentEvent,
+): string {
+  return [
+    `Investigate a ${event.environment} ${event.type} event in repository ${repositoryKey}.`,
+    "Use the local checkout provided as your working directory; do not inspect a remote copy of the repository.",
+    "Find the root cause and report the supporting evidence. Do not modify files.",
+    "",
+    `Event ID: ${event.id}`,
+    `Occurred at: ${event.occurredAt}`,
+    "Event context:",
+    JSON.stringify(event.payload, null, 2),
+  ].join("\n");
 }
 
 async function abortableDelay(
