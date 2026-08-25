@@ -148,6 +148,13 @@ process.stdin.on("data", (chunk) => {
     input = input.slice(newline + 1);
     if (message.method === "initialize") {
       process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+    } else if (message.method === "command/exec") {
+      process.stdout.write(
+        JSON.stringify({
+          id: message.id,
+          result: { exitCode: 0, stdout: "", stderr: "" },
+        }) + "\\n",
+      );
     }
     newline = input.indexOf("\\n");
   }

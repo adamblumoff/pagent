@@ -353,6 +353,9 @@ function printDoctorReport(report: DoctorReport): void {
     console.log(
       `${check.status.toUpperCase().padEnd(5)} ${check.label.padEnd(25)} ${check.detail}`,
     );
+    if (check.remediation !== undefined) {
+      console.log(`      Fix: ${check.remediation}`);
+    }
   }
   const passed = report.checks.filter(({ status }) => status === "pass").length;
   const failed = report.checks.filter(({ status }) => status === "fail").length;

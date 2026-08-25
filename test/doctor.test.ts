@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
+import { CodexSandboxProbeError } from "../src/codex.js";
 import {
   runDoctor,
   type DoctorDependencies,
@@ -42,6 +43,7 @@ describe("runDoctor", () => {
       "relay.health",
       "relay.sse",
       "codex",
+      "sandbox.runtime",
       "worktree",
       "sandbox",
     ]);
@@ -50,7 +52,10 @@ describe("runDoctor", () => {
     expect(signals).toHaveLength(2);
     expect(signals[0]?.aborted).toBe(false);
     expect(signals[1]?.aborted).toBe(true);
-    expect(probeCodex).toHaveBeenCalledWith({ timeoutMs: 5_000 });
+    expect(probeCodex).toHaveBeenCalledWith({
+      timeoutMs: 5_000,
+      sandbox: { cwd: "/repo", mode: "read-only" },
+    });
     expect(JSON.stringify(report)).not.toContain("connector-secret");
     expect(JSON.stringify(report)).not.toContain(KEY);
   });
@@ -144,8 +149,56 @@ describe("runDoctor", () => {
     expect(check(report, "codex")).toMatchObject({
       status: "fail",
       detail: "Codex app server could not be found or initialized.",
+      remediation: expect.stringContaining("codex login"),
     });
+    expect(check(report, "sandbox.runtime")).toMatchObject({ status: "warn" });
     expect(JSON.stringify(report)).not.toContain("should-not-leak");
+  });
+
+  it("does not misdiagnose a missing repository as a sandbox failure", async () => {
+    const probeCodex = vi.fn(async () => undefined);
+    const report = await runDoctor(
+      input(),
+      dependencies({
+        stat: vi.fn(async (path: string) => {
+          if (path === resolve("/repo")) throw missing();
+          if (path === resolve("/state")) return directory();
+          throw missing();
+        }),
+        probeCodex,
+      }),
+    );
+
+    expect(probeCodex).toHaveBeenCalledWith({ timeoutMs: 5_000 });
+    expect(check(report, "codex").status).toBe("pass");
+    expect(check(report, "sandbox.runtime")).toMatchObject({
+      status: "warn",
+      detail: expect.stringContaining("repository mapping"),
+    });
+  });
+
+  it("fails with a concrete fix when Ubuntu blocks Bubblewrap", async () => {
+    const report = await runDoctor(
+      input({ includeAdvisories: false }),
+      dependencies({
+        probeCodex: vi.fn(async () => {
+          throw new CodexSandboxProbeError(
+            "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted secret=hidden",
+          );
+        }),
+      }),
+    );
+
+    expect(check(report, "codex").status).toBe("pass");
+    expect(check(report, "sandbox.runtime")).toMatchObject({
+      status: "fail",
+      detail: expect.stringContaining("host blocked"),
+      remediation: expect.stringContaining("use_legacy_landlock = true"),
+    });
+    expect(report.checks.map(({ id }) => id)).not.toContain("worktree");
+    expect(report.checks.map(({ id }) => id)).not.toContain("sandbox");
+    expect(report.ok).toBe(false);
+    expect(JSON.stringify(report)).not.toContain("secret=hidden");
   });
 });
 

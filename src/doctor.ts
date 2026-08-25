@@ -4,6 +4,7 @@ import { access, readFile, stat } from "node:fs/promises";
 import { dirname, parse, resolve } from "node:path";
 
 import {
+  CodexSandboxProbeError,
   probeCodexAppServer,
   type CodexAgentOptions,
   type CodexProbeOptions,
@@ -18,6 +19,7 @@ export interface DoctorCheck {
   label: string;
   status: DoctorStatus;
   detail: string;
+  remediation?: string | undefined;
 }
 
 export type DoctorCheckId =
@@ -29,6 +31,7 @@ export type DoctorCheckId =
   | "relay.health"
   | "relay.sse"
   | "codex"
+  | "sandbox.runtime"
   | "worktree"
   | "sandbox";
 
@@ -116,7 +119,8 @@ export async function runDoctor(
         ),
   );
 
-  checks.push(await checkRepositories(input.repositories, deps));
+  const repositories = await checkRepositories(input.repositories, deps);
+  checks.push(repositories);
   checks.push(await checkInbox(input.inboxPath, deps));
   checks.push(await checkState(input.statePath, deps));
 
@@ -140,7 +144,14 @@ export async function runDoctor(
     );
   }
 
-  checks.push(await checkCodex(timeoutMs, deps));
+  checks.push(
+    ...(await checkCodex(
+      input,
+      timeoutMs,
+      repositories.status === "pass",
+      deps,
+    )),
+  );
   if (input.includeAdvisories !== false) {
     checks.push(await checkWorktrees(input.repositories, deps));
     checks.push(checkSandbox(input.codex));
@@ -158,8 +169,15 @@ function check(
   label: string,
   status: DoctorStatus,
   detail: string,
+  remediation?: string,
 ): DoctorCheck {
-  return { id, label, status, detail };
+  return {
+    id,
+    label,
+    status,
+    detail,
+    ...(remediation === undefined ? {} : { remediation }),
+  };
 }
 
 function connectorConfigIsValid(input: DoctorInput): boolean {
@@ -529,25 +547,107 @@ async function fetchWithTimeout(
 }
 
 async function checkCodex(
+  input: DoctorInput,
   timeoutMs: number,
+  repositoriesReady: boolean,
   deps: DoctorDependencies,
-): Promise<DoctorCheck> {
+): Promise<DoctorCheck[]> {
+  const cwd =
+    Object.values(record(input.repositories) ?? {}).find(
+      (value): value is string => typeof value === "string" && value !== "",
+    ) ?? process.cwd();
   try {
-    await deps.probeCodex({ timeoutMs });
-    return check(
-      "codex",
-      "Codex app server",
-      "pass",
-      "Installed Codex app server initialized without creating a thread.",
+    await deps.probeCodex(
+      repositoriesReady
+        ? {
+            timeoutMs,
+            sandbox: { cwd, mode: input.codex?.sandboxMode },
+          }
+        : { timeoutMs },
     );
-  } catch {
-    return check(
-      "codex",
-      "Codex app server",
-      "fail",
-      "Codex app server could not be found or initialized.",
-    );
+    return [
+      check(
+        "codex",
+        "Codex app server",
+        "pass",
+        "Installed Codex app server initialized without creating a thread.",
+      ),
+      check(
+        "sandbox.runtime",
+        "Codex sandbox runtime",
+        repositoriesReady ? "pass" : "warn",
+        repositoriesReady
+          ? "Codex ran a no-thread command with the configured sandbox."
+          : "Skipped until the local repository mapping is accessible.",
+      ),
+    ];
+  } catch (error) {
+    if (error instanceof CodexSandboxProbeError) {
+      const failure = sandboxFailure(error.causeText);
+      return [
+        check(
+          "codex",
+          "Codex app server",
+          "pass",
+          "Installed Codex app server initialized without creating a thread.",
+        ),
+        check(
+          "sandbox.runtime",
+          "Codex sandbox runtime",
+          "fail",
+          failure.detail,
+          failure.remediation,
+        ),
+      ];
+    }
+    return [
+      check(
+        "codex",
+        "Codex app server",
+        "fail",
+        "Codex app server could not be found or initialized.",
+        "Install or update Codex, run `codex login`, then rerun `pagent doctor`.",
+      ),
+      check(
+        "sandbox.runtime",
+        "Codex sandbox runtime",
+        "warn",
+        "Skipped until the Codex app server can initialize.",
+      ),
+    ];
   }
+}
+
+function sandboxFailure(causeText: string): {
+  detail: string;
+  remediation: string;
+} {
+  if (
+    /bwrap|bubblewrap/iu.test(causeText) &&
+    /RTM_NEWADDR|uid_map|user namespace|operation not permitted/iu.test(causeText)
+  ) {
+    return {
+      detail:
+        "Bubblewrap cannot create Codex's Linux sandbox because the host blocked its user or network namespace.",
+      remediation:
+        "Add `use_legacy_landlock = true` under `[features]` in `~/.codex/config.toml`, then rerun `pagent doctor`. If that backend is unavailable, allow Codex's Bubblewrap helper to create user namespaces with a scoped AppArmor profile or run Pagent outside the restricted container. Do not disable AppArmor globally.",
+    };
+  }
+  if (
+    /bwrap|bubblewrap/iu.test(causeText) &&
+    /ENOENT|not found|no such file/iu.test(causeText)
+  ) {
+    return {
+      detail: "Codex cannot find its Bubblewrap sandbox helper.",
+      remediation:
+        "Update Codex first. If Codex still reports a missing system helper, install your Linux distribution's `bubblewrap` package, then rerun `pagent doctor`.",
+    };
+  }
+  return {
+    detail: "Codex could not run a command inside the configured sandbox.",
+    remediation:
+      "Update Codex, check the host's sandbox and namespace permissions, then rerun `pagent doctor`.",
+  };
 }
 
 async function checkWorktrees(

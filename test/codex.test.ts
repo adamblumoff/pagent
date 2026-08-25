@@ -14,7 +14,10 @@ vi.mock("node:child_process", async (importOriginal) => ({
 }));
 
 import { codexAgent } from "../src/connector.js";
-import { probeCodexAppServer } from "../src/codex.js";
+import {
+  CodexSandboxProbeError,
+  probeCodexAppServer,
+} from "../src/codex.js";
 
 interface SentMessage {
   id?: number;
@@ -148,6 +151,50 @@ describe("codexAgent", () => {
     expect(server.message("thread/start")).toBeUndefined();
     expect(server.child.kill).toHaveBeenCalled();
   });
+
+  it("runs the configured sandbox without creating a thread", async () => {
+    const server = fakeAppServer();
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => server.child.emit("spawn"));
+      return server.child;
+    });
+
+    await probeCodexAppServer({
+      timeoutMs: 100,
+      sandbox: { cwd: process.cwd(), mode: "read-only" },
+    });
+
+    expect(server.message("command/exec")?.params).toEqual({
+      command: ["/bin/true"],
+      cwd: process.cwd(),
+      timeoutMs: 100,
+      outputBytesCap: 4_096,
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+    });
+    expect(server.message("thread/start")).toBeUndefined();
+  });
+
+  it("reports a sandbox command failure separately from initialization", async () => {
+    const server = fakeAppServer(true, {
+      exitCode: 1,
+      stdout: "",
+      stderr: "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+    });
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => server.child.emit("spawn"));
+      return server.child;
+    });
+
+    const probe = probeCodexAppServer({
+      timeoutMs: 100,
+      sandbox: { cwd: process.cwd(), mode: "read-only" },
+    });
+
+    await expect(probe).rejects.toBeInstanceOf(CodexSandboxProbeError);
+    await expect(probe).rejects.toMatchObject({
+      causeText: expect.stringContaining("RTM_NEWADDR"),
+    });
+  });
 });
 
 function request(cwd = process.cwd()) {
@@ -165,7 +212,10 @@ function request(cwd = process.cwd()) {
   };
 }
 
-function fakeAppServer(completeTurn = true) {
+function fakeAppServer(
+  completeTurn = true,
+  commandResult = { exitCode: 0, stdout: "", stderr: "" },
+) {
   const child = fakeChild();
   const sent: SentMessage[] = [];
   let input = "";
@@ -179,7 +229,7 @@ function fakeAppServer(completeTurn = true) {
       input = input.slice(newline + 1);
       const message = JSON.parse(line) as SentMessage;
       sent.push(message);
-      respond(child, message, completeTurn);
+      respond(child, message, completeTurn, commandResult);
       newline = input.indexOf("\n");
     }
   });
@@ -207,6 +257,7 @@ function respond(
   child: ChildProcessWithoutNullStreams,
   message: SentMessage,
   completeTurn: boolean,
+  commandResult: { exitCode: number; stdout: string; stderr: string },
 ): void {
   const send = (value: unknown) => {
     (child.stdout as PassThrough).write(`${JSON.stringify(value)}\n`);
@@ -219,6 +270,8 @@ function respond(
       id: message.id,
       result: { thread: { id: "codex-thread-1" } },
     });
+  } else if (message.method === "command/exec") {
+    send({ id: message.id, result: commandResult });
   } else if (message.method === "turn/start") {
     send({ id: message.id, result: { turn: { id: "turn-1" } } });
     if (!completeTurn) {

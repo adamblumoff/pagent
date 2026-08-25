@@ -22,6 +22,20 @@ export interface CodexAgentOptions {
 
 export interface CodexProbeOptions {
   timeoutMs?: number;
+  sandbox?: {
+    cwd: string;
+    mode?: CodexSandboxMode | undefined;
+  } | undefined;
+}
+
+export class CodexSandboxProbeError extends Error {
+  readonly causeText: string;
+
+  constructor(causeText: string) {
+    super("Codex sandbox command could not run.");
+    this.name = "CodexSandboxProbeError";
+    this.causeText = causeText;
+  }
 }
 
 interface AppServerMessage {
@@ -36,6 +50,12 @@ interface ThreadStartResponse {
   thread: { id: string };
 }
 
+interface CommandExecResponse {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
 export function codexAgent(options: CodexAgentOptions = {}): AgentAdapter {
   return {
     run: (request) =>
@@ -43,7 +63,7 @@ export function codexAgent(options: CodexAgentOptions = {}): AgentAdapter {
   };
 }
 
-/** Verifies that the installed Codex app server can initialize without creating a thread. */
+/** Verifies app-server initialization and, when requested, its real sandbox without creating a thread. */
 export async function probeCodexAppServer(
   options: CodexProbeOptions = {},
 ): Promise<void> {
@@ -68,6 +88,7 @@ export async function probeCodexAppServer(
   });
 
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let initialized = false;
   try {
     await Promise.race([
       (async () => {
@@ -85,14 +106,65 @@ export async function probeCodexAppServer(
         });
         await waitForResponse(messages, 1, "initialize", () => stderr);
         send(child, { method: "initialized", params: {} });
+        initialized = true;
+
+        if (options.sandbox !== undefined) {
+          send(child, {
+            method: "command/exec",
+            id: 2,
+            params: {
+              command: sandboxProbeCommand(),
+              cwd: resolve(options.sandbox.cwd),
+              timeoutMs,
+              outputBytesCap: 4_096,
+              ...(options.sandbox.mode === undefined
+                ? {}
+                : {
+                    sandboxPolicy: sandboxPolicy(
+                      options.sandbox.mode,
+                      options.sandbox.cwd,
+                    ),
+                  }),
+            },
+          });
+          let result: CommandExecResponse;
+          try {
+            result = await waitForResponse<CommandExecResponse>(
+              messages,
+              2,
+              "command/exec",
+              () => stderr,
+            );
+          } catch (error) {
+            throw new CodexSandboxProbeError(errorMessage(error));
+          }
+          if (result.exitCode !== 0) {
+            throw new CodexSandboxProbeError(
+              result.stderr.trim() ||
+                `Sandbox command exited ${result.exitCode}.`,
+            );
+          }
+        }
       })(),
       new Promise<never>((_, reject) => {
         timeout = setTimeout(
-          () => reject(new Error("Codex app server initialization timed out.")),
+          () =>
+            reject(
+              new Error(
+                initialized
+                  ? "Codex sandbox command timed out."
+                  : "Codex app server initialization timed out.",
+              ),
+            ),
           timeoutMs,
         );
       }),
     ]);
+  } catch (error) {
+    if (initialized && !(error instanceof CodexSandboxProbeError)) {
+      throw new CodexSandboxProbeError(errorMessage(error));
+    }
+    throw error;
   } finally {
     if (timeout !== undefined) {
       clearTimeout(timeout);
@@ -101,6 +173,29 @@ export async function probeCodexAppServer(
     child.stdin.end();
     child.kill();
   }
+}
+
+function sandboxProbeCommand(): string[] {
+  return process.platform === "win32"
+    ? ["cmd.exe", "/d", "/c", "exit", "0"]
+    : [process.platform === "darwin" ? "/usr/bin/true" : "/bin/true"];
+}
+
+function sandboxPolicy(
+  mode: CodexSandboxMode,
+  cwd: string,
+): Record<string, unknown> {
+  if (mode === "danger-full-access") {
+    return { type: "dangerFullAccess" };
+  }
+  if (mode === "workspace-write") {
+    return {
+      type: "workspaceWrite",
+      writableRoots: [resolve(cwd)],
+      networkAccess: false,
+    };
+  }
+  return { type: "readOnly", networkAccess: false };
 }
 
 async function runCodex(
@@ -379,4 +474,8 @@ function codexLaunchError(error: Error): Error {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown sandbox error.";
 }
