@@ -2,6 +2,9 @@ node_modules/
 dist/
 dist-demo/
 coverage/
+.next/
+.wrangler/
+*.tsbuildinfo
 .pagent/
 *.log
 .env*

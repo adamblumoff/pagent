@@ -10,5 +10,6 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src", "test", "demo", "pagent.config.ts"]
+  "include": ["src", "test", "demo", "pagent.config.ts"],
+  "exclude": ["test/e2e/frameworks"]
 }

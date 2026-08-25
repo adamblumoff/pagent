@@ -28,8 +28,9 @@
     "cli": "pnpm build:sdk && node dist/cli.js",
     "demo": "pnpm build:sdk && pnpm --filter pagent-demo dev",
     "test": "vitest run && npm --prefix relay test",
+    "test:e2e:frameworks": "pnpm build:sdk && pnpm --filter './test/e2e/frameworks/**' build && vitest run --config vitest.e2e.config.ts",
     "smoke:bun": "pnpm build:sdk && bun test/runtime/bun-smoke.mjs",
-    "typecheck": "pnpm typecheck:cloud && pnpm build:sdk && pnpm typecheck:consumers && tsc --noEmit && pnpm --filter pagent-demo typecheck && npm --prefix relay run typecheck"
+    "typecheck": "pnpm typecheck:cloud && pnpm build:sdk && pnpm typecheck:consumers && tsc --noEmit && pnpm --filter pagent-demo typecheck && pnpm --filter './test/e2e/frameworks/**' typecheck && npm --prefix relay run typecheck"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

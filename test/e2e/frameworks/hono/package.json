@@ -1,0 +1,19 @@
+{
+  "name": "@pagent/e2e-hono",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "start": "wrangler dev --local --ip 127.0.0.1 --show-interactive-dev-session=false",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "4.13.4",
+    "pagent": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "wrangler": "4.123.0"
+  }
+}
