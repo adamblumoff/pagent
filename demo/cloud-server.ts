@@ -7,11 +7,11 @@ const port = readPositiveNumber("PORT", 3_000);
 const enabled = process.env.PAGENT_ENABLED === "true";
 const environment = process.env.PAGENT_ENV;
 const active = enabled && Boolean(environment?.trim());
+const triggerToken = requireEnvironment("DEMO_TRIGGER_TOKEN");
 
 const healthFailed = defineEvent<HealthResult>({
   name: "health.failed",
   enabledIn: ["staging"],
-  investigation: { cooldownMs: 60_000 },
 });
 const pagent = createPagent({
   enabled,
@@ -49,6 +49,10 @@ const server = createServer((request, response) => {
   }
 
   if (request.method === "POST" && request.url === "/demo/failure") {
+    if (request.headers.authorization !== `Bearer ${triggerToken}`) {
+      respond(response, 401, { error: "Unauthorized" });
+      return;
+    }
     const result = observeFailure();
     respond(response, 202, {
       accepted: true,
@@ -63,10 +67,6 @@ const server = createServer((request, response) => {
 
 server.listen(port, "0.0.0.0", () => {
   console.log(`[demo] listening on :${port}`);
-  const result = observeFailure();
-  console.log(
-    `[demo] startup health check: ${result.status} (${result.latencyMs}ms > ${result.thresholdMs}ms)`,
-  );
 });
 
 async function shutdown(): Promise<void> {
