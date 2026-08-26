@@ -11,6 +11,7 @@ import { RecordingRelayStore } from "./recording-store.js";
 const config: RelayConfig = {
   port: 0,
   heartbeatMs: 100,
+  acknowledgedContextRetentionMs: 86_400_000,
   sources: [
     {
       token: "source-secret",
@@ -414,6 +415,76 @@ describe("relay HTTP API", () => {
     }
     abort.abort();
     assert.match(text, /"repositoryKey":"dynamic-repo"/);
+  });
+
+  it("acknowledges tasks and retires context keys without an enqueue race", async () => {
+    store.publish("local-1", task("1", "event-1"));
+
+    const unauthorized = await fetch(
+      `${baseUrl}/v1/connectors/local-1/tasks/1/ack`,
+      { method: "POST", headers: { authorization: "Bearer wrong" } },
+    );
+    assert.equal(unauthorized.status, 401);
+
+    const invalid = await fetch(
+      `${baseUrl}/v1/connectors/local-1/tasks/not-a-task/ack`,
+      {
+        method: "POST",
+        headers: { authorization: "Bearer connector-secret" },
+      },
+    );
+    assert.equal(invalid.status, 400);
+
+    const retirePending = await fetch(
+      `${baseUrl}/v1/connectors/local-1/context-keys/staging-2026-08`,
+      {
+        method: "DELETE",
+        headers: { authorization: "Bearer connector-secret" },
+      },
+    );
+    assert.equal(retirePending.status, 409);
+
+    const acknowledge = () =>
+      fetch(`${baseUrl}/v1/connectors/local-1/tasks/1/ack`, {
+        method: "POST",
+        headers: { authorization: "Bearer connector-secret" },
+      });
+    const acknowledged = await acknowledge();
+    assert.equal(acknowledged.status, 200);
+    assert.deepEqual(await acknowledged.json(), {
+      version: 1,
+      status: "acknowledged",
+      taskId: "1",
+    });
+    assert.equal((await acknowledge()).status, 200);
+    assert.deepEqual(await store.tasksAfter("local-1", "0", 10), []);
+
+    const retired = await fetch(
+      `${baseUrl}/v1/connectors/local-1/context-keys/staging-2026-08`,
+      {
+        method: "DELETE",
+        headers: { authorization: "Bearer connector-secret" },
+      },
+    );
+    assert.equal(retired.status, 200);
+    assert.deepEqual(await retired.json(), {
+      version: 1,
+      status: "retired",
+      keyId: "staging-2026-08",
+    });
+
+    const staleEvent = await fetch(`${baseUrl}/v1/events`, {
+      method: "POST",
+      body: JSON.stringify(event("stale-key-event")),
+      headers: {
+        authorization: "Bearer source-secret",
+        "content-type": "application/json",
+      },
+    });
+    assert.equal(staleEvent.status, 409);
+    assert.deepEqual(await staleEvent.json(), {
+      error: "context key has been retired",
+    });
   });
 
   it("rotates credentials and revokes active connector streams", async () => {

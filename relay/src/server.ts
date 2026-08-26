@@ -20,6 +20,7 @@ import type {
 const MAX_BODY_BYTES = 256 * 1024;
 const REPLAY_BATCH_SIZE = 100;
 const MAX_SEQUENCE_ID = 9_223_372_036_854_775_807n;
+const MAX_RETENTION_SWEEP_MS = 60 * 60 * 1_000;
 
 function bearerToken(request: IncomingMessage): string | undefined {
   const header = request.headers.authorization;
@@ -137,14 +138,17 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
 function lastEventId(request: IncomingMessage): string {
   const value = request.headers["last-event-id"] ?? "0";
   const result = Array.isArray(value) ? value[0] : value;
-  if (
-    result === undefined ||
-    !/^(0|[1-9]\d*)$/.test(result) ||
-    BigInt(result) > MAX_SEQUENCE_ID
-  ) {
+  if (result === undefined || !isSequenceId(result, true)) {
     throw new Error("Last-Event-ID must be a non-negative integer");
   }
   return result;
+}
+
+function isSequenceId(value: string, allowZero = false): boolean {
+  return (
+    (allowZero ? /^(0|[1-9]\d*)$/u : /^[1-9]\d*$/u).test(value) &&
+    BigInt(value) <= MAX_SEQUENCE_ID
+  );
 }
 
 function writeTask(response: ServerResponse, task: RelayTask): void {
@@ -239,6 +243,22 @@ export function createRelayServer(options: {
   };
   const unsubscribeCredentialChanges =
     store.subscribeCredentialChanges(credentialChanged);
+  const sweepAcknowledgedContext = (): void => {
+    const before = new Date(
+      Date.now() - config.acknowledgedContextRetentionMs,
+    ).toISOString();
+    void store.purgeAcknowledgedContext(before).catch((error: unknown) => {
+      console.error("Acknowledged context cleanup failed", error);
+    });
+  };
+  const retentionSweep = setInterval(
+    sweepAcknowledgedContext,
+    Math.min(
+      config.acknowledgedContextRetentionMs,
+      MAX_RETENTION_SWEEP_MS,
+    ),
+  );
+  retentionSweep.unref();
 
   const server = createServer(async (request, response) => {
     try {
@@ -398,11 +418,89 @@ export function createRelayServer(options: {
           source,
           event: envelope.event,
         });
+        if (result.status === "retired-key") {
+          sendJson(response, 409, { error: "context key has been retired" });
+          return;
+        }
         const body =
           "task" in result
             ? { status: result.status, taskId: result.task?.id }
             : { status: result.status };
         sendJson(response, result.status === "queued" ? 201 : 202, body);
+        return;
+      }
+
+      const acknowledgementMatch =
+        request.method === "POST"
+          ? /^\/v1\/connectors\/([^/]+)\/tasks\/([^/]+)\/ack$/.exec(
+              url.pathname,
+            )
+          : null;
+      if (acknowledgementMatch) {
+        const connectorId = decodeURIComponent(acknowledgementMatch[1] ?? "");
+        const taskId = decodeURIComponent(acknowledgementMatch[2] ?? "");
+        if (!isSequenceId(taskId)) {
+          sendJson(response, 400, { error: "task ID must be a positive integer" });
+          return;
+        }
+        if (
+          !(await connectorIsAuthorized(
+            request,
+            connectorId,
+            config.connectors,
+            store,
+          ))
+        ) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (!(await store.acknowledgeTask(connectorId, taskId))) {
+          sendJson(response, 404, { error: "task not found" });
+          return;
+        }
+        sendJson(
+          response,
+          200,
+          { version: 1, status: "acknowledged", taskId },
+          { "cache-control": "no-store" },
+        );
+        return;
+      }
+
+      const retirementMatch =
+        request.method === "DELETE"
+          ? /^\/v1\/connectors\/([^/]+)\/context-keys\/([^/]+)$/.exec(
+              url.pathname,
+            )
+          : null;
+      if (retirementMatch) {
+        const connectorId = decodeURIComponent(retirementMatch[1] ?? "");
+        const keyId = decodeURIComponent(retirementMatch[2] ?? "");
+        if (keyId === "" || keyId !== keyId.trim() || keyId.length > 200) {
+          sendJson(response, 400, { error: "context key ID is invalid" });
+          return;
+        }
+        if (
+          !(await connectorIsAuthorized(
+            request,
+            connectorId,
+            config.connectors,
+            store,
+          ))
+        ) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        if (!(await store.retireContextKey(connectorId, keyId))) {
+          sendJson(response, 409, { error: "context key is still referenced" });
+          return;
+        }
+        sendJson(
+          response,
+          200,
+          { version: 1, status: "retired", keyId },
+          { "cache-control": "no-store" },
+        );
         return;
       }
 
@@ -464,6 +562,9 @@ export function createRelayServer(options: {
       }
     }
   });
-  server.once("close", unsubscribeCredentialChanges);
+  server.once("close", () => {
+    clearInterval(retentionSweep);
+    unsubscribeCredentialChanges();
+  });
   return server;
 }

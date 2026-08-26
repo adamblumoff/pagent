@@ -11,10 +11,13 @@ import {
 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { parseEnv, promisify } from "node:util";
+import { promisify } from "node:util";
 
 import { probeCodexAppServer } from "./codex.js";
-import { parseConnectorKeyring } from "./config.js";
+import {
+  readExistingContextKeys,
+  retireUnusedContextKeys,
+} from "./key-rotation.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_ENVIRONMENTS = ["staging"] as const;
@@ -179,11 +182,6 @@ export async function runProjectInit(
       `Pagent generated an encryption key ID that conflicts with an existing key. Run \`pagent init --reset\` again.`,
     );
   }
-  // The relay has no acknowledgement watermark yet, so only retention is safe.
-  const keyring = JSON.stringify({
-    ...retainedContextKeys,
-    [contextKeyId]: pending.contextKey,
-  });
   if (previousPending === undefined) await writePendingInit(pendingPath, pending);
 
   try {
@@ -198,6 +196,24 @@ export async function runProjectInit(
     }
     throw error;
   }
+
+  const activeContextKeys =
+    options.reset === true
+      ? await retireUnusedContextKeys(
+          {
+            relayUrl,
+            connectorId: pending.connectorId,
+            connectorToken: pending.connectorToken,
+            keys: retainedContextKeys,
+          },
+          dependencies.fetch ?? defaultFetch,
+          dependencies.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        )
+      : retainedContextKeys;
+  const keyring = JSON.stringify({
+    ...activeContextKeys,
+    [contextKeyId]: pending.contextKey,
+  });
 
   const { connectorId, sourceToken, connectorToken, contextKey } = pending;
   const files: SetupFile[] = [
@@ -690,37 +706,6 @@ function encryptionKeyId(key: string): string {
 
 function encode(value: Uint8Array): string {
   return Buffer.from(value).toString("base64url");
-}
-
-async function readExistingContextKeys(
-  path: string,
-): Promise<Record<string, string>> {
-  const invalid = () =>
-    new Error(
-      `Pagent cannot rotate credentials because ${path} does not contain a valid PAGENT_CONTEXT_KEYS keyring. Restore that file or revoke the connector before initializing again.`,
-    );
-  const contents = await readOptionalText(path);
-  if (contents === undefined) throw invalid();
-
-  let serialized: string | undefined;
-  try {
-    serialized = parseEnv(contents).PAGENT_CONTEXT_KEYS;
-  } catch {
-    throw invalid();
-  }
-  if (serialized === undefined) throw invalid();
-
-  let value: unknown;
-  try {
-    value = JSON.parse(serialized);
-  } catch {
-    throw invalid();
-  }
-  try {
-    return { ...parseConnectorKeyring(value) };
-  } catch {
-    throw invalid();
-  }
 }
 
 async function readPendingInit(path: string): Promise<PendingInit | undefined> {

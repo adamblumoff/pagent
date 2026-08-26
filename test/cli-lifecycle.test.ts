@@ -37,6 +37,7 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
       config: {
         port: 0,
         heartbeatMs: 100,
+        acknowledgedContextRetentionMs: 86_400_000,
         sources: [],
         connectors: [],
         adminToken: "admin-secret",
@@ -110,10 +111,6 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
 
       const originalConnectorId = enrolled!.connectorId;
       const originalSourceHash = enrolled!.sourceTokenHash;
-      const originalKeyring = JSON.parse(local.PAGENT_CONTEXT_KEYS!) as Record<
-        string,
-        string
-      >;
       const originalKeyId = cloud.PAGENT_ENCRYPTION_KEY_ID!;
       const rotationCode = await runCli(
         [
@@ -165,9 +162,9 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
       const rotatedKeyId = rotatedCloud.PAGENT_ENCRYPTION_KEY_ID!;
       expect(rotatedKeyId).not.toBe(originalKeyId);
       expect(rotatedKeyring).toEqual({
-        [originalKeyId]: originalKeyring[originalKeyId],
         [rotatedKeyId]: rotatedCloud.PAGENT_ENCRYPTION_KEY,
       });
+      expect(rotatedKeyring).not.toHaveProperty(originalKeyId);
 
       const revoke = await runCli(
         [

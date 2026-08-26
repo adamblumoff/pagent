@@ -202,6 +202,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
       15_000,
       "PAGENT_SSE_HEARTBEAT_MS",
     ),
+    acknowledgedContextRetentionMs: positiveInteger(
+      env.PAGENT_ACKNOWLEDGED_CONTEXT_RETENTION_MS,
+      86_400_000,
+      "PAGENT_ACKNOWLEDGED_CONTEXT_RETENTION_MS",
+    ),
     sources,
     connectors,
     ...(adminToken === undefined ? {} : { adminToken }),

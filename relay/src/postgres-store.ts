@@ -123,11 +123,30 @@ export class PostgresRelayStore implements RelayStore {
         event_id TEXT NOT NULL UNIQUE REFERENCES pagent_events(event_id),
         connector_id TEXT NOT NULL,
         repository_key TEXT NOT NULL,
+        acknowledged_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      ALTER TABLE pagent_tasks
+        ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
+
+      CREATE TABLE IF NOT EXISTS pagent_retired_context_keys (
+        connector_id TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        retired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (connector_id, key_id)
       );
 
       CREATE INDEX IF NOT EXISTS pagent_tasks_connector_id_id_idx
         ON pagent_tasks (connector_id, id);
+
+      CREATE INDEX IF NOT EXISTS pagent_tasks_unacknowledged_idx
+        ON pagent_tasks (connector_id, id)
+        WHERE acknowledged_at IS NULL;
+
+      CREATE INDEX IF NOT EXISTS pagent_tasks_acknowledged_at_idx
+        ON pagent_tasks (acknowledged_at)
+        WHERE acknowledged_at IS NOT NULL;
 
       ALTER TABLE pagent_events
         ADD COLUMN IF NOT EXISTS investigation_cooldown_ms BIGINT NOT NULL DEFAULT 0;
@@ -164,7 +183,7 @@ export class PostgresRelayStore implements RelayStore {
         DROP COLUMN IF EXISTS payload;
 
       ALTER TABLE pagent_events
-        ALTER COLUMN encrypted_context SET NOT NULL;
+        ALTER COLUMN encrypted_context DROP NOT NULL;
 
       ALTER TABLE pagent_tasks
         DROP COLUMN IF EXISTS prompt;
@@ -368,6 +387,23 @@ export class PostgresRelayStore implements RelayStore {
     const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
+      const contextLock = JSON.stringify([
+        input.source.connectorId,
+        input.event.context.keyId,
+      ]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+        contextLock,
+      ]);
+      const retired = await client.query(
+        `SELECT 1
+           FROM pagent_retired_context_keys
+          WHERE connector_id = $1 AND key_id = $2`,
+        [input.source.connectorId, input.event.context.keyId],
+      );
+      if ((retired.rowCount ?? 0) > 0) {
+        await client.query("COMMIT");
+        return { status: "retired-key" };
+      }
       const routeKey = JSON.stringify([
         input.source.connectorId,
         input.source.repositoryKey,
@@ -406,7 +442,7 @@ export class PostgresRelayStore implements RelayStore {
                   e.repository_key, e.encrypted_context
              FROM pagent_events e
              JOIN pagent_tasks t ON t.event_id = e.event_id
-            WHERE e.event_id = $1`,
+            WHERE e.event_id = $1 AND t.acknowledged_at IS NULL`,
           [input.event.id],
         );
         await client.query("COMMIT");
@@ -505,12 +541,65 @@ export class PostgresRelayStore implements RelayStore {
               e.repository_key, e.encrypted_context
          FROM pagent_tasks t
          JOIN pagent_events e ON e.event_id = t.event_id
-        WHERE t.connector_id = $1 AND t.id > $2::bigint
+        WHERE t.connector_id = $1
+          AND t.id > $2::bigint
+          AND t.acknowledged_at IS NULL
         ORDER BY t.id ASC
         LIMIT $3`,
       [connectorId, lastEventId, limit],
     );
     return result.rows.map(taskFromRow);
+  }
+
+  async acknowledgeTask(connectorId: string, taskId: string): Promise<boolean> {
+    const result = await this.#pool.query(
+      `UPDATE pagent_tasks
+          SET acknowledged_at = COALESCE(acknowledged_at, NOW())
+        WHERE connector_id = $1 AND id = $2::bigint
+        RETURNING id`,
+      [connectorId, taskId],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async retireContextKey(connectorId: string, keyId: string): Promise<boolean> {
+    return this.#transaction(async (client) => {
+      const contextLock = JSON.stringify([connectorId, keyId]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+        contextLock,
+      ]);
+      const referenced = await client.query(
+        `SELECT 1
+           FROM pagent_tasks t
+           JOIN pagent_events e ON e.event_id = t.event_id
+          WHERE t.connector_id = $1
+            AND t.acknowledged_at IS NULL
+            AND e.encrypted_context->>'keyId' = $2
+          LIMIT 1`,
+        [connectorId, keyId],
+      );
+      if ((referenced.rowCount ?? 0) > 0) return false;
+      await client.query(
+        `INSERT INTO pagent_retired_context_keys (connector_id, key_id)
+         VALUES ($1, $2)
+         ON CONFLICT (connector_id, key_id) DO NOTHING`,
+        [connectorId, keyId],
+      );
+      return true;
+    });
+  }
+
+  async purgeAcknowledgedContext(before: string): Promise<number> {
+    const result = await this.#pool.query(
+      `UPDATE pagent_events e
+          SET encrypted_context = NULL
+         FROM pagent_tasks t
+        WHERE t.event_id = e.event_id
+          AND t.acknowledged_at < $1::timestamptz
+          AND e.encrypted_context IS NOT NULL`,
+      [before],
+    );
+    return result.rowCount ?? 0;
   }
 
   subscribe(connectorId: string, listener: () => void): () => void {

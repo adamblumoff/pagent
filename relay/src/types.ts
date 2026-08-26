@@ -38,6 +38,7 @@ export interface ConnectorCredential {
 export interface RelayConfig {
   port: number;
   heartbeatMs: number;
+  acknowledgedContextRetentionMs: number;
   sources: readonly SourceRoute[];
   connectors: readonly ConnectorCredential[];
   adminToken?: string;
@@ -87,7 +88,8 @@ export interface RelayTask {
 export type EnqueueResult =
   | { status: "queued"; task: RelayTask }
   | { status: "duplicate"; task?: RelayTask }
-  | { status: "cooldown" };
+  | { status: "cooldown" }
+  | { status: "retired-key" };
 
 export interface RelayStore {
   initialize(): Promise<void>;
@@ -105,6 +107,9 @@ export interface RelayStore {
     lastEventId: string,
     limit: number,
   ): Promise<RelayTask[]>;
+  acknowledgeTask(connectorId: string, taskId: string): Promise<boolean>;
+  retireContextKey(connectorId: string, keyId: string): Promise<boolean>;
+  purgeAcknowledgedContext(before: string): Promise<number>;
   subscribe(connectorId: string, listener: () => void): () => void;
   subscribeCredentialChanges(
     listener: (connectorId: string) => void,

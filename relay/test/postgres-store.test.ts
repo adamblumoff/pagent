@@ -52,6 +52,7 @@ function input(
     cooldownMs?: number;
     group?: string;
     route?: SourceRoute;
+    keyId?: string;
   } = {},
 ): EnqueueInput {
   return {
@@ -67,7 +68,7 @@ function input(
       },
       context: {
         algorithm: "A256GCM",
-        keyId: "staging-2026-08",
+        keyId: options.keyId ?? "staging-2026-08",
         iv: "AAECAwQFBgcICQoL",
         ciphertext: "AAECAwQFBgcICQoLDA0ODw",
       },
@@ -82,7 +83,11 @@ function schemaConnectionString(connectionString: string, schema: string): strin
 }
 
 async function withStore(
-  run: (store: PostgresRelayStore) => Promise<void>,
+  run: (
+    store: PostgresRelayStore,
+    pool: pg.Pool,
+    schema: string,
+  ) => Promise<void>,
   seed?: (pool: pg.Pool, schema: string) => Promise<void>,
 ): Promise<void> {
   assert.ok(databaseUrl);
@@ -96,7 +101,7 @@ async function withStore(
       schemaConnectionString(databaseUrl, schema),
     );
     await store.initialize();
-    await run(store);
+    await run(store, admin, schema);
   } finally {
     await store?.close().catch(() => undefined);
     await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
@@ -261,6 +266,44 @@ describe(
         assert.deepEqual(
           localTwo.map((task) => [task.id, task.eventId]),
           [["3", "event-3"]],
+        );
+      });
+    });
+
+    it("acknowledges tasks, clears retained ciphertext, and fences retired keys", async () => {
+      await withStore(async (store, pool, schema) => {
+        const queued = await store.enqueue(
+          input("retained-event", { keyId: "key-old" }),
+        );
+        assert.equal(queued.status, "queued");
+        const taskId = queued.status === "queued" ? queued.task.id : "";
+
+        assert.equal(await store.retireContextKey("local-1", "key-old"), false);
+        assert.equal(await store.acknowledgeTask("local-2", taskId), false);
+        assert.equal(await store.acknowledgeTask("local-1", taskId), true);
+        assert.equal(await store.acknowledgeTask("local-1", taskId), true);
+        assert.deepEqual(await store.tasksAfter("local-1", "0", 10), []);
+        assert.equal(await store.retireContextKey("local-1", "key-old"), true);
+
+        assert.deepEqual(
+          await store.enqueue(input("stale-event", { keyId: "key-old" })),
+          { status: "retired-key" },
+        );
+        assert.equal(
+          await store.purgeAcknowledgedContext(
+            new Date(Date.now() + 1_000).toISOString(),
+          ),
+          1,
+        );
+        const retained = await pool.query<{ encrypted_context: unknown }>(
+          `SELECT encrypted_context
+             FROM ${schema}.pagent_events
+            WHERE event_id = 'retained-event'`,
+        );
+        assert.equal(retained.rows[0]?.encrypted_context, null);
+        assert.deepEqual(
+          await store.enqueue(input("retained-event", { keyId: "key-old" })),
+          { status: "retired-key" },
         );
       });
     });

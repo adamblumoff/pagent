@@ -44,6 +44,8 @@ export class RecordingRelayStore implements RelayStore {
   >();
   readonly #revoked = new Set<string>();
   readonly #tasks: StoredTask[] = [];
+  readonly #acknowledged = new Set<string>();
+  readonly #retiredKeys = new Set<string>();
   healthError: Error | undefined;
 
   async initialize(): Promise<void> {}
@@ -153,6 +155,13 @@ export class RecordingRelayStore implements RelayStore {
 
   async enqueue(input: EnqueueInput): Promise<EnqueueResult> {
     this.enqueues.push(input);
+    if (
+      this.#retiredKeys.has(
+        contextKey(input.source.connectorId, input.event.context.keyId),
+      )
+    ) {
+      return { status: "retired-key" };
+    }
     return (
       this.enqueueResults.shift() ?? {
         status: "queued",
@@ -170,10 +179,40 @@ export class RecordingRelayStore implements RelayStore {
     return this.#tasks
       .filter(
         (entry) =>
-          entry.connectorId === connectorId && BigInt(entry.task.id) > cursor,
+          entry.connectorId === connectorId &&
+          BigInt(entry.task.id) > cursor &&
+          !this.#acknowledged.has(taskKey(connectorId, entry.task.id)),
       )
       .slice(0, limit)
       .map((entry) => entry.task);
+  }
+
+  async acknowledgeTask(connectorId: string, taskId: string): Promise<boolean> {
+    if (
+      !this.#tasks.some(
+        (entry) => entry.connectorId === connectorId && entry.task.id === taskId,
+      )
+    ) {
+      return false;
+    }
+    this.#acknowledged.add(taskKey(connectorId, taskId));
+    return true;
+  }
+
+  async retireContextKey(connectorId: string, keyId: string): Promise<boolean> {
+    const referenced = this.#tasks.some(
+      (entry) =>
+        entry.connectorId === connectorId &&
+        entry.task.context.keyId === keyId &&
+        !this.#acknowledged.has(taskKey(connectorId, entry.task.id)),
+    );
+    if (referenced) return false;
+    this.#retiredKeys.add(contextKey(connectorId, keyId));
+    return true;
+  }
+
+  async purgeAcknowledgedContext(_before: string): Promise<number> {
+    return 0;
   }
 
   subscribe(connectorId: string, listener: () => void): () => void {
@@ -218,6 +257,14 @@ export class RecordingRelayStore implements RelayStore {
       queueMicrotask(() => listener(connectorId));
     }
   }
+}
+
+function taskKey(connectorId: string, taskId: string): string {
+  return `${connectorId}\0${taskId}`;
+}
+
+function contextKey(connectorId: string, keyId: string): string {
+  return `${connectorId}\0${keyId}`;
 }
 
 function sameEnrollment(left: EnrollmentInput, right: EnrollmentInput): boolean {

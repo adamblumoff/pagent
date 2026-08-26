@@ -109,7 +109,7 @@ describe("runDoctor", () => {
 
     expect(check(report, "inbox")).toMatchObject({
       status: "pass",
-      detail: expect.stringContaining("migrate to v3"),
+      detail: expect.stringContaining("migrate to v4"),
     });
   });
 

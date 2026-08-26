@@ -10,6 +10,7 @@ describe("relay config", () => {
       {
         port: 3000,
         heartbeatMs: 15_000,
+        acknowledgedContextRetentionMs: 86_400_000,
         sources: [],
         connectors: [],
         adminToken: "admin-secret",
@@ -38,6 +39,7 @@ describe("relay config", () => {
       { id: "connector", token: "connector-secret" },
     ]);
     assert.equal(config.adminToken, undefined);
+    assert.equal(config.acknowledgedContextRetentionMs, 86_400_000);
   });
 
   it("rejects an inert config and incomplete static credentials", () => {
@@ -53,6 +55,14 @@ describe("relay config", () => {
     assert.throws(
       () => loadConfig({ PAGENT_ENROLLMENT_TOKEN: "legacy" }),
       /no longer supported/i,
+    );
+    assert.throws(
+      () =>
+        loadConfig({
+          PAGENT_ADMIN_TOKEN: "admin-secret",
+          PAGENT_ACKNOWLEDGED_CONTEXT_RETENTION_MS: "0",
+        }),
+      /positive integer/,
     );
   });
 });

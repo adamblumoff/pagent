@@ -176,7 +176,7 @@ async function pendingTaskCount(inboxPath: string): Promise<number> {
       typeof value === "object" &&
       value !== null &&
       "version" in value &&
-      (value.version === 2 || value.version === 3) &&
+      (value.version === 2 || value.version === 3 || value.version === 4) &&
       "pending" in value &&
       Array.isArray(value.pending)
     ) {

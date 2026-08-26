@@ -33,17 +33,20 @@ describe("relay connector", () => {
     const results: string[] = [];
     const connections: boolean[] = [];
     const relayTask = await task("1");
-    const fetchRelay = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      expect(init?.method).toBe("GET");
-      expect(new Headers(init?.headers).get("authorization")).toBe(
-        "Bearer connector-secret",
-      );
-      expect(new Headers(init?.headers).get("accept")).toBe(
-        "text/event-stream",
-      );
-      expect(new Headers(init?.headers).has("last-event-id")).toBe(false);
-      return sseResponse(relayTask, [7, 13, 5]);
-    });
+    const fetchRelay = connectorFetch(
+      () => sseResponse(relayTask, [7, 13, 5]),
+      (_url, init) => {
+        expect(init?.method).toBe("GET");
+        expect(new Headers(init?.headers).get("authorization")).toBe(
+          "Bearer connector-secret",
+        );
+        expect(new Headers(init?.headers).get("accept")).toBe(
+          "text/event-stream",
+        );
+        expect(new Headers(init?.headers).has("last-event-id")).toBe(false);
+      },
+      "connector-secret",
+    );
     const inboxPath = await temporaryInbox();
     const connector = createRelayConnector({
       ...connectorOptions(inboxPath, recordingAgent(requests)),
@@ -57,7 +60,7 @@ describe("relay connector", () => {
 
     await connector.runOnce();
 
-    expect(fetchRelay).toHaveBeenCalledTimes(1);
+    expect(fetchRelay).toHaveBeenCalledTimes(2);
     expect(requests).toHaveLength(1);
     expect(requests[0]).toEqual({
       cwd: resolve("."),
@@ -76,9 +79,10 @@ describe("relay connector", () => {
     expect(requests[0]?.prompt).toContain("Event ID: event-1");
     expect(requests[0]?.prompt).toContain('"reason": "pool exhausted"');
     expect(JSON.parse(await readFile(inboxPath, "utf8"))).toEqual({
-      version: 3,
+      version: 4,
       cursor: "1",
       pending: [],
+      acknowledgements: [],
     });
     expect(results).toEqual(["thread-1"]);
     expect(connections).toEqual([true, false]);
@@ -101,7 +105,7 @@ describe("relay connector", () => {
     expect(inbox).not.toContain("pool exhausted");
     expect(inbox).not.toContain("payload");
     expect(JSON.parse(inbox)).toMatchObject({
-      version: 3,
+      version: 4,
       cursor: "2",
       pending: [
         {
@@ -161,7 +165,7 @@ describe("relay connector", () => {
     const olderTask = await task("3");
     const first = createRelayConnector({
       ...connectorOptions(inboxPath, recordingAgent(requests)),
-      fetch: vi.fn(async () => sseResponse(relayTask)) as typeof fetch,
+      fetch: connectorFetch(() => sseResponse(relayTask)),
     });
     await first.runOnce();
 
@@ -181,9 +185,10 @@ describe("relay connector", () => {
     expect(secondFetch).toHaveBeenCalledTimes(1);
     expect(requests).toHaveLength(1);
     expect(JSON.parse(await readFile(inboxPath, "utf8"))).toEqual({
-      version: 3,
+      version: 4,
       cursor: "4",
       pending: [],
+      acknowledgements: [],
     });
   });
 
@@ -211,13 +216,13 @@ describe("relay connector", () => {
       fetch: vi.fn(async () => sseResponse(relayTask)) as typeof fetch,
     });
 
-    await connector.runOnce();
+    await expect(connector.runOnce()).rejects.toThrow(message);
 
     expect(requests).toHaveLength(0);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toEqual(
-      expect.objectContaining({ message: expect.stringContaining(message) }),
-    );
+    expect(errors).toHaveLength(0);
+    expect(JSON.parse(await readFile(inboxPath, "utf8"))).toMatchObject({
+      pending: [{ id }],
+    });
   });
 
   it.each([
@@ -289,7 +294,7 @@ describe("relay connector", () => {
       encryption: {
         keys: { "key-b": CURRENT_KEY, "key-a": PREVIOUS_KEY },
       },
-      fetch: vi.fn(async () => emptySseResponse()) as typeof fetch,
+      fetch: connectorFetch(() => emptySseResponse()),
     });
 
     await rotated.runOnce();
@@ -297,9 +302,10 @@ describe("relay connector", () => {
     expect(requests).toHaveLength(1);
     expect(requests[0]?.event.payload).toEqual({ reason: "pool exhausted" });
     expect(JSON.parse(await readFile(inboxPath, "utf8"))).toEqual({
-      version: 3,
+      version: 4,
       cursor: "10",
       pending: [],
+      acknowledgements: [],
     });
   });
 
@@ -317,9 +323,11 @@ describe("relay connector", () => {
     await expect(failing.runOnce()).rejects.toBe(failure);
 
     const requests: AgentRequest[] = [];
-    const recoveryFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    const recoveryFetch = connectorFetch(() => emptySseResponse(), (
+      _url,
+      init,
+    ) => {
       expect(new Headers(init?.headers).get("last-event-id")).toBe("11");
-      return emptySseResponse();
     });
     const recovered = createRelayConnector({
       ...connectorOptions(inboxPath, recordingAgent(requests)),
@@ -330,7 +338,56 @@ describe("relay connector", () => {
 
     expect(requests).toHaveLength(1);
     expect(requests[0]?.event.id).toBe("event-11");
-    expect(recoveryFetch).toHaveBeenCalledTimes(1);
+    expect(recoveryFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a failed acknowledgement without running Codex twice", async () => {
+    const inboxPath = await temporaryInbox();
+    const relayTask = await task("14");
+    const requests: AgentRequest[] = [];
+    const failedAcknowledgement = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit) =>
+        init?.method === "POST"
+          ? new Response(null, { status: 503 })
+          : sseResponse(relayTask),
+    ) as typeof fetch;
+    const first = createRelayConnector({
+      ...connectorOptions(inboxPath, recordingAgent(requests)),
+      fetch: failedAcknowledgement,
+    });
+
+    await expect(first.runOnce()).rejects.toThrow(
+      "Relay acknowledgement failed with status 503",
+    );
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(await readFile(inboxPath, "utf8"))).toEqual({
+      version: 4,
+      cursor: "14",
+      pending: [],
+      acknowledgements: ["14"],
+    });
+
+    const methods: string[] = [];
+    const recovered = createRelayConnector({
+      ...connectorOptions(inboxPath, recordingAgent(requests)),
+      fetch: vi.fn(async (_input, init) => {
+        methods.push(init?.method ?? "GET");
+        return init?.method === "POST"
+          ? new Response(null, { status: 200 })
+          : emptySseResponse();
+      }) as typeof fetch,
+    });
+
+    await recovered.runOnce();
+
+    expect(methods).toEqual(["POST", "GET"]);
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(await readFile(inboxPath, "utf8"))).toEqual({
+      version: 4,
+      cursor: "14",
+      pending: [],
+      acknowledgements: [],
+    });
   });
 
   it("migrates v2 state while preserving its cursor and pending task", async () => {
@@ -357,9 +414,10 @@ describe("relay connector", () => {
     await expect(connector.runOnce()).rejects.toBe(failure);
 
     expect(JSON.parse(await readFile(inboxPath, "utf8"))).toEqual({
-      version: 3,
+      version: 4,
       cursor: "12",
       pending: [relayTask],
+      acknowledgements: [],
     });
   });
 
@@ -383,9 +441,10 @@ describe("relay connector", () => {
       expect.objectContaining({ message: "Relay task 13 has an invalid shape." }),
     ]);
     expect(JSON.parse(await readFile(inboxPath, "utf8"))).toEqual({
-      version: 3,
+      version: 4,
       cursor: "13",
       pending: [],
+      acknowledgements: [],
     });
 
     const fetchRelay = vi.fn(
@@ -508,6 +567,27 @@ function emptySseResponse(): Response {
   return new Response(": heartbeat\n\n", {
     headers: { "content-type": "text/event-stream" },
   });
+}
+
+function connectorFetch(
+  sse: () => Response,
+  inspectSse?: (input: string | URL | Request, init?: RequestInit) => void,
+  token = "secret",
+): typeof fetch {
+  return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      expect(input.toString()).toMatch(/\/tasks\/[1-9]\d*\/ack$/u);
+      expect(new Headers(init.headers).get("authorization")).toBe(
+        `Bearer ${token}`,
+      );
+      return new Response(
+        JSON.stringify({ version: 1, status: "acknowledged" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    inspectSse?.(input, init);
+    return sse();
+  }) as typeof fetch;
 }
 
 function flipFirstCharacter(value: string): string {

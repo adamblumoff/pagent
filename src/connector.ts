@@ -53,9 +53,10 @@ export interface RelayConnector {
 }
 
 interface InboxState {
-  version: 3;
+  version: 4;
   cursor?: string;
   pending: RelayTask[];
+  acknowledgements: string[];
 }
 
 const MAX_SEQUENCE_ID = 9_223_372_036_854_775_807n;
@@ -108,9 +109,24 @@ class FileInbox {
     return (await this.#load()).pending[0];
   }
 
-  async complete(id: string): Promise<void> {
+  async markAgentCompleted(id: string): Promise<void> {
     const state = await this.#load();
     state.pending = state.pending.filter((task) => task.id !== id);
+    if (!state.acknowledgements.includes(id)) {
+      state.acknowledgements.push(id);
+    }
+    await this.#save();
+  }
+
+  async nextAcknowledgement(): Promise<string | undefined> {
+    return (await this.#load()).acknowledgements[0];
+  }
+
+  async markAcknowledged(id: string): Promise<void> {
+    const state = await this.#load();
+    state.acknowledgements = state.acknowledgements.filter(
+      (acknowledgement) => acknowledgement !== id,
+    );
     await this.#save();
   }
 
@@ -126,12 +142,12 @@ class FileInbox {
       if (!isNodeError(error) || error.code !== "ENOENT") {
         throw error;
       }
-      this.#state = { version: 3, pending: [] };
+      this.#state = { version: 4, pending: [], acknowledgements: [] };
       return this.#state;
     }
 
     this.#state = inboxState(parsed);
-    if (record(parsed)?.version === 2) {
+    if (record(parsed)?.version === 2 || record(parsed)?.version === 3) {
       await this.#save();
     }
 
@@ -224,6 +240,7 @@ class DefaultRelayConnector implements RelayConnector {
 
     let connected = false;
     try {
+      await this.#drainAcknowledgements(options.signal);
       await this.#drainInbox(options.signal);
       const cursor = await this.#inbox.cursor();
       const headers = new Headers({
@@ -282,10 +299,7 @@ class DefaultRelayConnector implements RelayConnector {
     while (task !== undefined) {
       const rejection = this.#policyRejection(task);
       if (rejection !== undefined) {
-        await this.#inbox.complete(task.id);
-        this.#report(rejection);
-        task = await this.#inbox.next();
-        continue;
+        throw rejection;
       }
 
       const metadata: PagentEventMetadata = {
@@ -321,7 +335,7 @@ class DefaultRelayConnector implements RelayConnector {
         event,
         ...(signal === undefined ? {} : { signal }),
       });
-      await this.#inbox.complete(task.id);
+      await this.#inbox.markAgentCompleted(task.id);
       if (this.#onAgentResult !== undefined) {
         try {
           await this.#onAgentResult(result, task);
@@ -329,7 +343,36 @@ class DefaultRelayConnector implements RelayConnector {
           this.#report(error);
         }
       }
+      await this.#acknowledge(task.id, signal);
+      await this.#inbox.markAcknowledged(task.id);
       task = await this.#inbox.next();
+    }
+  }
+
+  async #drainAcknowledgements(
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    let taskId = await this.#inbox.nextAcknowledgement();
+    while (taskId !== undefined) {
+      await this.#acknowledge(taskId, signal);
+      await this.#inbox.markAcknowledged(taskId);
+      taskId = await this.#inbox.nextAcknowledgement();
+    }
+  }
+
+  async #acknowledge(
+    taskId: string,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const response = await this.#fetch(taskAcknowledgementUrl(this.#url, taskId), {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.#token}` },
+      ...(signal === undefined ? {} : { signal }),
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Relay acknowledgement failed with status ${response.status}.`,
+      );
     }
   }
 
@@ -538,10 +581,13 @@ function relayTask(message: SseMessage): RelayTask {
 function inboxState(value: unknown): InboxState {
   const state = record(value);
   if (
-    (state?.version !== 2 && state?.version !== 3) ||
+    (state?.version !== 2 && state?.version !== 3 && state?.version !== 4) ||
     !Array.isArray(state.pending) ||
     !state.pending.every(isRelayTask) ||
     (state.cursor !== undefined && !isTaskId(state.cursor)) ||
+    (state.version === 4 &&
+      (!Array.isArray(state.acknowledgements) ||
+        !state.acknowledgements.every(isTaskId))) ||
     (state.version === 2 &&
       (!Array.isArray(state.completed) ||
         !state.completed.every((id) => typeof id === "string")))
@@ -550,10 +596,21 @@ function inboxState(value: unknown): InboxState {
   }
 
   return {
-    version: 3,
+    version: 4,
     ...(state.cursor === undefined ? {} : { cursor: state.cursor }),
     pending: state.pending,
+    acknowledgements:
+      state.version === 4 ? state.acknowledgements as string[] : [],
   };
+}
+
+function taskAcknowledgementUrl(eventsUrl: string, taskId: string): string {
+  const url = new URL(eventsUrl);
+  if (!url.pathname.endsWith("/events")) {
+    throw new Error("Relay connector URL must end with /events.");
+  }
+  url.pathname = `${url.pathname.slice(0, -"/events".length)}/tasks/${encodeURIComponent(taskId)}/ack`;
+  return url.toString();
 }
 
 function isRelayTask(value: unknown): value is RelayTask {

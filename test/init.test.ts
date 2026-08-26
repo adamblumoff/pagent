@@ -178,7 +178,7 @@ describe("project initialization", () => {
         connectorId: first.connectorId,
         environments: ["production"],
       },
-      dependencies(successfulFetch("rotated"), 90),
+      dependencies(successfulFetch("rotated", "referenced"), 90),
     );
     expect(reset.environments).toEqual(["production"]);
     expect(await readFile(reset.configPath, "utf8")).toContain(
@@ -383,11 +383,30 @@ function initOptions(root: string): {
   };
 }
 
-function successfulFetch(status: "enrolled" | "rotated" = "enrolled") {
-  return vi.fn<EnrollmentFetch>().mockResolvedValue({
-    ok: true,
-    status: 201,
-    json: async () => ({ status }),
+function successfulFetch(
+  status: "enrolled" | "rotated" = "enrolled",
+  retirement: "retired" | "referenced" = "retired",
+) {
+  return vi.fn<EnrollmentFetch>(async (input, init) => {
+    if (init.method === "DELETE") {
+      const keyId = decodeURIComponent(new URL(input).pathname.split("/").at(-1)!);
+      return retirement === "retired"
+        ? {
+            ok: true,
+            status: 200,
+            json: async () => ({ version: 1, status: "retired", keyId }),
+          }
+        : {
+            ok: false,
+            status: 409,
+            json: async () => ({ error: "context key is still referenced" }),
+          };
+    }
+    return {
+      ok: true,
+      status: 201,
+      json: async () => ({ status }),
+    };
   });
 }
 

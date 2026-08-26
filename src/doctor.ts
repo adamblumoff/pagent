@@ -258,7 +258,7 @@ async function checkInbox(
     );
   }
   const value = record(storage.value);
-  if (value?.version !== 2 && value?.version !== 3) {
+  if (value?.version !== 2 && value?.version !== 3 && value?.version !== 4) {
     return check(
       "inbox",
       "Encrypted inbox",
@@ -270,7 +270,8 @@ async function checkInbox(
   }
   if (
     !Array.isArray(value.pending) ||
-    (value.version === 2 && !Array.isArray(value.completed))
+    (value.version === 2 && !Array.isArray(value.completed)) ||
+    (value.version === 4 && !Array.isArray(value.acknowledgements))
   ) {
     return check(
       "inbox",
@@ -283,9 +284,9 @@ async function checkInbox(
     "inbox",
     "Encrypted inbox",
     "pass",
-    value.version === 2
-      ? "Inbox v2 is readable and writable and will migrate to v3 on startup."
-      : "Inbox v3 is readable and writable.",
+    value.version === 4
+      ? "Inbox v4 is readable and writable."
+      : `Inbox v${value.version} is readable and writable and will migrate to v4 on startup.`,
   );
 }
 
