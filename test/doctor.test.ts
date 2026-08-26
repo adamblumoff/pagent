@@ -9,6 +9,7 @@ import {
   type DoctorDependencies,
   type DoctorInput,
 } from "../src/doctor.js";
+import { PAGENT_VERSION } from "../src/version.js";
 
 const KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
@@ -20,6 +21,9 @@ describe("runDoctor", () => {
       if (init?.signal) signals.push(init.signal);
       if (url.endsWith("/health")) {
         return Response.json({ status: "ok" });
+      }
+      if (url.endsWith("/v1/metadata")) {
+        return Response.json(relayMetadata());
       }
       expect(new Headers(init?.headers).get("authorization")).toBe(
         "Bearer connector-secret",
@@ -40,16 +44,21 @@ describe("runDoctor", () => {
       "repositories",
       "inbox",
       "relay.health",
+      "relay.compatibility",
       "relay.sse",
       "codex",
       "sandbox.runtime",
       "sandbox",
     ]);
     expect(report.checks.every(({ status }) => status === "pass")).toBe(true);
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(signals).toHaveLength(2);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(signals).toHaveLength(3);
     expect(signals[0]?.aborted).toBe(false);
     expect(signals[1]?.aborted).toBe(true);
+    expect(signals[2]?.aborted).toBe(true);
+    expect(check(report, "relay.compatibility").detail).toBe(
+      `CLI ${PAGENT_VERSION} supports relay protocol 1; SDK event protocol 2 is accepted.`,
+    );
     expect(probeCodex).toHaveBeenCalledWith({
       timeoutMs: 5_000,
       sandbox: { cwd: "/repo", mode: "read-only" },
@@ -67,6 +76,9 @@ describe("runDoctor", () => {
 
     expect(check(report, "config").status).toBe("fail");
     expect(check(report, "relay.health")).toMatchObject({ status: "warn" });
+    expect(check(report, "relay.compatibility")).toMatchObject({
+      status: "warn",
+    });
     expect(check(report, "relay.sse")).toMatchObject({ status: "warn" });
     expect(report.ok).toBe(false);
     expect(fetch).not.toHaveBeenCalled();
@@ -127,7 +139,77 @@ describe("runDoctor", () => {
     expect(check(report, "relay.sse").detail).toBe(
       "Relay connector authentication returned HTTP 401.",
     );
+    expect(check(report, "relay.compatibility")).toMatchObject({
+      status: "fail",
+      detail: "Relay metadata returned HTTP 401.",
+      remediation: expect.stringContaining("/v1/metadata"),
+    });
     expect(JSON.stringify(report)).not.toContain("connector-secret");
+  });
+
+  it("reports malformed relay metadata with an upgrade path", async () => {
+    const fetch = relayFetch(Response.json({ relayProtocol: "one" }));
+    const report = await runDoctor(input(), dependencies({ fetch }));
+
+    expect(check(report, "relay.compatibility")).toMatchObject({
+      status: "fail",
+      detail: "Relay metadata response is malformed.",
+      remediation: expect.stringContaining("Update the relay"),
+    });
+  });
+
+  it("rejects relay and event protocol drift", async () => {
+    const relayDrift = await runDoctor(
+      input(),
+      dependencies({
+        fetch: relayFetch(
+          Response.json({ ...relayMetadata(), relayProtocol: 2 }),
+        ),
+      }),
+    );
+    expect(check(relayDrift, "relay.compatibility")).toMatchObject({
+      status: "fail",
+      detail: expect.stringContaining("Relay protocol 2 is incompatible"),
+      remediation: expect.stringContaining("supports relay protocol 2"),
+    });
+
+    const eventDrift = await runDoctor(
+      input(),
+      dependencies({
+        fetch: relayFetch(
+          Response.json({
+            ...relayMetadata(),
+            eventProtocol: { min: 3, max: 4 },
+          }),
+        ),
+      }),
+    );
+    expect(check(eventDrift, "relay.compatibility")).toMatchObject({
+      status: "fail",
+      detail: expect.stringContaining("SDK event protocol 2"),
+      remediation: expect.stringContaining("3-4"),
+    });
+  });
+
+  it("distinguishes unreachable metadata from invalid metadata", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async (request) => {
+      if (request.toString().endsWith("/v1/metadata")) {
+        throw new TypeError("network details must not leak");
+      }
+      return request.toString().endsWith("/health")
+        ? Response.json({ status: "ok" })
+        : new Response(new ReadableStream(), {
+            headers: { "content-type": "text/event-stream" },
+          });
+    });
+    const report = await runDoctor(input(), dependencies({ fetch }));
+
+    expect(check(report, "relay.compatibility")).toMatchObject({
+      status: "fail",
+      detail: "Relay metadata could not be reached before the timeout.",
+      remediation: expect.stringContaining("network connection"),
+    });
+    expect(JSON.stringify(report)).not.toContain("network details");
   });
 
   it("keeps the write-capable sandbox advisory", async () => {
@@ -275,15 +357,29 @@ function dependencies(
       expect(mode & constants.R_OK).not.toBe(0);
     }),
     readFile: vi.fn(async () => ""),
-    fetch: vi.fn<typeof globalThis.fetch>(async (request) =>
-      request.toString().endsWith("/health")
-        ? Response.json({ status: "ok" })
-        : new Response(new ReadableStream(), {
-            headers: { "content-type": "text/event-stream" },
-          }),
-    ),
+    fetch: relayFetch(Response.json(relayMetadata())),
     probeCodex: vi.fn(async () => undefined),
     ...overrides,
+  };
+}
+
+function relayFetch(metadataResponse: Response) {
+  return vi.fn<typeof globalThis.fetch>(async (request) => {
+    const url = request.toString();
+    if (url.endsWith("/health")) return Response.json({ status: "ok" });
+    if (url.endsWith("/v1/metadata")) return metadataResponse.clone();
+    return new Response(new ReadableStream(), {
+      headers: { "content-type": "text/event-stream" },
+    });
+  });
+}
+
+function relayMetadata() {
+  return {
+    version: 1,
+    serviceVersion: "0.1.0",
+    relayProtocol: 1,
+    eventProtocol: { min: 2, max: 2 },
   };
 }
 

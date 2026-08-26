@@ -308,7 +308,7 @@ export class RecordingRelayStore implements RelayStore {
     return true;
   }
 
-  async purgeAcknowledgedContext(_before: string): Promise<number> {
+  async purgeExpiredContext(_before: string): Promise<number> {
     return 0;
   }
 

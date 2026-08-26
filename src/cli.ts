@@ -35,8 +35,8 @@ import {
   localStatePaths,
   type LocalStatePaths,
 } from "./local-state.js";
+import { PAGENT_VERSION } from "./version.js";
 
-const VERSION = "0.0.0";
 const DAEMON_ENVIRONMENT_KEY = "PAGENT_INTERNAL_DAEMON";
 const START_RECEIPT_TIMEOUT_MS = 15_000;
 
@@ -70,7 +70,7 @@ async function main(): Promise<void> {
       console.log(renderCliHelp(command.command));
       return;
     case "version":
-      console.log(VERSION);
+      console.log(PAGENT_VERSION);
       return;
     case "init":
       await initCommand(command);

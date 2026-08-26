@@ -752,14 +752,20 @@ export class PostgresRelayStore implements RelayStore {
     });
   }
 
-  async purgeAcknowledgedContext(before: string): Promise<number> {
+  async purgeExpiredContext(before: string): Promise<number> {
     const result = await this.#pool.query(
       `UPDATE pagent_events e
           SET encrypted_context = NULL
-         FROM pagent_tasks t
-        WHERE t.event_id = e.event_id
-          AND t.acknowledged_at < $1::timestamptz
-          AND e.encrypted_context IS NOT NULL`,
+        WHERE e.encrypted_context IS NOT NULL
+          AND (
+            (e.outcome = 'cooldown' AND e.received_at < $1::timestamptz)
+            OR EXISTS (
+              SELECT 1
+                FROM pagent_tasks t
+               WHERE t.event_id = e.event_id
+                 AND t.acknowledged_at < $1::timestamptz
+            )
+          )`,
       [before],
     );
     return result.rowCount ?? 0;

@@ -1,0 +1,102 @@
+name: Private release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: pagent_test
+          POSTGRES_USER: pagent
+          POSTGRES_PASSWORD: pagent
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pagent -d pagent_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.17.1 --activate
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          npm ci --prefix relay
+          pnpm setup:e2e:frameworks
+
+      - name: Validate types and builds
+        run: |
+          pnpm typecheck
+          pnpm typecheck:e2e:frameworks
+          pnpm build
+
+      - name: Run unit and release tests
+        run: |
+          pnpm test
+          pnpm test:release
+
+      - name: Test PostgreSQL store
+        run: npm --prefix relay run test:postgres
+        env:
+          PAGENT_TEST_DATABASE_URL: postgresql://pagent:pagent@127.0.0.1:5432/pagent_test
+
+      - name: Test framework consumers
+        run: pnpm test:e2e:frameworks
+
+      - name: Test Bun consumer
+        run: pnpm smoke:bun
+
+      - name: Build release artifacts
+        run: |
+          pnpm release:build -- --tag "$GITHUB_REF_NAME"
+          pnpm release:build -- --tag "$GITHUB_REF_NAME" \
+            --out-dir .release-check \
+            --skip-build
+          diff --recursive --brief release .release-check
+
+      - name: Create private GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --clobber
+          else
+            release_flags=(--verify-tag --generate-notes --title "$GITHUB_REF_NAME")
+            if [[ "$GITHUB_REF_NAME" == *-rc.* ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" release/* \
+              "${release_flags[@]}"
+          fi

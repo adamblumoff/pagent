@@ -1,3 +1,5 @@
+import type { EVENT_PROTOCOL_VERSION } from "./version.js";
+
 export interface EncryptedContext {
   algorithm: "A256GCM";
   keyId: string;
@@ -6,7 +8,7 @@ export interface EncryptedContext {
 }
 
 export interface EventEnvelope {
-  version: 2;
+  version: typeof EVENT_PROTOCOL_VERSION;
   event: {
     id: string;
     type: string;
@@ -173,7 +175,7 @@ export interface RelayStore {
   ): Promise<boolean>;
   acknowledgeTask(connectorId: string, taskId: string): Promise<boolean>;
   retireContextKey(connectorId: string, keyId: string): Promise<boolean>;
-  purgeAcknowledgedContext(before: string): Promise<number>;
+  purgeExpiredContext(before: string): Promise<number>;
   subscribe(connectorId: string, listener: () => void): () => void;
   subscribeCredentialChanges(
     listener: (connectorId: string) => void,

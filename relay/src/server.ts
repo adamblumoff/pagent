@@ -8,6 +8,7 @@ import {
   parseEventEnvelope,
 } from "./domain.js";
 import { relayTaskErrorCodes } from "./types.js";
+import { RELAY_METADATA } from "./version.js";
 import type {
   ConnectorCredential,
   EventEnvelope,
@@ -339,7 +340,7 @@ export function createRelayServer(options: {
     const before = new Date(
       Date.now() - config.acknowledgedContextRetentionMs,
     ).toISOString();
-    void store.purgeAcknowledgedContext(before).catch((error: unknown) => {
+    void store.purgeExpiredContext(before).catch((error: unknown) => {
       console.error("Acknowledged context cleanup failed", error);
     });
   };
@@ -364,6 +365,13 @@ export function createRelayServer(options: {
           console.error("Relay health check failed", error);
           sendJson(response, 503, { status: "unavailable" });
         }
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/v1/metadata") {
+        sendJson(response, 200, RELAY_METADATA, {
+          "cache-control": "public, max-age=300",
+        });
         return;
       }
 

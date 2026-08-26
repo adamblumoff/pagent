@@ -1,9 +1,19 @@
 {
   "name": "pagent",
-  "version": "0.0.0",
+  "version": "0.1.0-rc.1",
+  "description": "Turn selected application failures into proactive local Codex investigations.",
   "private": true,
   "type": "module",
   "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adamblumoff/pagent.git"
+  },
+  "packageManager": "pnpm@10.17.1",
   "engines": {
     "node": ">=22"
   },
@@ -32,6 +42,8 @@
     "typecheck:e2e:frameworks": "pnpm --dir test/e2e/frameworks --recursive typecheck",
     "test:e2e:frameworks": "pnpm build:sdk && pnpm --dir test/e2e/frameworks --recursive build && vitest run --config vitest.e2e.config.ts",
     "smoke:bun": "pnpm build:sdk && bun test/runtime/bun-smoke.mjs",
+    "test:release": "node --test scripts/release/*.test.mjs",
+    "release:build": "node scripts/release/build-release.mjs",
     "typecheck": "pnpm typecheck:cloud && pnpm build:sdk && pnpm typecheck:consumers && tsc --noEmit && pnpm --filter pagent-demo typecheck && npm --prefix relay run typecheck"
   },
   "devDependencies": {

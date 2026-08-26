@@ -432,7 +432,7 @@ describe(
           { status: "retired-key" },
         );
         assert.equal(
-          await store.purgeAcknowledgedContext(
+          await store.purgeExpiredContext(
             new Date(Date.now() + 1_000).toISOString(),
           ),
           1,
@@ -446,6 +446,56 @@ describe(
         assert.deepEqual(
           await store.enqueue(input("retained-event", { keyId: "key-old" })),
           { status: "retired-key" },
+        );
+      });
+    });
+
+    it("clears suppressed ciphertext without deleting event history", async () => {
+      await withStore(async (store, pool, schema) => {
+        assert.equal(
+          (
+            await store.enqueue(
+              input("queued-event", {
+                cooldownMs: 60_000,
+                keyId: "cooldown-key",
+              }),
+            )
+          ).status,
+          "queued",
+        );
+        assert.equal(
+          (
+            await store.enqueue(
+              input("suppressed-event", {
+                cooldownMs: 60_000,
+                keyId: "cooldown-key",
+              }),
+            )
+          ).status,
+          "cooldown",
+        );
+
+        assert.equal(
+          await store.purgeExpiredContext(
+            new Date(Date.now() + 60_000).toISOString(),
+          ),
+          1,
+        );
+
+        const contexts = await pool.query<{
+          encrypted_context: unknown;
+          event_id: string;
+        }>(
+          `SELECT event_id, encrypted_context
+             FROM ${schema}.pagent_events
+            WHERE event_id IN ('queued-event', 'suppressed-event')
+            ORDER BY event_id`,
+        );
+        assert.notEqual(contexts.rows[0]?.encrypted_context, null);
+        assert.equal(contexts.rows[1]?.encrypted_context, null);
+        assert.equal(
+          (await store.findEvent("local-1", "suppressed-event"))?.status,
+          "suppressed",
         );
       });
     });

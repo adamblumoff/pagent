@@ -6,6 +6,9 @@ coverage/
 .wrangler/
 *.tsbuildinfo
 .pagent/
+.release-check/
+.tmp-release-*/
+/release/
 *.log
 .env*
 !.env.example

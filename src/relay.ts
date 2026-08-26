@@ -7,6 +7,7 @@ import type {
   RelayTransportRequest,
   RelayTransportResponse,
 } from "./types.js";
+import { EVENT_PROTOCOL_VERSION } from "./version.js";
 
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_ENVELOPE_BYTES = 64 * 1024;
@@ -48,7 +49,10 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
   }
 
   return async (event) => {
-    const envelope: RelayEventEnvelope = { version: 2, event };
+    const envelope: RelayEventEnvelope = {
+      version: EVENT_PROTOCOL_VERSION,
+      event,
+    };
     let body: string;
     try {
       body = JSON.stringify(envelope);
