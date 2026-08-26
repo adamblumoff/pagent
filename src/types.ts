@@ -94,6 +94,11 @@ export interface PagentDeliveryError extends Error {
   statusCode?: number | undefined;
 }
 
+export interface PagentDeliveryReceipt {
+  eventId: string;
+  deliveredAt: string;
+}
+
 export interface EncryptedContext {
   algorithm: "A256GCM";
   keyId: string;
@@ -179,6 +184,7 @@ export interface PagentOptions {
   environment?: string | undefined;
   relay?: RelayOptions | undefined;
   encryption?: PagentEncryptionOptions | undefined;
+  onDelivery?: ((receipt: PagentDeliveryReceipt) => void) | undefined;
   onDeliveryError?: ((error: PagentDeliveryError) => void) | undefined;
 }
 

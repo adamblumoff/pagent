@@ -12,6 +12,7 @@ export {
   type PagentClient,
   type PagentDeliveryError,
   type PagentDeliveryErrorCode,
+  type PagentDeliveryReceipt,
   type PagentEncryptionOptions,
   type PagentOptions,
   type RelayOptions,

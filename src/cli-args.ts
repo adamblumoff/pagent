@@ -5,6 +5,7 @@ export const cliCommandNames = [
   "start",
   "stop",
   "status",
+  "events",
   "logs",
   "doctor",
   "help",
@@ -12,6 +13,18 @@ export const cliCommandNames = [
 ] as const;
 
 export type CliCommandName = (typeof cliCommandNames)[number];
+
+export const eventLifecycleStatuses = [
+  "queued",
+  "received",
+  "running",
+  "retrying",
+  "needs-attention",
+  "completed",
+  "suppressed",
+] as const;
+
+export type EventLifecycleStatus = (typeof eventLifecycleStatuses)[number];
 
 export type CliCommand =
   | {
@@ -47,6 +60,19 @@ export type CliCommand =
     }
   | {
       name: "status";
+      json: boolean;
+    }
+  | {
+      name: "events";
+      action: "list";
+      limit: number;
+      status: EventLifecycleStatus | undefined;
+      json: boolean;
+    }
+  | {
+      name: "events";
+      action: "show";
+      eventId: string;
       json: boolean;
     }
   | {
@@ -128,6 +154,16 @@ Show connector state and relay connectivity.
 Options:
   --json      Print machine-readable JSON
   -h, --help  Show help for status`,
+  events: `Usage: pagent events [options]
+       pagent events show <event-id> [--json]
+
+List recent event handoffs or inspect one event.
+
+Options:
+  --limit <count>    Number of events to show from 1 to 100 (default: 20)
+  --status <status>  Filter by lifecycle status
+  --json             Print machine-readable JSON
+  -h, --help         Show help for events`,
   logs: `Usage: pagent logs [options]
 
 Read logs from the background connector.
@@ -162,6 +198,7 @@ Commands:
   start       Start the connector (background by default)
   stop        Stop the connector gracefully
   status      Show connector state
+  events      Show recent event handoffs
   logs        Read connector logs
   doctor      Check the local setup without changing it
   help        Show help for a command
@@ -221,6 +258,8 @@ export function parseCliArgs(args: readonly string[]): CliCommand {
       return { name: "stop" };
     case "status":
       return { name: "status", json: parseBooleanFlag(first, rest, "--json") };
+    case "events":
+      return parseEvents(rest);
     case "logs":
       return parseLogs(rest);
     case "doctor":
@@ -484,6 +523,71 @@ function parseLogs(args: readonly string[]): CliCommand {
   }
 
   return { name: "logs", follow, lines };
+}
+
+function parseEvents(args: readonly string[]): CliCommand {
+  if (args[0] === "show") {
+    return parseEventShow(args.slice(1));
+  }
+
+  let limit = 20;
+  let status: EventLifecycleStatus | undefined;
+  let json = false;
+  let hasLimit = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "--json") {
+      json = setOnce("events", arg, json);
+      continue;
+    }
+
+    const option = valueOption(arg, ["--limit", "--status"]);
+    if (!option) rejectCommandArg("events", arg);
+    if (option.flag === "--limit" && hasLimit) {
+      throw duplicateOption("events", option.flag);
+    }
+    if (option.flag === "--status" && status !== undefined) {
+      throw duplicateOption("events", option.flag);
+    }
+
+    const value = optionValue(option, args[index + 1]);
+    if (option.inlineValue === undefined) index += 1;
+    if (option.flag === "--limit") {
+      limit = parsePositiveInteger(option.flag, value);
+      if (limit > 100) {
+        throw new CliUsageError('Option "--limit" cannot exceed 100.');
+      }
+      hasLimit = true;
+    } else {
+      status = parseEventLifecycleStatus(value);
+    }
+  }
+
+  return { name: "events", action: "list", limit, status, json };
+}
+
+function parseEventShow(args: readonly string[]): CliCommand {
+  const eventId = args[0];
+  if (eventId === undefined || eventId.startsWith("-")) {
+    throw new CliUsageError("Usage: pagent events show <event-id> [--json].");
+  }
+
+  return {
+    name: "events",
+    action: "show",
+    eventId,
+    json: parseBooleanFlag("events", args.slice(1), "--json"),
+  };
+}
+
+function parseEventLifecycleStatus(value: string): EventLifecycleStatus {
+  if ((eventLifecycleStatuses as readonly string[]).includes(value)) {
+    return value as EventLifecycleStatus;
+  }
+  throw new CliUsageError(
+    `Option "--status" must be one of: ${eventLifecycleStatuses.join(", ")}.`,
+  );
 }
 
 function parseHelp(args: readonly string[]): CliCommand {

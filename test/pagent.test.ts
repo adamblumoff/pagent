@@ -63,6 +63,33 @@ describe("Pagent", () => {
     });
   });
 
+  it("reports the accepted event ID without changing the wrapped return", async () => {
+    const relayFetch = successfulRelay();
+    const receipts: Array<{ eventId: string; deliveredAt: string }> = [];
+    const pagent = createPagent({
+      enabled: true,
+      environment: "staging",
+      relay: relayOptions(),
+      encryption: encryptionOptions(),
+      onDelivery: (receipt) => receipts.push(receipt),
+    });
+    const observed = pagent.observe(() => "application result", {
+      event: healthFailed,
+      on: "result",
+      triggerWhen: () => true,
+      context: () => ({ reason: "pool exhausted" }),
+    });
+
+    expect(observed()).toBe("application result");
+    await pagent.flush();
+
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({ eventId: eventBody(relayFetch).id });
+    expect(new Date(receipts[0]!.deliveredAt).toISOString()).toBe(
+      receipts[0]!.deliveredAt,
+    );
+  });
+
   it.each([
     { name: "disabled", enabled: false, environment: "staging" },
     { name: "missing environment", enabled: true, environment: undefined },

@@ -2,7 +2,15 @@ import { readFile } from "node:fs/promises";
 
 import { codexAgent } from "./codex.js";
 import type { ConnectorConfig } from "./config.js";
-import { createRelayConnector } from "./connector.js";
+import {
+  createRelayConnector,
+  type RelayTask,
+  type RelayTaskLifecycleUpdate,
+} from "./connector.js";
+import {
+  FileHandoffHistory,
+  type HandoffHistoryRecord,
+} from "./handoff-history.js";
 import {
   startLocalControlServer,
   type LocalDaemonStatus,
@@ -37,6 +45,7 @@ export async function runLocalConnector(
     relayConnected: false,
     pendingTasks: 0,
   };
+  const history = new FileHandoffHistory(options.paths.historyPath);
   let ready = false;
   let resolveReady: (() => void) | undefined;
   let rejectReady: ((error: Error) => void) | undefined;
@@ -57,10 +66,7 @@ export async function runLocalConnector(
   await ensureLocalStateDirectory(options.paths);
   const control = await startLocalControlServer({
     endpoint: options.paths.controlEndpoint,
-    getStatus: async () => ({
-      ...status,
-      pendingTasks: await pendingTaskCount(options.paths.inboxPath),
-    }),
+    getStatus: () => daemonStatus(status, options.paths.inboxPath, history),
     onStop: stop,
   });
 
@@ -80,6 +86,8 @@ export async function runLocalConnector(
       environments: options.config.environments,
       encryption: options.config.encryption,
       agent: codexAgent(options.config.codex),
+      onTaskLifecycle: (update, task) =>
+        recordTaskLifecycle(history, update, task),
       onConnectionChange: (connected) => {
         status.relayConnected = connected;
         if (connected) {
@@ -95,19 +103,17 @@ export async function runLocalConnector(
         }
       },
       onAgentResult: (result, task) => {
-        status.lastHandoff = {
-          eventType: task.type,
-          completedAt: new Date().toISOString(),
-          ...(result.threadId === undefined ? {} : { threadId: result.threadId }),
-        };
         log(
           `[pagent] ${task.type} diagnosis thread: ${result.threadId ?? "unknown"}`,
         );
       },
       onError: (error) => {
         const message = safeErrorMessage(error);
-        status.lastError = { message, occurredAt: new Date().toISOString() };
         log(`[pagent] connector error: ${message}`);
+        status.lastError = {
+          message,
+          occurredAt: new Date().toISOString(),
+        };
         if (!ready) {
           rejectReady?.(new Error(message));
         }
@@ -120,10 +126,9 @@ export async function runLocalConnector(
         firstConnection,
         options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS,
       );
-      await options.onReady?.({
-        ...status,
-        pendingTasks: await pendingTaskCount(options.paths.inboxPath),
-      });
+      await options.onReady?.(
+        await daemonStatus(status, options.paths.inboxPath, history),
+      );
       await connectorRun;
     } catch (error) {
       abort.abort();
@@ -135,6 +140,112 @@ export async function runLocalConnector(
     process.off("SIGTERM", onSignal);
     await control.close();
   }
+}
+
+async function daemonStatus(
+  status: LocalDaemonStatus,
+  inboxPath: string,
+  history: FileHandoffHistory,
+): Promise<LocalDaemonStatus> {
+  const records = await history.list();
+  const lastHandoff = records.find((record) => record.status === "completed");
+  const lastError = records.find(
+    (record) =>
+      record.status === "retrying" && record.lastErrorMessage !== undefined,
+  );
+  const handoffError =
+    lastError?.lastErrorMessage === undefined
+      ? undefined
+      : {
+          message: lastError.lastErrorMessage,
+          occurredAt: lastError.lastAttemptAt ?? lastError.receivedAt,
+        };
+  const latestError = newerError(status.lastError, handoffError);
+  return {
+    ...status,
+    pendingTasks: await pendingTaskCount(inboxPath),
+    ...(lastHandoff?.completedAt === undefined
+      ? {}
+      : {
+          lastHandoff: {
+            eventType: lastHandoff.eventType,
+            completedAt: lastHandoff.completedAt,
+            ...(lastHandoff.threadId === undefined
+              ? {}
+              : { threadId: lastHandoff.threadId }),
+          },
+        }),
+    ...(latestError === undefined ? {} : { lastError: latestError }),
+  };
+}
+
+function newerError(
+  first: LocalDaemonStatus["lastError"],
+  second: LocalDaemonStatus["lastError"],
+): LocalDaemonStatus["lastError"] {
+  if (first === undefined) return second;
+  if (second === undefined) return first;
+  return Date.parse(first.occurredAt) >= Date.parse(second.occurredAt)
+    ? first
+    : second;
+}
+
+async function recordTaskLifecycle(
+  history: FileHandoffHistory,
+  update: RelayTaskLifecycleUpdate,
+  task: RelayTask,
+): Promise<void> {
+  let record = await history.findByEventId(task.eventId);
+  if (record === undefined) {
+    record = await history.upsert({
+      taskId: task.id,
+      eventId: task.eventId,
+      eventType: task.type,
+      environment: task.environment,
+      status: "received",
+      attempts: 0,
+      receivedAt: update.occurredAt,
+    });
+  }
+
+  const patch = lifecyclePatch(record, update);
+  if (patch !== undefined) {
+    await history.update(task.id, patch);
+  }
+}
+
+function lifecyclePatch(
+  record: HandoffHistoryRecord,
+  update: RelayTaskLifecycleUpdate,
+): Parameters<FileHandoffHistory["update"]>[1] | undefined {
+  if (update.status === "received") {
+    return undefined;
+  }
+  if (update.status === "running") {
+    return {
+      status: "running",
+      attempts: record.attempts + 1,
+      startedAt: record.startedAt ?? update.occurredAt,
+      lastAttemptAt: update.occurredAt,
+      lastErrorCode: undefined,
+      lastErrorMessage: undefined,
+    };
+  }
+  if (update.status === "retrying") {
+    return {
+      status: "retrying",
+      lastAttemptAt: update.occurredAt,
+      lastErrorCode: update.errorCode,
+      lastErrorMessage: update.errorMessage,
+    };
+  }
+  return {
+    status: "completed",
+    completedAt: update.occurredAt,
+    lastErrorCode: undefined,
+    lastErrorMessage: undefined,
+    ...(update.threadId === undefined ? {} : { threadId: update.threadId }),
+  };
 }
 
 function connectorEventsUrl(baseUrl: string, connectorId: string): string {

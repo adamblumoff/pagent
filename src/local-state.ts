@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 
 export interface LocalStatePaths {
   directory: string;
+  historyPath: string;
   inboxPath: string;
   logPath: string;
   controlEndpoint: string;
@@ -34,6 +35,7 @@ export function localStatePaths(
 
   return {
     directory,
+    historyPath: join(directory, "handoffs.json"),
     inboxPath: join(directory, "inbox.json"),
     logPath: join(directory, "connector.log"),
     controlEndpoint:

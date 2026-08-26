@@ -7,8 +7,12 @@ import type {
   EnrollmentResult,
   EnqueueInput,
   EnqueueResult,
+  RelayEventCursor,
+  RelayEventHistoryRecord,
+  RelayEventSummary,
   RelayStore,
   RelayTask,
+  RelayTaskProgress,
   SourceAuthorization,
 } from "./types.js";
 
@@ -26,6 +30,23 @@ interface TaskRow {
   investigation_group: string | null;
   repository_key: string;
   encrypted_context: EncryptedContext;
+}
+
+interface EventSummaryRow {
+  event_id: string;
+  event_type: string;
+  environment: string;
+  occurred_at: Date;
+  received_at: Date;
+  cursor_received_at: string;
+  outcome: "queued" | "cooldown";
+  task_id: string | null;
+  received_locally_at: Date | null;
+  started_at: Date | null;
+  attempt_count: number;
+  last_attempt_at: Date | null;
+  last_error_code: RelayEventSummary["lastErrorCode"] | null;
+  acknowledged_at: Date | null;
 }
 
 interface EnrollmentRow {
@@ -57,6 +78,55 @@ function taskFromRow(row: TaskRow): RelayTask {
     context: row.encrypted_context,
   };
 }
+
+function eventSummaryFromRow(row: EventSummaryRow): RelayEventSummary {
+  const status =
+    row.outcome === "cooldown"
+      ? "suppressed"
+      : row.acknowledged_at !== null
+        ? "completed"
+        : row.last_error_code !== null
+          ? "retrying"
+          : row.started_at !== null
+            ? "running"
+            : row.received_locally_at !== null
+              ? "received"
+              : "queued";
+  return {
+    eventId: row.event_id,
+    type: row.event_type,
+    environment: row.environment,
+    occurredAt: row.occurred_at.toISOString(),
+    receivedAt: row.received_at.toISOString(),
+    status,
+    attemptCount: row.attempt_count,
+    ...(row.task_id === null ? {} : { taskId: row.task_id }),
+    ...(row.received_locally_at === null
+      ? {}
+      : { receivedLocallyAt: row.received_locally_at.toISOString() }),
+    ...(row.started_at === null
+      ? {}
+      : { startedAt: row.started_at.toISOString() }),
+    ...(row.last_attempt_at === null
+      ? {}
+      : { lastAttemptAt: row.last_attempt_at.toISOString() }),
+    ...(row.last_error_code === null
+      ? {}
+      : { lastErrorCode: row.last_error_code }),
+    ...(row.acknowledged_at === null
+      ? {}
+      : { completedAt: row.acknowledged_at.toISOString() }),
+  };
+}
+
+const EVENT_SUMMARY_SELECT = `
+  SELECT e.event_id, e.event_type, e.environment, e.occurred_at, e.received_at,
+         to_char(e.received_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_received_at,
+         e.outcome, t.id::text AS task_id, t.received_locally_at, t.started_at,
+         COALESCE(t.attempt_count, 0)::int AS attempt_count, t.last_attempt_at,
+         t.last_error_code, t.acknowledged_at
+    FROM pagent_events e
+    LEFT JOIN pagent_tasks t ON t.event_id = e.event_id`;
 
 export class PostgresRelayStore implements RelayStore {
   readonly #pool: pg.Pool;
@@ -123,12 +193,29 @@ export class PostgresRelayStore implements RelayStore {
         event_id TEXT NOT NULL UNIQUE REFERENCES pagent_events(event_id),
         connector_id TEXT NOT NULL,
         repository_key TEXT NOT NULL,
+        received_locally_at TIMESTAMPTZ,
+        started_at TIMESTAMPTZ,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TIMESTAMPTZ,
+        last_error_code TEXT CHECK (
+          last_error_code IS NULL OR last_error_code IN (
+            'policy_rejected', 'context_unavailable', 'codex_failed',
+            'connector_stopped', 'unknown'
+          )
+        ),
         acknowledged_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
       ALTER TABLE pagent_tasks
         ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ;
+
+      ALTER TABLE pagent_tasks
+        ADD COLUMN IF NOT EXISTS received_locally_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS last_error_code TEXT;
 
       CREATE TABLE IF NOT EXISTS pagent_retired_context_keys (
         connector_id TEXT NOT NULL,
@@ -147,6 +234,9 @@ export class PostgresRelayStore implements RelayStore {
       CREATE INDEX IF NOT EXISTS pagent_tasks_acknowledged_at_idx
         ON pagent_tasks (acknowledged_at)
         WHERE acknowledged_at IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS pagent_events_connector_history_idx
+        ON pagent_events (connector_id, received_at DESC, event_id DESC);
 
       ALTER TABLE pagent_events
         ADD COLUMN IF NOT EXISTS investigation_cooldown_ms BIGINT NOT NULL DEFAULT 0;
@@ -551,10 +641,83 @@ export class PostgresRelayStore implements RelayStore {
     return result.rows.map(taskFromRow);
   }
 
+  async eventsBefore(
+    connectorId: string,
+    cursor: RelayEventCursor | undefined,
+    limit: number,
+  ): Promise<RelayEventHistoryRecord[]> {
+    const result = await this.#pool.query<EventSummaryRow>(
+      `${EVENT_SUMMARY_SELECT}
+        WHERE e.connector_id = $1
+          AND e.outcome IN ('queued', 'cooldown')
+          AND (
+            $2::timestamptz IS NULL OR
+            (e.received_at, e.event_id) < ($2::timestamptz, $3::text)
+          )
+        ORDER BY e.received_at DESC, e.event_id DESC
+        LIMIT $4`,
+      [connectorId, cursor?.receivedAt ?? null, cursor?.eventId ?? null, limit],
+    );
+    return result.rows.map((row) => ({
+      event: eventSummaryFromRow(row),
+      cursor: {
+        receivedAt: row.cursor_received_at,
+        eventId: row.event_id,
+      },
+    }));
+  }
+
+  async findEvent(
+    connectorId: string,
+    eventId: string,
+  ): Promise<RelayEventSummary | undefined> {
+    const result = await this.#pool.query<EventSummaryRow>(
+      `${EVENT_SUMMARY_SELECT}
+        WHERE e.connector_id = $1
+          AND e.event_id = $2
+          AND e.outcome IN ('queued', 'cooldown')`,
+      [connectorId, eventId],
+    );
+    const row = result.rows[0];
+    return row === undefined ? undefined : eventSummaryFromRow(row);
+  }
+
+  async updateTaskProgress(
+    connectorId: string,
+    taskId: string,
+    progress: RelayTaskProgress,
+  ): Promise<boolean> {
+    const update =
+      progress.status === "received"
+        ? `received_locally_at = COALESCE(received_locally_at, NOW())`
+        : progress.status === "started"
+          ? `started_at = COALESCE(started_at, NOW()),
+             received_locally_at = COALESCE(received_locally_at, NOW()),
+             attempt_count = attempt_count + 1,
+             last_attempt_at = NOW(),
+             last_error_code = NULL`
+          : `last_attempt_at = NOW(), last_error_code = $3`;
+    const parameters =
+      progress.status === "retrying"
+        ? [connectorId, taskId, progress.errorCode]
+        : [connectorId, taskId];
+    const result = await this.#pool.query(
+      `UPDATE pagent_tasks
+          SET ${update}
+        WHERE connector_id = $1
+          AND id = $2::bigint
+          AND acknowledged_at IS NULL
+        RETURNING id`,
+      parameters,
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
   async acknowledgeTask(connectorId: string, taskId: string): Promise<boolean> {
     const result = await this.#pool.query(
       `UPDATE pagent_tasks
-          SET acknowledged_at = COALESCE(acknowledged_at, NOW())
+          SET acknowledged_at = COALESCE(acknowledged_at, NOW()),
+              last_error_code = NULL
         WHERE connector_id = $1 AND id = $2::bigint
         RETURNING id`,
       [connectorId, taskId],

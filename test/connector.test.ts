@@ -9,6 +9,7 @@ import {
   createRelayConnector,
   type RelayConnectorOptions,
   type RelayTask,
+  type RelayTaskLifecycleUpdate,
 } from "../src/connector.js";
 import { encryptEventContext } from "../src/crypto.js";
 import type { PagentEventMetadata } from "../src/types.js";
@@ -31,6 +32,7 @@ describe("relay connector", () => {
   it("decrypts an allowed task and builds the read-only prompt locally", async () => {
     const requests: AgentRequest[] = [];
     const results: string[] = [];
+    const lifecycle: RelayTaskLifecycleUpdate[] = [];
     const connections: boolean[] = [];
     const relayTask = await task("1");
     const fetchRelay = connectorFetch(
@@ -54,13 +56,16 @@ describe("relay connector", () => {
       onAgentResult: (result) => {
         results.push(result.threadId ?? "unknown");
       },
+      onTaskLifecycle: (update) => {
+        lifecycle.push(update);
+      },
       onConnectionChange: (connected) => connections.push(connected),
       fetch: fetchRelay as typeof fetch,
     });
 
     await connector.runOnce();
 
-    expect(fetchRelay).toHaveBeenCalledTimes(2);
+    expect(fetchRelay).toHaveBeenCalledTimes(4);
     expect(requests).toHaveLength(1);
     expect(requests[0]).toEqual({
       cwd: resolve("."),
@@ -85,6 +90,11 @@ describe("relay connector", () => {
       acknowledgements: [],
     });
     expect(results).toEqual(["thread-1"]);
+    expect(lifecycle).toEqual([
+      expect.objectContaining({ status: "received" }),
+      expect.objectContaining({ status: "running" }),
+      expect.objectContaining({ status: "completed", threadId: "thread-1" }),
+    ]);
     expect(connections).toEqual([true, false]);
   });
 
@@ -92,11 +102,22 @@ describe("relay connector", () => {
     const relayTask = await task("2");
     const inboxPath = await temporaryInbox();
     const failure = new Error("Codex unavailable");
+    const lifecycle: RelayTaskLifecycleUpdate[] = [];
+    const progress: unknown[] = [];
     const connector = createRelayConnector({
       ...connectorOptions(inboxPath, {
         run: vi.fn(async () => Promise.reject(failure)),
       }),
-      fetch: vi.fn(async () => sseResponse(relayTask)) as typeof fetch,
+      onTaskLifecycle: (update) => {
+        lifecycle.push(update);
+      },
+      fetch: vi.fn(async (_input, init) => {
+        if (init?.method === "POST") {
+          progress.push(JSON.parse(String(init.body)));
+          return new Response(null, { status: 200 });
+        }
+        return sseResponse(relayTask);
+      }) as typeof fetch,
     });
 
     await expect(connector.runOnce()).rejects.toBe(failure);
@@ -118,6 +139,53 @@ describe("relay connector", () => {
         },
       ],
     });
+    expect(progress).toEqual([
+      { version: 1, status: "received" },
+      { version: 1, status: "started" },
+      { version: 1, status: "retrying", errorCode: "codex_failed" },
+    ]);
+    expect(lifecycle).toEqual([
+      expect.objectContaining({ status: "received" }),
+      expect.objectContaining({ status: "running" }),
+      expect.objectContaining({
+        status: "retrying",
+        errorCode: "codex_failed",
+        errorMessage: "Codex unavailable",
+      }),
+    ]);
+  });
+
+  it("does not let a stalled lifecycle endpoint prevent the Codex run", async () => {
+    const relayTask = await task("20");
+    const inboxPath = await temporaryInbox();
+    const runAgent = vi.fn(async () => ({ threadId: "thread-20" }));
+    const stalledProgress = new Promise<Response>(() => undefined);
+    const connector = createRelayConnector({
+      ...connectorOptions(inboxPath, { run: runAgent }),
+      fetch: vi.fn(async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/progress")) {
+          return stalledProgress;
+        }
+        if (init?.method === "POST") {
+          return new Response(null, { status: 200 });
+        }
+        return sseResponse(relayTask);
+      }) as typeof fetch,
+    });
+
+    await expect(
+      Promise.race([
+        connector.runOnce(),
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(
+            () => reject(new Error("Codex stayed blocked behind lifecycle reporting")),
+            2_000,
+          ),
+        ),
+      ]),
+    ).resolves.toBeUndefined();
+    expect(runAgent).toHaveBeenCalledOnce();
   });
 
   it("cancels an active agent run and leaves its encrypted task pending", async () => {
@@ -338,7 +406,7 @@ describe("relay connector", () => {
 
     expect(requests).toHaveLength(1);
     expect(requests[0]?.event.id).toBe("event-11");
-    expect(recoveryFetch).toHaveBeenCalledTimes(2);
+    expect(recoveryFetch).toHaveBeenCalledTimes(3);
   });
 
   it("retries a failed acknowledgement without running Codex twice", async () => {
@@ -576,10 +644,20 @@ function connectorFetch(
 ): typeof fetch {
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     if (init?.method === "POST") {
-      expect(input.toString()).toMatch(/\/tasks\/[1-9]\d*\/ack$/u);
       expect(new Headers(init.headers).get("authorization")).toBe(
         `Bearer ${token}`,
       );
+      if (input.toString().endsWith("/progress")) {
+        expect(new Headers(init.headers).get("content-type")).toBe(
+          "application/json",
+        );
+        expect(JSON.parse(String(init.body))).toMatchObject({ version: 1 });
+        return new Response(
+          JSON.stringify({ version: 1, status: "recorded" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      expect(input.toString()).toMatch(/\/tasks\/[1-9]\d*\/ack$/u);
       return new Response(
         JSON.stringify({ version: 1, status: "acknowledged" }),
         { status: 200, headers: { "content-type": "application/json" } },

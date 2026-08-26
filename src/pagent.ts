@@ -42,6 +42,7 @@ class Pagent implements PagentClient {
   readonly #environment: string | undefined;
   readonly #encrypt: EventContextEncryptor | undefined;
   readonly #onDeliveryError: PagentOptions["onDeliveryError"];
+  readonly #onDelivery: PagentOptions["onDelivery"];
   readonly #pending = new Set<Promise<void>>();
   readonly #relay: RelayEmitter | undefined;
 
@@ -57,6 +58,7 @@ class Pagent implements PagentClient {
         ? undefined
         : createRelayEmitter(options.relay);
     this.#onDeliveryError = options.onDeliveryError;
+    this.#onDelivery = options.onDelivery;
 
     if (this.#enabled && this.#relay === undefined) {
       throw new Error("Pagent requires a relay when enabled.");
@@ -206,6 +208,14 @@ class Pagent implements PagentClient {
       context: await this.#encrypt!(metadata, payload),
     };
     await this.#relay!(event);
+    try {
+      this.#onDelivery?.({
+        eventId: metadata.id,
+        deliveredAt: new Date().toISOString(),
+      });
+    } catch {
+      // Pagent callbacks must not affect the observed application.
+    }
   }
 
   #reportError(error: unknown): void {

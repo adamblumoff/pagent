@@ -5,14 +5,23 @@ import type {
   EnrollmentResult,
   EnqueueInput,
   EnqueueResult,
+  RelayEventCursor,
+  RelayEventHistoryRecord,
+  RelayEventSummary,
   RelayStore,
   RelayTask,
+  RelayTaskProgress,
   SourceAuthorization,
 } from "../src/types.js";
 
 interface StoredTask {
   connectorId: string;
   task: RelayTask;
+}
+
+interface StoredEvent {
+  connectorId: string;
+  summary: RelayEventSummary;
 }
 
 function taskFor(input: EnqueueInput, id: string): RelayTask {
@@ -44,6 +53,7 @@ export class RecordingRelayStore implements RelayStore {
   >();
   readonly #revoked = new Set<string>();
   readonly #tasks: StoredTask[] = [];
+  readonly #events: StoredEvent[] = [];
   readonly #acknowledged = new Set<string>();
   readonly #retiredKeys = new Set<string>();
   healthError: Error | undefined;
@@ -162,12 +172,27 @@ export class RecordingRelayStore implements RelayStore {
     ) {
       return { status: "retired-key" };
     }
-    return (
+    const result =
       this.enqueueResults.shift() ?? {
         status: "queued",
         task: taskFor(input, String(this.enqueues.length)),
-      }
-    );
+      };
+    if (result.status === "queued" || result.status === "cooldown") {
+      this.#events.push({
+        connectorId: input.source.connectorId,
+        summary: {
+          eventId: input.event.id,
+          type: input.event.type,
+          environment: input.event.environment,
+          occurredAt: input.event.occurredAt,
+          receivedAt: receivedAt(this.#events.length),
+          status: result.status === "cooldown" ? "suppressed" : "queued",
+          attemptCount: 0,
+          ...(result.status === "queued" ? { taskId: result.task.id } : {}),
+        },
+      });
+    }
+    return result;
   }
 
   async tasksAfter(
@@ -196,6 +221,78 @@ export class RecordingRelayStore implements RelayStore {
       return false;
     }
     this.#acknowledged.add(taskKey(connectorId, taskId));
+    const stored = this.#events.find(
+      (event) =>
+        event.connectorId === connectorId && event.summary.taskId === taskId,
+    );
+    if (stored !== undefined) {
+      stored.summary.status = "completed";
+      stored.summary.completedAt = receivedAt(this.#events.length);
+    }
+    return true;
+  }
+
+  async eventsBefore(
+    connectorId: string,
+    cursor: RelayEventCursor | undefined,
+    limit: number,
+  ): Promise<RelayEventHistoryRecord[]> {
+    return this.#events
+      .filter(
+        (entry) =>
+          entry.connectorId === connectorId &&
+          (cursor === undefined || beforeCursor(entry.summary, cursor)),
+      )
+      .sort((left, right) => compareEvents(right.summary, left.summary))
+      .slice(0, limit)
+      .map((entry) => ({
+        event: { ...entry.summary },
+        cursor: {
+          receivedAt: entry.summary.receivedAt,
+          eventId: entry.summary.eventId,
+        },
+      }));
+  }
+
+  async findEvent(
+    connectorId: string,
+    eventId: string,
+  ): Promise<RelayEventSummary | undefined> {
+    const stored = this.#events.find(
+      (event) =>
+        event.connectorId === connectorId && event.summary.eventId === eventId,
+    );
+    return stored === undefined ? undefined : { ...stored.summary };
+  }
+
+  async updateTaskProgress(
+    connectorId: string,
+    taskId: string,
+    progress: RelayTaskProgress,
+  ): Promise<boolean> {
+    const stored = this.#events.find(
+      (event) =>
+        event.connectorId === connectorId &&
+        event.summary.taskId === taskId &&
+        event.summary.status !== "completed",
+    );
+    if (stored === undefined) return false;
+    const now = receivedAt(this.#events.length + stored.summary.attemptCount);
+    if (progress.status === "received") {
+      stored.summary.receivedLocallyAt ??= now;
+      if (stored.summary.status === "queued") stored.summary.status = "received";
+    } else if (progress.status === "started") {
+      stored.summary.receivedLocallyAt ??= now;
+      stored.summary.startedAt ??= now;
+      stored.summary.lastAttemptAt = now;
+      stored.summary.attemptCount += 1;
+      delete stored.summary.lastErrorCode;
+      stored.summary.status = "running";
+    } else {
+      stored.summary.lastAttemptAt = now;
+      stored.summary.lastErrorCode = progress.errorCode;
+      stored.summary.status = "retrying";
+    }
     return true;
   }
 
@@ -236,6 +333,21 @@ export class RecordingRelayStore implements RelayStore {
 
   publish(connectorId: string, task: RelayTask): void {
     this.#tasks.push({ connectorId, task });
+    if (!this.#events.some((event) => event.summary.eventId === task.eventId)) {
+      this.#events.push({
+        connectorId,
+        summary: {
+          eventId: task.eventId,
+          type: task.type,
+          environment: task.environment,
+          occurredAt: task.occurredAt,
+          receivedAt: receivedAt(this.#events.length),
+          status: "queued",
+          attemptCount: 0,
+          taskId: task.id,
+        },
+      });
+    }
     for (const listener of this.#listeners.get(connectorId) ?? []) {
       queueMicrotask(listener);
     }
@@ -277,5 +389,26 @@ function sameEnrollment(left: EnrollmentInput, right: EnrollmentInput): boolean 
     left.allowedEnvironments.every(
       (environment, index) => environment === right.allowedEnvironments[index],
     )
+  );
+}
+
+function receivedAt(index: number): string {
+  return new Date(Date.UTC(2026, 7, 24, 12, 0, 0, index)).toISOString();
+}
+
+function compareEvents(left: RelayEventSummary, right: RelayEventSummary): number {
+  return (
+    left.receivedAt.localeCompare(right.receivedAt) ||
+    left.eventId.localeCompare(right.eventId)
+  );
+}
+
+function beforeCursor(
+  event: RelayEventSummary,
+  cursor: RelayEventCursor,
+): boolean {
+  return (
+    event.receivedAt < cursor.receivedAt ||
+    (event.receivedAt === cursor.receivedAt && event.eventId < cursor.eventId)
   );
 }

@@ -110,6 +110,46 @@ describe("CLI arguments", () => {
     });
   });
 
+  it("lists recent events with filters", () => {
+    expect(parseCliArgs(["events"])).toEqual({
+      name: "events",
+      action: "list",
+      limit: 20,
+      status: undefined,
+      json: false,
+    });
+    expect(
+      parseCliArgs([
+        "events",
+        "--limit=50",
+        "--status",
+        "needs-attention",
+        "--json",
+      ]),
+    ).toEqual({
+      name: "events",
+      action: "list",
+      limit: 50,
+      status: "needs-attention",
+      json: true,
+    });
+  });
+
+  it("parses event detail commands", () => {
+    expect(parseCliArgs(["events", "show", "evt_7C92"])).toEqual({
+      name: "events",
+      action: "show",
+      eventId: "evt_7C92",
+      json: false,
+    });
+    expect(parseCliArgs(["events", "show", "evt_7C92", "--json"])).toEqual({
+      name: "events",
+      action: "show",
+      eventId: "evt_7C92",
+      json: true,
+    });
+  });
+
   it("parses log tailing and line limits", () => {
     expect(parseCliArgs(["logs"])).toEqual({
       name: "logs",
@@ -230,15 +270,49 @@ describe("CLI arguments", () => {
     );
   });
 
+  it("rejects malformed event commands", () => {
+    expectUsageError(
+      ["events", "--limit", "0"],
+      'Option "--limit" requires a positive integer.',
+    );
+    expectUsageError(
+      ["events", "--limit", "101"],
+      'Option "--limit" cannot exceed 100.',
+    );
+    expectUsageError(
+      ["events", "--status", "failed"],
+      'Option "--status" must be one of: queued, received, running, retrying, needs-attention, completed, suppressed.',
+    );
+    expectUsageError(
+      ["events", "--status", "queued", "--status=completed"],
+      'Option "--status" was provided more than once for "events".',
+    );
+    expectUsageError(
+      ["events", "show"],
+      "Usage: pagent events show <event-id> [--json].",
+    );
+    expectUsageError(
+      ["events", "show", "evt_7C92", "extra"],
+      'Unexpected argument "extra" for "events".',
+    );
+    expectUsageError(
+      ["events", "show", "evt_7C92", "--limit", "5"],
+      'Unknown option "--limit" for "events".',
+    );
+  });
+
   it("renders concise general and command help", () => {
     expect(renderCliHelp()).toContain("Usage: pagent <command> [options]");
     expect(renderCliHelp()).toContain("init        Enroll this repository");
     expect(renderCliHelp()).toContain("enrollment  Create a single-use");
     expect(renderCliHelp("connector")).toContain("connector revoke");
     expect(renderCliHelp()).toContain("start       Start the connector");
+    expect(renderCliHelp()).toContain("events      Show recent event handoffs");
     expect(renderCliHelp("init")).toContain("--enrollment <code>");
     expect(renderCliHelp("start")).toContain("--foreground");
     expect(renderCliHelp("logs")).toContain("--lines <count>");
+    expect(renderCliHelp("events")).toContain("events show <event-id>");
+    expect(renderCliHelp("events")).toContain("--status <status>");
   });
 });
 

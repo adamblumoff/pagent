@@ -7,12 +7,16 @@ import {
   parseEnrollmentCodeRequest,
   parseEventEnvelope,
 } from "./domain.js";
+import { relayTaskErrorCodes } from "./types.js";
 import type {
   ConnectorCredential,
   EventEnvelope,
   RelayConfig,
+  RelayEventCursor,
+  RelayEventSummary,
   RelayStore,
   RelayTask,
+  RelayTaskProgress,
   SourceAuthorization,
   SourceRoute,
 } from "./types.js";
@@ -21,6 +25,9 @@ const MAX_BODY_BYTES = 256 * 1024;
 const REPLAY_BATCH_SIZE = 100;
 const MAX_SEQUENCE_ID = 9_223_372_036_854_775_807n;
 const MAX_RETENTION_SWEEP_MS = 60 * 60 * 1_000;
+const DEFAULT_EVENT_HISTORY_LIMIT = 20;
+const MAX_EVENT_HISTORY_LIMIT = 100;
+const MAX_CURSOR_LENGTH = 1_024;
 
 function bearerToken(request: IncomingMessage): string | undefined {
   const header = request.headers.authorization;
@@ -149,6 +156,91 @@ function isSequenceId(value: string, allowZero = false): boolean {
     (allowZero ? /^(0|[1-9]\d*)$/u : /^[1-9]\d*$/u).test(value) &&
     BigInt(value) <= MAX_SEQUENCE_ID
   );
+}
+
+function eventHistoryLimit(url: URL): number {
+  const value = url.searchParams.get("limit");
+  if (value === null) return DEFAULT_EVENT_HISTORY_LIMIT;
+  if (!/^[1-9]\d*$/u.test(value)) {
+    throw new Error("limit must be an integer from 1 to 100");
+  }
+  const limit = Number(value);
+  if (limit > MAX_EVENT_HISTORY_LIMIT) {
+    throw new Error("limit must be an integer from 1 to 100");
+  }
+  return limit;
+}
+
+function encodeEventCursor(event: RelayEventCursor): string {
+  return Buffer.from(
+    JSON.stringify([event.receivedAt, event.eventId]),
+  ).toString("base64url");
+}
+
+function decodeEventCursor(value: string | null): RelayEventCursor | undefined {
+  if (value === null) return undefined;
+  if (
+    value.length === 0 ||
+    value.length > MAX_CURSOR_LENGTH ||
+    !/^[A-Za-z0-9_-]+$/u.test(value)
+  ) {
+    throw new Error("cursor is invalid");
+  }
+  try {
+    const decoded: unknown = JSON.parse(
+      Buffer.from(value, "base64url").toString("utf8"),
+    );
+    if (
+      !Array.isArray(decoded) ||
+      decoded.length !== 2 ||
+      typeof decoded[0] !== "string" ||
+      new Date(decoded[0]).toISOString() !== decoded[0] ||
+      typeof decoded[1] !== "string" ||
+      decoded[1].length === 0 ||
+      decoded[1].length > 200
+    ) {
+      throw new Error("invalid cursor fields");
+    }
+    return { receivedAt: decoded[0], eventId: decoded[1] };
+  } catch {
+    throw new Error("cursor is invalid");
+  }
+}
+
+function parseTaskProgress(value: unknown): RelayTaskProgress {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("progress must be an object");
+  }
+  const progress = value as Record<string, unknown>;
+  const allowedKeys = new Set(["version", "status", "errorCode"]);
+  if (Object.keys(progress).some((key) => !allowedKeys.has(key))) {
+    throw new Error("progress contains an unexpected field");
+  }
+  if (
+    progress.version !== 1 ||
+    !["received", "started", "retrying"].includes(String(progress.status))
+  ) {
+    throw new Error("progress version or status is invalid");
+  }
+  const status = progress.status as RelayTaskProgress["status"];
+  if (status === "retrying") {
+    if (
+      typeof progress.errorCode !== "string" ||
+      !relayTaskErrorCodes.includes(
+        progress.errorCode as (typeof relayTaskErrorCodes)[number],
+      )
+    ) {
+      throw new Error("retrying progress requires a supported error code");
+    }
+    return {
+      status,
+      errorCode: progress.errorCode as (typeof relayTaskErrorCodes)[number],
+    };
+  }
+  if (progress.errorCode !== undefined) {
+    throw new Error("only retrying progress may include an error code");
+  }
+  return { status };
 }
 
 function writeTask(response: ServerResponse, task: RelayTask): void {
@@ -427,6 +519,137 @@ export function createRelayServer(options: {
             ? { status: result.status, taskId: result.task?.id }
             : { status: result.status };
         sendJson(response, result.status === "queued" ? 201 : 202, body);
+        return;
+      }
+
+      const eventHistoryItemMatch =
+        request.method === "GET"
+          ? /^\/v1\/connectors\/([^/]+)\/event-history\/([^/]+)$/.exec(
+              url.pathname,
+            )
+          : null;
+      if (eventHistoryItemMatch) {
+        const connectorId = decodeURIComponent(eventHistoryItemMatch[1] ?? "");
+        const eventId = decodeURIComponent(eventHistoryItemMatch[2] ?? "");
+        if (eventId === "" || eventId.length > 200) {
+          sendJson(response, 400, { error: "event ID is invalid" });
+          return;
+        }
+        if (
+          !(await connectorIsAuthorized(
+            request,
+            connectorId,
+            config.connectors,
+            store,
+          ))
+        ) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        const eventSummary = await store.findEvent(connectorId, eventId);
+        if (eventSummary === undefined) {
+          sendJson(response, 404, { error: "event not found" });
+          return;
+        }
+        sendJson(
+          response,
+          200,
+          { version: 1, event: eventSummary },
+          { "cache-control": "no-store" },
+        );
+        return;
+      }
+
+      const eventHistoryMatch =
+        request.method === "GET"
+          ? /^\/v1\/connectors\/([^/]+)\/event-history$/.exec(url.pathname)
+          : null;
+      if (eventHistoryMatch) {
+        const connectorId = decodeURIComponent(eventHistoryMatch[1] ?? "");
+        if (
+          !(await connectorIsAuthorized(
+            request,
+            connectorId,
+            config.connectors,
+            store,
+          ))
+        ) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        let cursor: RelayEventCursor | undefined;
+        let limit: number;
+        try {
+          cursor = decodeEventCursor(url.searchParams.get("cursor"));
+          limit = eventHistoryLimit(url);
+        } catch (error) {
+          sendJson(response, 400, {
+            error: error instanceof Error ? error.message : "invalid pagination",
+          });
+          return;
+        }
+        const records = await store.eventsBefore(connectorId, cursor, limit + 1);
+        const hasNextPage = records.length > limit;
+        const page = records.slice(0, limit);
+        const last = page.at(-1);
+        sendJson(
+          response,
+          200,
+          {
+            version: 1,
+            events: page.map((record) => record.event),
+            ...(hasNextPage && last !== undefined
+              ? { nextCursor: encodeEventCursor(last.cursor) }
+              : {}),
+          },
+          { "cache-control": "no-store" },
+        );
+        return;
+      }
+
+      const progressMatch =
+        request.method === "POST"
+          ? /^\/v1\/connectors\/([^/]+)\/tasks\/([^/]+)\/progress$/.exec(
+              url.pathname,
+            )
+          : null;
+      if (progressMatch) {
+        const connectorId = decodeURIComponent(progressMatch[1] ?? "");
+        const taskId = decodeURIComponent(progressMatch[2] ?? "");
+        if (!isSequenceId(taskId)) {
+          sendJson(response, 400, { error: "task ID must be a positive integer" });
+          return;
+        }
+        if (
+          !(await connectorIsAuthorized(
+            request,
+            connectorId,
+            config.connectors,
+            store,
+          ))
+        ) {
+          sendJson(response, 401, { error: "unauthorized" });
+          return;
+        }
+        let progress: RelayTaskProgress;
+        try {
+          progress = parseTaskProgress(await readJson(request));
+        } catch (error) {
+          sendJson(response, 400, {
+            error: error instanceof Error ? error.message : "invalid progress",
+          });
+          return;
+        }
+        if (!(await store.updateTaskProgress(connectorId, taskId, progress))) {
+          sendJson(response, 404, { error: "pending task not found" });
+          return;
+        }
+        sendJson(
+          response,
+          200,
+          { version: 1, status: "recorded", taskId },
+          { "cache-control": "no-store" },
+        );
         return;
       }
 

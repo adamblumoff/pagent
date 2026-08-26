@@ -5,24 +5,12 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { createRelayServer } from "../src/server.js";
-import type { RelayConfig, RelayTask } from "../src/types.js";
 import { RecordingRelayStore } from "./recording-store.js";
-
-const config: RelayConfig = {
-  port: 0,
-  heartbeatMs: 100,
-  acknowledgedContextRetentionMs: 86_400_000,
-  sources: [
-    {
-      token: "source-secret",
-      repositoryKey: "pagent-demo",
-      connectorId: "local-1",
-      allowedEnvironments: ["staging", "production"],
-    },
-  ],
-  connectors: [{ id: "local-1", token: "connector-secret" }],
-  adminToken: "admin-secret",
-};
+import {
+  relayTestConfig as config,
+  relayTestEvent as event,
+  relayTestTask as task,
+} from "./relay-test-fixture.js";
 
 const dynamicSourceToken = "dynamic-source-secret";
 const dynamicConnectorToken = "dynamic-connector-secret";
@@ -107,48 +95,6 @@ async function waitForStreamClose(
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
   }
-}
-
-function event(id: string, overrides: Record<string, unknown> = {}) {
-  return {
-    version: 2,
-    event: {
-      id,
-      type: "health.failed",
-      environment: "staging",
-      occurredAt: "2026-08-24T12:00:00.000Z",
-      context: {
-        algorithm: "A256GCM",
-        keyId: "staging-2026-08",
-        iv: "AAECAwQFBgcICQoL",
-        ciphertext: "AAECAwQFBgcICQoLDA0ODw",
-      },
-      ...overrides,
-    },
-  };
-}
-
-function task(
-  id: string,
-  eventId: string,
-  overrides: Partial<RelayTask> = {},
-): RelayTask {
-  return {
-    id,
-    eventId,
-    type: "health.failed",
-    environment: "staging",
-    occurredAt: "2026-08-24T12:00:00.000Z",
-    investigation: { cooldownMs: 0 },
-    repositoryKey: "pagent-demo",
-    context: {
-      algorithm: "A256GCM",
-      keyId: "staging-2026-08",
-      iv: "AAECAwQFBgcICQoL",
-      ciphertext: "AAECAwQFBgcICQoLDA0ODw",
-    },
-    ...overrides,
-  };
 }
 
 async function encryptedContextFor(value: unknown) {

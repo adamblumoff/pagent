@@ -29,6 +29,7 @@ describe("local state", () => {
       }),
     ).toMatchObject({
       directory: "/home/ada/.local/state/pagent",
+      historyPath: "/home/ada/.local/state/pagent/handoffs.json",
       inboxPath: "/home/ada/.local/state/pagent/inbox.json",
       logPath: "/home/ada/.local/state/pagent/connector.log",
       controlEndpoint: "/home/ada/.local/state/pagent/control.sock",

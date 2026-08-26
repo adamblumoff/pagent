@@ -18,6 +18,7 @@ import {
   revokeConnector,
 } from "./admin.js";
 import { runDoctor, type DoctorReport } from "./doctor.js";
+import { runEventsCommand } from "./events-cli.js";
 import { runProjectInit } from "./init.js";
 import {
   invalidateConnectorConfigCache,
@@ -91,6 +92,9 @@ async function main(): Promise<void> {
       return;
     case "status":
       await statusCommand(command.json);
+      return;
+    case "events":
+      await runEventsCommand(command);
       return;
     case "logs":
       await logsCommand(command.lines, command.follow);

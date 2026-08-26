@@ -270,6 +270,148 @@ describe(
       });
     });
 
+    it("tracks metadata-only lifecycle progress and paginates all outcomes", async () => {
+      await withStore(async (store, pool, schema) => {
+        const queued = await store.enqueue(input("event-a"));
+        assert.equal(queued.status, "queued");
+        const taskId = queued.status === "queued" ? queued.task.id : "";
+        assert.equal(
+          (
+            await store.enqueue(
+              input("event-b", { cooldownMs: 60_000 }),
+            )
+          ).status,
+          "cooldown",
+        );
+        const secondQueued = await store.enqueue(
+          input("event-c", { group: "other" }),
+        );
+        assert.equal(secondQueued.status, "queued");
+        await pool.query(`
+          UPDATE ${schema}.pagent_events
+             SET received_at = CASE event_id
+               WHEN 'event-a' THEN '2026-08-26T12:00:00.000100Z'::timestamptz
+               WHEN 'event-b' THEN '2026-08-26T12:00:00.000200Z'::timestamptz
+               WHEN 'event-c' THEN '2026-08-26T12:00:00.000300Z'::timestamptz
+             END
+           WHERE event_id IN ('event-a', 'event-b', 'event-c')
+        `);
+
+        const allRecords = await store.eventsBefore("local-1", undefined, 10);
+        const all = allRecords.map((record) => record.event);
+        assert.equal(all.length, 3);
+        assert.deepEqual(
+          Object.fromEntries(all.map((event) => [event.eventId, event.status])),
+          {
+            "event-a": "queued",
+            "event-b": "suppressed",
+            "event-c": "queued",
+          },
+        );
+        const firstPage = await store.eventsBefore("local-1", undefined, 2);
+        const pageCursor = firstPage.at(-1)?.cursor;
+        assert.ok(pageCursor);
+        assert.match(pageCursor.receivedAt, /\.000200Z$/u);
+        const secondPage = await store.eventsBefore(
+          "local-1",
+          pageCursor,
+          2,
+        );
+        assert.deepEqual(
+          [...firstPage, ...secondPage].map((record) => record.event.eventId),
+          all.map((event) => event.eventId),
+        );
+        assert.deepEqual(await store.eventsBefore("local-2", undefined, 10), []);
+        assert.equal(await store.findEvent("local-2", "event-a"), undefined);
+
+        assert.equal(
+          await store.updateTaskProgress(
+            "local-1",
+            secondQueued.status === "queued" ? secondQueued.task.id : "",
+            { status: "started" },
+          ),
+          true,
+        );
+        assert.ok(
+          (await store.findEvent("local-1", "event-c"))?.receivedLocallyAt,
+        );
+
+        assert.equal(
+          await store.updateTaskProgress("local-1", taskId, {
+            status: "received",
+          }),
+          true,
+        );
+        assert.equal(
+          (await store.findEvent("local-1", "event-a"))?.status,
+          "received",
+        );
+        assert.equal(
+          await store.updateTaskProgress("local-1", taskId, {
+            status: "started",
+          }),
+          true,
+        );
+        assert.equal(
+          await store.updateTaskProgress("local-1", taskId, {
+            status: "retrying",
+            errorCode: "codex_failed",
+          }),
+          true,
+        );
+        const retrying = await store.findEvent("local-1", "event-a");
+        assert.equal(retrying?.status, "retrying");
+        assert.equal(retrying?.attemptCount, 1);
+        assert.equal(retrying?.lastErrorCode, "codex_failed");
+        assert.ok(retrying?.receivedLocallyAt);
+        assert.ok(retrying?.startedAt);
+        assert.ok(retrying?.lastAttemptAt);
+        assert.deepEqual(
+          (await store.tasksAfter("local-1", "0", 10)).map(
+            (task) => task.eventId,
+          ),
+          ["event-a", "event-c"],
+        );
+
+        assert.equal(
+          await store.updateTaskProgress("local-1", taskId, {
+            status: "started",
+          }),
+          true,
+        );
+        assert.equal(await store.acknowledgeTask("local-1", taskId), true);
+        assert.equal(
+          await store.updateTaskProgress("local-1", taskId, {
+            status: "received",
+          }),
+          false,
+        );
+        const completed = await store.findEvent("local-1", "event-a");
+        assert.equal(completed?.status, "completed");
+        assert.equal(completed?.attemptCount, 2);
+        assert.equal(completed?.lastErrorCode, undefined);
+        assert.ok(completed?.completedAt);
+
+        const columns = await pool.query<{ column_name: string }>(
+          `SELECT column_name
+             FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name IN ('pagent_events', 'pagent_tasks')`,
+          [schema],
+        );
+        const names = columns.rows.map((row) => row.column_name);
+        for (const forbidden of [
+          "payload",
+          "prompt",
+          "thread_id",
+          "error_message",
+          "codex_output",
+        ]) {
+          assert.equal(names.includes(forbidden), false);
+        }
+      });
+    });
+
     it("acknowledges tasks, clears retained ciphertext, and fences retired keys", async () => {
       await withStore(async (store, pool, schema) => {
         const queued = await store.enqueue(

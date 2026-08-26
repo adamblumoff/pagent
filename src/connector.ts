@@ -45,6 +45,30 @@ export interface RelayConnectorOptions {
     result: AgentResult,
     task: RelayTask,
   ) => void | Promise<void>;
+  onTaskLifecycle?: (
+    update: RelayTaskLifecycleUpdate,
+    task: RelayTask,
+  ) => void | Promise<void>;
+}
+
+export type RelayTaskLifecycleStatus =
+  | "received"
+  | "running"
+  | "retrying"
+  | "completed";
+
+export type RelayTaskErrorCode =
+  | "policy_rejected"
+  | "context_unavailable"
+  | "codex_failed"
+  | "connector_stopped";
+
+export interface RelayTaskLifecycleUpdate {
+  status: RelayTaskLifecycleStatus;
+  occurredAt: string;
+  errorCode?: RelayTaskErrorCode | undefined;
+  errorMessage?: string | undefined;
+  threadId?: string | undefined;
 }
 
 export interface RelayConnector {
@@ -60,6 +84,7 @@ interface InboxState {
 }
 
 const MAX_SEQUENCE_ID = 9_223_372_036_854_775_807n;
+const LIFECYCLE_REPORT_TIMEOUT_MS = 500;
 
 interface SseMessage {
   id: string;
@@ -79,18 +104,21 @@ class FileInbox {
     return (await this.#load()).cursor;
   }
 
-  async receive(task: RelayTask): Promise<void> {
+  async receive(task: RelayTask): Promise<boolean> {
     const state = await this.#load();
     if (state.cursor !== undefined && !sequenceAfter(task.id, state.cursor)) {
-      return;
+      return false;
     }
 
     state.cursor = task.id;
+    let inserted = false;
     if (!state.pending.some((pending) => pending.id === task.id)) {
       state.pending.push(task);
+      inserted = true;
     }
 
     await this.#save();
+    return inserted;
   }
 
   async skip(id: string): Promise<void> {
@@ -180,6 +208,7 @@ class DefaultRelayConnector implements RelayConnector {
   readonly #inbox: FileInbox;
   readonly #decryptors: Map<string, EventContextDecryptor>;
   readonly #onAgentResult: RelayConnectorOptions["onAgentResult"];
+  readonly #onTaskLifecycle: RelayConnectorOptions["onTaskLifecycle"];
   readonly #onConnectionChange: RelayConnectorOptions["onConnectionChange"];
   readonly #onError: ((error: unknown) => void) | undefined;
   readonly #reconnectDelayMs: number;
@@ -209,6 +238,7 @@ class DefaultRelayConnector implements RelayConnector {
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#reconnectDelayMs = options.reconnectDelayMs ?? 1_000;
     this.#onAgentResult = options.onAgentResult;
+    this.#onTaskLifecycle = options.onTaskLifecycle;
     this.#onConnectionChange = options.onConnectionChange;
     this.#onError = options.onError;
 
@@ -283,7 +313,9 @@ class DefaultRelayConnector implements RelayConnector {
   ): Promise<void> {
     try {
       const task = relayTask(message);
-      await this.#inbox.receive(task);
+      if (await this.#inbox.receive(task)) {
+        await this.#recordLifecycle(task, { status: "received" }, signal);
+      }
     } catch (error) {
       await this.#inbox.skip(message.id);
       this.#report(error);
@@ -297,51 +329,79 @@ class DefaultRelayConnector implements RelayConnector {
     let task = await this.#inbox.next();
 
     while (task !== undefined) {
-      const rejection = this.#policyRejection(task);
-      if (rejection !== undefined) {
-        throw rejection;
-      }
-
-      const metadata: PagentEventMetadata = {
-        id: task.eventId,
-        type: task.type,
-        environment: task.environment,
-        occurredAt: task.occurredAt,
-        investigation: task.investigation,
-      };
-      const decrypt = this.#decryptors.get(task.context.keyId);
-      if (decrypt === undefined) {
-        throw new Error(
-          `Relay task ${task.id} uses unknown context key ${task.context.keyId}.`,
-        );
-      }
-
-      let payload: JsonValue;
+      await this.#recordLifecycle(task, { status: "running" }, signal);
+      let failureCode: RelayTaskErrorCode = "policy_rejected";
       try {
-        payload = await decrypt(metadata, task.context);
-      } catch (cause) {
-        throw new Error(`Relay task ${task.id} context could not be decrypted.`, {
-          cause,
-        });
-      }
-
-      const event: PagentEvent = {
-        ...metadata,
-        payload,
-      };
-      const result = await this.#agent.run({
-        cwd: this.#repositories.get(task.repositoryKey)!,
-        prompt: investigationPrompt(task.repositoryKey, event),
-        event,
-        ...(signal === undefined ? {} : { signal }),
-      });
-      await this.#inbox.markAgentCompleted(task.id);
-      if (this.#onAgentResult !== undefined) {
-        try {
-          await this.#onAgentResult(result, task);
-        } catch (error) {
-          this.#report(error);
+        const rejection = this.#policyRejection(task);
+        if (rejection !== undefined) {
+          throw rejection;
         }
+
+        const metadata: PagentEventMetadata = {
+          id: task.eventId,
+          type: task.type,
+          environment: task.environment,
+          occurredAt: task.occurredAt,
+          investigation: task.investigation,
+        };
+        const decrypt = this.#decryptors.get(task.context.keyId);
+        if (decrypt === undefined) {
+          throw new Error(
+            `Relay task ${task.id} uses unknown context key ${task.context.keyId}.`,
+          );
+        }
+
+        failureCode = "context_unavailable";
+        let payload: JsonValue;
+        try {
+          payload = await decrypt(metadata, task.context);
+        } catch (cause) {
+          throw new Error(
+            `Relay task ${task.id} context could not be decrypted.`,
+            { cause },
+          );
+        }
+
+        const event: PagentEvent = {
+          ...metadata,
+          payload,
+        };
+        failureCode = "codex_failed";
+        const result = await this.#agent.run({
+          cwd: this.#repositories.get(task.repositoryKey)!,
+          prompt: investigationPrompt(task.repositoryKey, event),
+          event,
+          ...(signal === undefined ? {} : { signal }),
+        });
+        await this.#inbox.markAgentCompleted(task.id);
+        await this.#recordLifecycle(
+          task,
+          {
+            status: "completed",
+            ...(result.threadId === undefined
+              ? {}
+              : { threadId: result.threadId }),
+          },
+          signal,
+        );
+        if (this.#onAgentResult !== undefined) {
+          try {
+            await this.#onAgentResult(result, task);
+          } catch (error) {
+            this.#report(error);
+          }
+        }
+      } catch (error) {
+        await this.#recordLifecycle(
+          task,
+          {
+            status: "retrying",
+            errorCode: signal?.aborted ? "connector_stopped" : failureCode,
+            errorMessage: safeLifecycleErrorMessage(error),
+          },
+          signal,
+        );
+        throw error;
       }
       await this.#acknowledge(task.id, signal);
       await this.#inbox.markAcknowledged(task.id);
@@ -373,6 +433,67 @@ class DefaultRelayConnector implements RelayConnector {
       throw new Error(
         `Relay acknowledgement failed with status ${response.status}.`,
       );
+    }
+  }
+
+  async #recordLifecycle(
+    task: RelayTask,
+    update: Omit<RelayTaskLifecycleUpdate, "occurredAt">,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const lifecycle: RelayTaskLifecycleUpdate = {
+      ...update,
+      occurredAt: new Date().toISOString(),
+    };
+    const localReport = this.#onTaskLifecycle === undefined
+      ? Promise.resolve()
+      : settleWithin(
+          Promise.resolve().then(() => this.#onTaskLifecycle?.(lifecycle, task)),
+          LIFECYCLE_REPORT_TIMEOUT_MS,
+        );
+    if (update.status === "completed") {
+      await localReport;
+      return;
+    }
+    await Promise.all([
+      localReport,
+      this.#reportRelayLifecycle(task, update, signal),
+    ]);
+  }
+
+  async #reportRelayLifecycle(
+    task: RelayTask,
+    update: Omit<RelayTaskLifecycleUpdate, "occurredAt">,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(abort, LIFECYCLE_REPORT_TIMEOUT_MS);
+    try {
+      await settleWithin(
+        this.#fetch(taskProgressUrl(this.#url, task.id), {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${this.#token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            version: 1,
+            status: update.status === "running" ? "started" : update.status,
+            ...(update.errorCode === undefined
+              ? {}
+              : { errorCode: update.errorCode }),
+          }),
+          signal: controller.signal,
+        }),
+        LIFECYCLE_REPORT_TIMEOUT_MS,
+      );
+    } catch {
+      // Older or temporarily unavailable relays cannot control local delivery.
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -613,6 +734,15 @@ function taskAcknowledgementUrl(eventsUrl: string, taskId: string): string {
   return url.toString();
 }
 
+function taskProgressUrl(eventsUrl: string, taskId: string): string {
+  const url = new URL(eventsUrl);
+  if (!url.pathname.endsWith("/events")) {
+    throw new Error("Relay connector URL must end with /events.");
+  }
+  url.pathname = `${url.pathname.slice(0, -"/events".length)}/tasks/${encodeURIComponent(taskId)}/progress`;
+  return url.toString();
+}
+
 function isRelayTask(value: unknown): value is RelayTask {
   const task = record(value);
   return (
@@ -691,6 +821,14 @@ function investigationPrompt(
   ].join("\n");
 }
 
+function safeLifecycleErrorMessage(error: unknown): string {
+  const message =
+    error instanceof Error ? error.message : "Unknown connector error.";
+  return message
+    .replace(/Bearer\s+\S+/giu, "Bearer [redacted]")
+    .replace(/https?:\/\/[^\s]+/giu, "[relay URL]");
+}
+
 async function abortableDelay(
   milliseconds: number,
   signal: AbortSignal | undefined,
@@ -709,6 +847,25 @@ async function abortableDelay(
       resolveDelay();
     }
   });
+}
+
+async function settleWithin(
+  operation: Promise<unknown>,
+  timeoutMs: number,
+): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      operation.catch(() => undefined),
+      new Promise<void>((resolveTimeout) => {
+        timeout = setTimeout(resolveTimeout, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
