@@ -240,7 +240,7 @@ export async function runProjectInit(
       contents: environmentFile({
         PAGENT_ENABLED: "true",
         PAGENT_ENV: environments[0]!,
-        PAGENT_RELAY_URL: relayUrl,
+        PAGENT_RELAY_URL: new URL("/v1/events", relayUrl).toString(),
         PAGENT_RELAY_TOKEN: sourceToken,
         PAGENT_ENCRYPTION_KEY_ID: contextKeyId,
         PAGENT_ENCRYPTION_KEY: contextKey,
