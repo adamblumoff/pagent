@@ -262,25 +262,45 @@ describe("relay connector", () => {
     });
   });
 
-  it("decrypts tasks with the previous key during rotation", async () => {
-    const requests: AgentRequest[] = [];
+  it("drains an offline task with its retained key after rotation", async () => {
     const inboxPath = await temporaryInbox();
     const relayTask = await task("10", {
-      keyId: "previous",
+      keyId: "key-a",
       key: PREVIOUS_KEY,
     });
-    const connector = createRelayConnector({
-      ...connectorOptions(inboxPath, recordingAgent(requests)),
-      encryption: {
-        keys: { current: CURRENT_KEY, previous: PREVIOUS_KEY },
-      },
+    const failure = new Error("Codex unavailable");
+    const offline = createRelayConnector({
+      ...connectorOptions(inboxPath, {
+        run: vi.fn(async () => Promise.reject(failure)),
+      }),
+      encryption: { keys: { "key-a": PREVIOUS_KEY } },
       fetch: vi.fn(async () => sseResponse(relayTask)) as typeof fetch,
     });
 
-    await connector.runOnce();
+    await expect(offline.runOnce()).rejects.toBe(failure);
+    expect(JSON.parse(await readFile(inboxPath, "utf8"))).toMatchObject({
+      cursor: "10",
+      pending: [{ id: "10", context: { keyId: "key-a" } }],
+    });
+
+    const requests: AgentRequest[] = [];
+    const rotated = createRelayConnector({
+      ...connectorOptions(inboxPath, recordingAgent(requests)),
+      encryption: {
+        keys: { "key-b": CURRENT_KEY, "key-a": PREVIOUS_KEY },
+      },
+      fetch: vi.fn(async () => emptySseResponse()) as typeof fetch,
+    });
+
+    await rotated.runOnce();
 
     expect(requests).toHaveLength(1);
     expect(requests[0]?.event.payload).toEqual({ reason: "pool exhausted" });
+    expect(JSON.parse(await readFile(inboxPath, "utf8"))).toEqual({
+      version: 3,
+      cursor: "10",
+      pending: [],
+    });
   });
 
   it("retries a failed local run before reconnecting", async () => {

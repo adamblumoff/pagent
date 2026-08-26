@@ -40,6 +40,12 @@ export function parseConnectorConfig(value: unknown): ConnectorConfig {
   return value as ConnectorConfig;
 }
 
+export function parseConnectorKeyring(value: unknown): ConnectorKeyring {
+  const issue = connectorKeyringIssue(value);
+  if (issue !== undefined) throw new Error(issue);
+  return value as ConnectorKeyring;
+}
+
 export function connectorConfigIssue(value: unknown): string | undefined {
   const config = record(value);
   const relay = record(config?.relay);
@@ -77,22 +83,8 @@ export function connectorConfigIssue(value: unknown): string | undefined {
   }
 
   const encryption = record(config?.encryption);
-  const keys = record(encryption?.keys);
-  if (keys === undefined || Object.keys(keys).length === 0) {
-    return "Encryption keys must contain at least one key.";
-  }
-  for (const [keyId, key] of Object.entries(keys)) {
-    if (!trimmed(keyId) || keyId.length > 200 || typeof key !== "string") {
-      return "Encryption key IDs and values must be non-empty strings.";
-    }
-    try {
-      if (decodeBase64Url(key, "Connector encryption key").byteLength !== 32) {
-        return "Each connector encryption key must decode to 32 bytes.";
-      }
-    } catch {
-      return "Each connector encryption key must be canonical unpadded base64url.";
-    }
-  }
+  const keyringIssue = connectorKeyringIssue(encryption?.keys);
+  if (keyringIssue !== undefined) return keyringIssue;
 
   if (
     config?.stateDirectory !== undefined &&
@@ -120,6 +112,26 @@ export function connectorConfigIssue(value: unknown): string | undefined {
     codex.sandboxMode !== "workspace-write"
   ) {
     return "Codex sandbox mode is invalid.";
+  }
+  return undefined;
+}
+
+function connectorKeyringIssue(value: unknown): string | undefined {
+  const keys = record(value);
+  if (keys === undefined || Object.keys(keys).length === 0) {
+    return "Encryption keys must contain at least one key.";
+  }
+  for (const [keyId, key] of Object.entries(keys)) {
+    if (!trimmed(keyId) || keyId.length > 200 || typeof key !== "string") {
+      return "Encryption key IDs and values must be non-empty strings.";
+    }
+    try {
+      if (decodeBase64Url(key, "Connector encryption key").byteLength !== 32) {
+        return "Each connector encryption key must decode to 32 bytes.";
+      }
+    } catch {
+      return "Each connector encryption key must be canonical unpadded base64url.";
+    }
   }
   return undefined;
 }

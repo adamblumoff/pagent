@@ -110,6 +110,11 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
 
       const originalConnectorId = enrolled!.connectorId;
       const originalSourceHash = enrolled!.sourceTokenHash;
+      const originalKeyring = JSON.parse(local.PAGENT_CONTEXT_KEYS!) as Record<
+        string,
+        string
+      >;
+      const originalKeyId = cloud.PAGENT_ENCRYPTION_KEY_ID!;
       const rotationCode = await runCli(
         [
           "enrollment",
@@ -148,6 +153,21 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
         replace: true,
       });
       expect(rotatedEnrollment?.sourceTokenHash).not.toBe(originalSourceHash);
+      const rotatedLocal = parseEnv(
+        await readFile(join(root, ".pagent/local.env"), "utf8"),
+      );
+      const rotatedCloud = parseEnv(
+        await readFile(join(root, ".pagent/cloud.env"), "utf8"),
+      );
+      const rotatedKeyring = JSON.parse(
+        rotatedLocal.PAGENT_CONTEXT_KEYS!,
+      ) as Record<string, string>;
+      const rotatedKeyId = rotatedCloud.PAGENT_ENCRYPTION_KEY_ID!;
+      expect(rotatedKeyId).not.toBe(originalKeyId);
+      expect(rotatedKeyring).toEqual({
+        [originalKeyId]: originalKeyring[originalKeyId],
+        [rotatedKeyId]: rotatedCloud.PAGENT_ENCRYPTION_KEY,
+      });
 
       const revoke = await runCli(
         [

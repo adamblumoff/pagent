@@ -77,14 +77,17 @@ describe("project initialization", () => {
     expect(config).not.toContain(cloud.PAGENT_ENCRYPTION_KEY);
 
     const keyring = JSON.parse(local.PAGENT_CONTEXT_KEYS!) as Record<string, string>;
+    const keyId = cloud.PAGENT_ENCRYPTION_KEY_ID!;
     expect(local.PAGENT_CONNECTOR_TOKEN).toMatch(/^pgcon_/u);
     expect(cloud).toMatchObject({
       PAGENT_ENABLED: "true",
       PAGENT_ENV: "staging",
       PAGENT_RELAY_URL: "https://relay.example.test",
-      PAGENT_ENCRYPTION_KEY_ID: "current",
-      PAGENT_ENCRYPTION_KEY: keyring.current,
+      PAGENT_ENCRYPTION_KEY_ID: keyId,
+      PAGENT_ENCRYPTION_KEY: keyring[keyId],
     });
+    expect(keyId).toMatch(/^key-[A-Za-z0-9_-]{43}$/u);
+    expect(Object.keys(keyring)).toEqual([keyId]);
     expect(cloud.PAGENT_RELAY_TOKEN).toMatch(/^pgsrc_/u);
     expect(Buffer.from(cloud.PAGENT_ENCRYPTION_KEY!, "base64url")).toHaveLength(32);
 
@@ -149,6 +152,17 @@ describe("project initialization", () => {
       dependencies(firstFetch),
     );
     const originalConfig = await readFile(first.configPath, "utf8");
+    const firstLocal = parseEnv(
+      await readFile(first.localEnvironmentPath, "utf8"),
+    );
+    const firstCloud = parseEnv(
+      await readFile(first.cloudEnvironmentPath, "utf8"),
+    );
+    const firstKeyring = JSON.parse(firstLocal.PAGENT_CONTEXT_KEYS!) as Record<
+      string,
+      string
+    >;
+    const firstKeyId = firstCloud.PAGENT_ENCRYPTION_KEY_ID!;
     const secondFetch = successfulFetch();
 
     await expect(
@@ -170,6 +184,44 @@ describe("project initialization", () => {
     expect(await readFile(reset.configPath, "utf8")).toContain(
       'environments: ["production"]',
     );
+    const resetLocal = parseEnv(
+      await readFile(reset.localEnvironmentPath, "utf8"),
+    );
+    const resetCloud = parseEnv(
+      await readFile(reset.cloudEnvironmentPath, "utf8"),
+    );
+    const resetKeyring = JSON.parse(resetLocal.PAGENT_CONTEXT_KEYS!) as Record<
+      string,
+      string
+    >;
+    const resetKeyId = resetCloud.PAGENT_ENCRYPTION_KEY_ID!;
+    expect(resetKeyId).not.toBe(firstKeyId);
+    expect(resetKeyring).toEqual({
+      [firstKeyId]: firstKeyring[firstKeyId],
+      [resetKeyId]: resetCloud.PAGENT_ENCRYPTION_KEY,
+    });
+  });
+
+  it("refuses to rotate before enrollment when the existing keyring is invalid", async () => {
+    const root = await repository("api");
+    const first = await runProjectInit(
+      initOptions(root),
+      dependencies(successfulFetch()),
+    );
+    await writeFile(first.localEnvironmentPath, "PAGENT_CONTEXT_KEYS='{}'\n");
+    const fetchEnrollment = successfulFetch("rotated");
+
+    await expect(
+      runProjectInit(
+        {
+          ...initOptions(root),
+          reset: true,
+          connectorId: first.connectorId,
+        },
+        dependencies(fetchEnrollment, 90),
+      ),
+    ).rejects.toThrow("Restore that file or revoke the connector");
+    expect(fetchEnrollment).not.toHaveBeenCalled();
   });
 
   it("requires HTTPS except for exact loopback hosts", async () => {
