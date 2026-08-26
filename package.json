@@ -1,6 +1,6 @@
 {
   "name": "pagent",
-  "version": "0.1.0-rc.2",
+  "version": "0.1.0",
   "description": "Turn selected application failures into proactive local Codex investigations.",
   "private": true,
   "type": "module",

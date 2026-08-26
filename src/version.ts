@@ -1,4 +1,4 @@
-export const PAGENT_VERSION = "0.1.0-rc.2";
+export const PAGENT_VERSION = "0.1.0";
 export const EVENT_PROTOCOL_VERSION = 2;
 export const RELAY_PROTOCOL_VERSION = 1;
 export const SUPPORTED_RELAY_PROTOCOL = {
