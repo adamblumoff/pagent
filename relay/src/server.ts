@@ -1,12 +1,15 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import type { PagentClient } from "pagent";
+
 import {
   assertEnvironmentAllowed,
   parseEnrollment,
   parseEnrollmentCodeRequest,
   parseEventEnvelope,
 } from "./domain.js";
+import { observeRelayRequests } from "./observability.js";
 import { relayTaskErrorCodes } from "./types.js";
 import { RELAY_METADATA } from "./version.js";
 import type {
@@ -324,6 +327,7 @@ function streamTasks(
 export function createRelayServer(options: {
   config: RelayConfig;
   store: RelayStore;
+  pagent?: PagentClient;
 }) {
   const { config, store } = options;
   const streams = new Map<string, Set<ServerResponse>>();
@@ -353,7 +357,10 @@ export function createRelayServer(options: {
   );
   retentionSweep.unref();
 
-  const server = createServer(async (request, response) => {
+  const handleRequest = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> => {
     try {
       const url = new URL(request.url ?? "/", "http://relay.local");
 
@@ -791,7 +798,14 @@ export function createRelayServer(options: {
       } else {
         response.destroy(error instanceof Error ? error : undefined);
       }
+      throw error;
     }
+  };
+  const observedRequest = observeRelayRequests(options.pagent, handleRequest);
+  const server = createServer((request, response) => {
+    void observedRequest(request, response).catch(() => {
+      // handleRequest already returned or closed the response.
+    });
   });
   server.once("close", () => {
     clearInterval(retentionSweep);

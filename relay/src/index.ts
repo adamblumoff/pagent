@@ -1,4 +1,5 @@
 import { loadConfig } from "./config.js";
+import { createRelayPagent } from "./observability.js";
 import { PostgresRelayStore } from "./postgres-store.js";
 import { createRelayServer } from "./server.js";
 
@@ -8,10 +9,11 @@ if (!databaseUrl) {
 }
 
 const config = loadConfig();
+const pagent = createRelayPagent();
 const store = new PostgresRelayStore(databaseUrl);
 await store.initialize();
 
-const server = createRelayServer({ config, store });
+const server = createRelayServer({ config, store, pagent });
 server.listen(config.port, "0.0.0.0", () => {
   console.log(`Pagent relay listening on port ${config.port}`);
 });
@@ -22,6 +24,7 @@ async function shutDown(): Promise<void> {
     return;
   }
   shuttingDown = true;
+  await pagent.flush();
   await new Promise<void>((resolve) => {
     server.close(() => resolve());
     server.closeAllConnections();

@@ -34,17 +34,17 @@
     "build:sdk": "tsc -p tsconfig.build.json",
     "typecheck:cloud": "tsc -p tsconfig.cloud.json",
     "typecheck:consumers": "tsc -p test/consumers/nodenext && tsc -p test/consumers/bundler && tsc -p test/consumers/web-runtime",
-    "build": "pnpm build:sdk && pnpm --filter pagent-demo build && npm --prefix relay run build",
+    "build": "pnpm build:sdk && pnpm --filter pagent-demo build && pnpm --filter pagent-relay build",
     "cli": "pnpm build:sdk && node dist/cli.js",
     "demo": "pnpm build:sdk && pnpm --filter pagent-demo dev",
-    "test": "vitest run && npm --prefix relay test",
+    "test": "vitest run && pnpm --filter pagent-relay test",
     "setup:e2e:frameworks": "pnpm --dir test/e2e/frameworks install --frozen-lockfile",
     "typecheck:e2e:frameworks": "pnpm --dir test/e2e/frameworks --recursive typecheck",
     "test:e2e:frameworks": "pnpm build:sdk && pnpm --dir test/e2e/frameworks --recursive build && vitest run --config vitest.e2e.config.ts",
     "smoke:bun": "pnpm build:sdk && bun test/runtime/bun-smoke.mjs",
     "test:release": "node --test scripts/release/*.test.mjs",
     "release:build": "node scripts/release/build-release.mjs",
-    "typecheck": "pnpm typecheck:cloud && pnpm build:sdk && pnpm typecheck:consumers && tsc --noEmit && pnpm --filter pagent-demo typecheck && npm --prefix relay run typecheck"
+    "typecheck": "pnpm typecheck:cloud && pnpm build:sdk && pnpm typecheck:consumers && tsc --noEmit && pnpm --filter pagent-demo typecheck && pnpm --filter pagent-relay typecheck"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
