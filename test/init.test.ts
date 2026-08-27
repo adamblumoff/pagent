@@ -82,7 +82,7 @@ describe("project initialization", () => {
     expect(cloud).toMatchObject({
       PAGENT_ENABLED: "true",
       PAGENT_ENV: "staging",
-      PAGENT_RELAY_URL: "https://relay.example.test",
+      PAGENT_RELAY_URL: "https://relay.example.test/v1/events",
       PAGENT_ENCRYPTION_KEY_ID: keyId,
       PAGENT_ENCRYPTION_KEY: keyring[keyId],
     });
@@ -140,7 +140,7 @@ describe("project initialization", () => {
     expect(await readFile(result.gitIgnorePath, "utf8")).toBe(".pagent/\n");
     expect(parseEnv(await readFile(result.cloudEnvironmentPath, "utf8"))).toMatchObject({
       PAGENT_ENV: "staging",
-      PAGENT_RELAY_URL: "http://127.0.0.1:8787",
+      PAGENT_RELAY_URL: "http://127.0.0.1:8787/v1/events",
     });
   });
 

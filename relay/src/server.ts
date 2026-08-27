@@ -1,13 +1,17 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
+import type { PagentClient } from "pagent";
+
 import {
   assertEnvironmentAllowed,
   parseEnrollment,
   parseEnrollmentCodeRequest,
   parseEventEnvelope,
 } from "./domain.js";
+import { observeRelayRequests } from "./observability.js";
 import { relayTaskErrorCodes } from "./types.js";
+import { RELAY_METADATA } from "./version.js";
 import type {
   ConnectorCredential,
   EventEnvelope,
@@ -323,6 +327,7 @@ function streamTasks(
 export function createRelayServer(options: {
   config: RelayConfig;
   store: RelayStore;
+  pagent?: PagentClient;
 }) {
   const { config, store } = options;
   const streams = new Map<string, Set<ServerResponse>>();
@@ -339,7 +344,7 @@ export function createRelayServer(options: {
     const before = new Date(
       Date.now() - config.acknowledgedContextRetentionMs,
     ).toISOString();
-    void store.purgeAcknowledgedContext(before).catch((error: unknown) => {
+    void store.purgeExpiredContext(before).catch((error: unknown) => {
       console.error("Acknowledged context cleanup failed", error);
     });
   };
@@ -352,7 +357,10 @@ export function createRelayServer(options: {
   );
   retentionSweep.unref();
 
-  const server = createServer(async (request, response) => {
+  const handleRequest = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> => {
     try {
       const url = new URL(request.url ?? "/", "http://relay.local");
 
@@ -364,6 +372,13 @@ export function createRelayServer(options: {
           console.error("Relay health check failed", error);
           sendJson(response, 503, { status: "unavailable" });
         }
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/v1/metadata") {
+        sendJson(response, 200, RELAY_METADATA, {
+          "cache-control": "public, max-age=300",
+        });
         return;
       }
 
@@ -783,7 +798,14 @@ export function createRelayServer(options: {
       } else {
         response.destroy(error instanceof Error ? error : undefined);
       }
+      throw error;
     }
+  };
+  const observedRequest = observeRelayRequests(options.pagent, handleRequest);
+  const server = createServer((request, response) => {
+    void observedRequest(request, response).catch(() => {
+      // handleRequest already returned or closed the response.
+    });
   });
   server.once("close", () => {
     clearInterval(retentionSweep);

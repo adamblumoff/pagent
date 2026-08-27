@@ -1,3 +1,5 @@
+import type { EVENT_PROTOCOL_VERSION } from "./version.js";
+
 export type JsonPrimitive = boolean | number | string | null;
 
 export type JsonValue =
@@ -111,7 +113,7 @@ export interface EncryptedRelayEvent extends PagentEventMetadata {
 }
 
 export interface RelayEventEnvelope {
-  version: 2;
+  version: typeof EVENT_PROTOCOL_VERSION;
   event: EncryptedRelayEvent;
 }
 

@@ -208,6 +208,18 @@ describe.skipIf(process.platform === "win32")("CLI lifecycle", () => {
         response.end('{"status":"ok"}\n');
         return;
       }
+      if (request.url === "/v1/metadata") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            version: 1,
+            serviceVersion: "0.1.0",
+            relayProtocol: 1,
+            eventProtocol: { min: 2, max: 2 },
+          }),
+        );
+        return;
+      }
       if (request.url === "/v1/connectors/local/events") {
         if (request.headers.authorization !== "Bearer connector-secret") {
           response.writeHead(401).end();

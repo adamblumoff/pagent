@@ -18,6 +18,7 @@ import {
   CodexSandboxProbeError,
   probeCodexAppServer,
 } from "../src/codex.js";
+import { PAGENT_VERSION } from "../src/version.js";
 
 interface SentMessage {
   id?: number;
@@ -48,7 +49,7 @@ describe("codexAgent", () => {
       clientInfo: {
         name: "pagent",
         title: "Pagent",
-        version: "0.0.0",
+        version: PAGENT_VERSION,
       },
     });
     expect(server.message("thread/start")?.params).toEqual({
@@ -141,7 +142,7 @@ describe("codexAgent", () => {
       clientInfo: {
         name: "pagent-doctor",
         title: "Pagent Doctor",
-        version: "0.0.0",
+        version: PAGENT_VERSION,
       },
     });
     expect(server.message("initialized")).toBeDefined();

@@ -12,6 +12,12 @@ import {
   connectorConfigIssue,
   type ConnectorEncryptionConfig,
 } from "./config.js";
+import {
+  EVENT_PROTOCOL_VERSION,
+  PAGENT_VERSION,
+  parseRelayMetadata,
+  SUPPORTED_RELAY_PROTOCOL,
+} from "./version.js";
 
 export type DoctorStatus = "pass" | "warn" | "fail";
 
@@ -29,6 +35,7 @@ export type DoctorCheckId =
   | "repositories"
   | "inbox"
   | "relay.health"
+  | "relay.compatibility"
   | "relay.sse"
   | "codex"
   | "sandbox.runtime"
@@ -132,12 +139,19 @@ export async function runDoctor(
 
   if (configValid && missingCapabilities.length === 0) {
     checks.push(await checkRelayHealth(input.relayUrl, timeoutMs, deps));
+    checks.push(await checkRelayCompatibility(input.relayUrl, timeoutMs, deps));
     checks.push(await checkRelaySse(input, timeoutMs, deps));
   } else {
     checks.push(
       check(
         "relay.health",
         "Relay health",
+        "warn",
+        "Skipped until the runtime and connector configuration are valid.",
+      ),
+      check(
+        "relay.compatibility",
+        "Relay compatibility",
         "warn",
         "Skipped until the runtime and connector configuration are valid.",
       ),
@@ -347,6 +361,98 @@ async function nearestParentIsWritable(
       candidate = dirname(candidate);
     }
   }
+}
+
+async function checkRelayCompatibility(
+  relayUrl: string,
+  timeoutMs: number,
+  deps: DoctorDependencies,
+): Promise<DoctorCheck> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await deps.fetch(new URL("/v1/metadata", relayUrl), {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      return check(
+        "relay.compatibility",
+        "Relay compatibility",
+        "fail",
+        `Relay metadata returned HTTP ${response.status}.`,
+        "Deploy a Pagent relay release that provides /v1/metadata, then rerun `pagent doctor`.",
+      );
+    }
+
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      return malformedRelayMetadataCheck();
+    }
+    const metadata = parseRelayMetadata(body);
+    if (metadata === undefined) {
+      return malformedRelayMetadataCheck();
+    }
+    if (
+      metadata.relayProtocol < SUPPORTED_RELAY_PROTOCOL.min ||
+      metadata.relayProtocol > SUPPORTED_RELAY_PROTOCOL.max
+    ) {
+      return check(
+        "relay.compatibility",
+        "Relay compatibility",
+        "fail",
+        `Relay protocol ${metadata.relayProtocol} is incompatible with CLI ${PAGENT_VERSION}, which supports ${protocolRange(SUPPORTED_RELAY_PROTOCOL)}.`,
+        `Install a Pagent CLI that supports relay protocol ${metadata.relayProtocol}, or deploy a relay that uses ${protocolRange(SUPPORTED_RELAY_PROTOCOL)}, then rerun \`pagent doctor\`.`,
+      );
+    }
+    if (
+      EVENT_PROTOCOL_VERSION < metadata.eventProtocol.min ||
+      EVENT_PROTOCOL_VERSION > metadata.eventProtocol.max
+    ) {
+      return check(
+        "relay.compatibility",
+        "Relay compatibility",
+        "fail",
+        `SDK event protocol ${EVENT_PROTOCOL_VERSION} is outside the relay's supported range ${protocolRange(metadata.eventProtocol)}.`,
+        `Install a Pagent SDK that emits an event protocol from ${protocolRange(metadata.eventProtocol)}, or deploy a compatible relay, then rerun \`pagent doctor\`.`,
+      );
+    }
+    return check(
+      "relay.compatibility",
+      "Relay compatibility",
+      "pass",
+      `CLI ${PAGENT_VERSION} supports relay protocol ${metadata.relayProtocol}; SDK event protocol ${EVENT_PROTOCOL_VERSION} is accepted.`,
+    );
+  } catch {
+    return check(
+      "relay.compatibility",
+      "Relay compatibility",
+      "fail",
+      "Relay metadata could not be reached before the timeout.",
+      "Check the relay URL and network connection, then rerun `pagent doctor`.",
+    );
+  } finally {
+    clearTimeout(timeout);
+    controller.abort();
+  }
+}
+
+function malformedRelayMetadataCheck(): DoctorCheck {
+  return check(
+    "relay.compatibility",
+    "Relay compatibility",
+    "fail",
+    "Relay metadata response is malformed.",
+    "Update the relay to a release with valid protocol metadata, then rerun `pagent doctor`.",
+  );
+}
+
+function protocolRange(range: { min: number; max: number }): string {
+  return range.min === range.max ? String(range.min) : `${range.min}-${range.max}`;
 }
 
 async function checkRelayHealth(

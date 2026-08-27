@@ -1,6 +1,7 @@
 packages:
   - .
   - demo
+  - relay
 
 allowBuilds:
   esbuild: true

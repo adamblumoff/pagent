@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 import type { AgentAdapter, AgentResult } from "./agent.js";
+import { PAGENT_VERSION } from "./version.js";
 
 export type CodexApprovalPolicy = "never" | "on-request" | "untrusted";
 export type CodexSandboxMode =
@@ -289,7 +290,7 @@ async function initializeAppServer(
   send(appServer.child, {
     method: "initialize",
     id: 1,
-    params: { clientInfo: { ...clientInfo, version: "0.0.0" } },
+    params: { clientInfo: { ...clientInfo, version: PAGENT_VERSION } },
   });
   await waitForResponse(
     appServer.messages,

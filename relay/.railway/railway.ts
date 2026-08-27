@@ -6,10 +6,10 @@ export default defineRailway(() => {
   const relay = service("relay", {
     build: {
       builder: "RAILPACK",
-      buildCommand: "npm run build",
+      buildCommand: "pnpm --filter pagent-relay build",
     },
     deploy: {
-      startCommand: "npm start",
+      startCommand: "pnpm --filter pagent-relay start",
       healthcheckPath: "/health",
       healthcheckTimeout: 30,
       restartPolicyMaxRetries: 5,
@@ -17,6 +17,12 @@ export default defineRailway(() => {
     env: {
       DATABASE_URL: preserve(),
       PAGENT_ADMIN_TOKEN: preserve(),
+      PAGENT_ENABLED: preserve(),
+      PAGENT_ENCRYPTION_KEY: preserve(),
+      PAGENT_ENCRYPTION_KEY_ID: preserve(),
+      PAGENT_ENV: preserve(),
+      PAGENT_RELAY_TOKEN: preserve(),
+      PAGENT_RELAY_URL: preserve(),
       PAGENT_SSE_HEARTBEAT_MS: preserve(),
     },
   });

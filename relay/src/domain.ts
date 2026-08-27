@@ -4,6 +4,7 @@ import type {
   EventEnvelope,
   SourceAuthorization,
 } from "./types.js";
+import { EVENT_PROTOCOL_VERSION } from "./version.js";
 
 const MAX_NAME_LENGTH = 200;
 const AES_GCM_IV_BYTES = 12;
@@ -116,8 +117,14 @@ function parseEncryptedContext(value: unknown): EncryptedContext {
 }
 
 export function parseEventEnvelope(value: unknown): EventEnvelope {
-  if (!isRecord(value) || value.version !== 2 || !isRecord(value.event)) {
-    throw new Error("body must contain version 2 and an event object");
+  if (
+    !isRecord(value) ||
+    value.version !== EVENT_PROTOCOL_VERSION ||
+    !isRecord(value.event)
+  ) {
+    throw new Error(
+      `body must contain version ${EVENT_PROTOCOL_VERSION} and an event object`,
+    );
   }
   assertOnlyKeys(value, ["version", "event"], "body");
   const event = value.event;
@@ -152,7 +159,7 @@ export function parseEventEnvelope(value: unknown): EventEnvelope {
         ).trim();
 
   return {
-    version: 2,
+    version: EVENT_PROTOCOL_VERSION,
     event: {
       id: boundedString(event.id, "event.id"),
       type: boundedString(event.type, "event.type"),

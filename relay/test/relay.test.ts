@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { createRelayServer } from "../src/server.js";
+import { RELAY_METADATA } from "../src/version.js";
 import { RecordingRelayStore } from "./recording-store.js";
 import {
   relayTestConfig as config,
@@ -138,6 +139,16 @@ describe("relay HTTP API", () => {
     server.close();
     await once(server, "close");
     await store.close();
+  });
+
+  it("publishes unauthenticated release and protocol metadata", async () => {
+    const response = await fetch(`${baseUrl}/v1/metadata`, {
+      headers: { authorization: "Bearer irrelevant" },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("cache-control"), "public, max-age=300");
+    assert.deepEqual(await response.json(), RELAY_METADATA);
   });
 
   it("issues and consumes a single-use enrollment code", async () => {
