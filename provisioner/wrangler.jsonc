@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "pagent-provisioner",
+  "account_id": "7668e16c839b89abc63bbb8bb96f5c61",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
   // Set PAGENT_PROVISIONER_ADMIN_TOKEN, PAGENT_CREDENTIAL_SECRET, and the Cloudflare API
@@ -9,8 +10,8 @@
   "kv_namespaces": [
     {
       "binding": "PAGENT_ENVIRONMENTS",
-      "id": "replace-with-production-kv-namespace-id",
-      "preview_id": "replace-with-preview-kv-namespace-id"
+      "id": "4ad82e50e3ca4436ad19da2b1a584ae0",
+      "preview_id": "c9b337c69de54bec9aba12c07298cd54"
     }
   ],
   "durable_objects": {

@@ -14,6 +14,8 @@ interface DnsResult {
   id?: string;
 }
 
+const runtimeFetch: typeof fetch = (input, init) => globalThis.fetch(input, init);
+
 export class CloudflareApiError extends Error {
   constructor(
     message: string,
@@ -32,7 +34,7 @@ export class CloudflareApi {
     private readonly zoneId: string,
     private readonly apiToken: string,
     baseUrl = "https://api.cloudflare.com/client/v4",
-    private readonly fetcher: typeof fetch = fetch,
+    private readonly fetcher: typeof fetch = runtimeFetch,
   ) {
     this.baseUrl = baseUrl.replace(/\/+$/u, "");
   }
@@ -165,8 +167,11 @@ export class CloudflareApi {
           ...init.headers,
         },
       });
-    } catch {
-      throw new CloudflareApiError("Could not reach the Cloudflare API.", 502);
+    } catch (error) {
+      const detail = error instanceof Error
+        ? `${error.name}: ${error.message}`
+        : "unknown runtime error";
+      throw new CloudflareApiError(`Could not reach the Cloudflare API (${detail}).`, 502);
     }
     if (allowNotFound && response.status === 404) return undefined as T;
 

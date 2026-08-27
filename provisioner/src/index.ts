@@ -591,16 +591,19 @@ async function handleErrors(action: () => Promise<Response>): Promise<Response> 
 }
 
 function validateEnv(env: ProvisionerEnv): void {
-  const required = [
-    env.CLOUDFLARE_ACCOUNT_ID,
-    env.CLOUDFLARE_ZONE_ID,
-    env.CLOUDFLARE_API_TOKEN,
-    env.PAGENT_PUBLIC_ZONE,
-    env.PAGENT_PROVISIONER_ADMIN_TOKEN,
-    env.PAGENT_CREDENTIAL_SECRET,
-  ];
-  if (required.some((value) => typeof value !== "string" || value.trim() === "")) {
-    throw new Error("Pagent provisioner bindings are incomplete.");
+  const required = {
+    CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_ZONE_ID: env.CLOUDFLARE_ZONE_ID,
+    CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN,
+    PAGENT_PUBLIC_ZONE: env.PAGENT_PUBLIC_ZONE,
+    PAGENT_PROVISIONER_ADMIN_TOKEN: env.PAGENT_PROVISIONER_ADMIN_TOKEN,
+    PAGENT_CREDENTIAL_SECRET: env.PAGENT_CREDENTIAL_SECRET,
+  };
+  const missing = Object.entries(required)
+    .filter(([, value]) => typeof value !== "string" || value.trim() === "")
+    .map(([name]) => name);
+  if (missing.length > 0) {
+    throw new Error(`Pagent provisioner bindings are incomplete: ${missing.join(", ")}.`);
   }
   if (env.PAGENT_CREDENTIAL_SECRET.length < 32) {
     throw new Error("PAGENT_CREDENTIAL_SECRET is too short.");
