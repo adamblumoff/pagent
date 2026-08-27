@@ -14,9 +14,8 @@ import {
   type CliCommand,
 } from "./cli-args.js";
 import {
-  createEnrollmentCode,
-  revokeConnector,
-} from "./admin.js";
+  TunnelProvisioningClient,
+} from "./tunnel-provisioning.js";
 import { runDoctor, type DoctorReport } from "./doctor.js";
 import { runEventsCommand } from "./events-cli.js";
 import { runProjectInit } from "./init.js";
@@ -78,8 +77,8 @@ async function main(): Promise<void> {
     case "enrollment":
       await enrollmentCommand(command);
       return;
-    case "connector":
-      await connectorCommand(command);
+    case "tunnel":
+      await tunnelCommand(command);
       return;
     case "doctor":
       await doctorCommand(command.json);
@@ -105,65 +104,91 @@ async function main(): Promise<void> {
 async function enrollmentCommand(
   command: Extract<CliCommand, { name: "enrollment" }>,
 ): Promise<void> {
-  const { relayUrl, adminToken } = await adminCredentials(command);
-  const enrollment = await createEnrollmentCode({
-    relayUrl,
-    adminToken,
-    ttlMinutes: command.ttlMinutes,
-    ...(command.connectorId === undefined
-      ? {}
-      : { connectorId: command.connectorId }),
+  const interactive = isInteractive();
+  const provisionerUrl = await cliValue({
+    value: command.provisioner ?? process.env.PAGENT_PROVISIONER_URL,
+    interactive,
+    prompt: "Provisioning service URL: ",
+    missing:
+      "Provisioning service URL is required. Pass `--provisioner <url>` or set PAGENT_PROVISIONER_URL.",
   });
-  console.log(enrollment.code);
-  console.error(`Expires at ${enrollment.expiresAt}.`);
+  const adminToken = await cliValue({
+    value: command.adminToken ?? process.env.PAGENT_PROVISIONER_ADMIN_TOKEN,
+    interactive,
+    prompt: "Provisioner admin token: ",
+    hidden: true,
+    missing:
+      "Provisioner admin token is required. Set PAGENT_PROVISIONER_ADMIN_TOKEN or pass `--admin-token <token>`.",
+  });
+  const enrollment = await new TunnelProvisioningClient({ serviceUrl: provisionerUrl })
+    .createEnrollmentToken({
+      adminToken,
+      expiresInSeconds: command.ttlMinutes * 60,
+    });
+  console.log(enrollment.token);
+  console.error(`Enrollment token expires at ${enrollment.expiresAt}.`);
 }
 
-async function connectorCommand(
-  command: Extract<CliCommand, { name: "connector" }>,
+async function tunnelCommand(
+  command: Extract<CliCommand, { name: "tunnel" }>,
 ): Promise<void> {
-  const { relayUrl, adminToken, interactive } =
-    await adminCredentials(command);
+  const loaded = await loadConnectorConfig();
+  const interactive = isInteractive();
   if (!command.yes) {
     if (!interactive) {
       throw new Error(
-        "Connector revocation needs confirmation in a non-interactive shell. Review the connector ID, then add `--yes`.",
+        "Tunnel revocation needs confirmation in a non-interactive shell. Review the environment, then add `--yes`.",
       );
     }
     const answer = await question(
-      `Revoke connector ${command.connectorId}? Its source and connector credentials will stop working. [y/N] `,
+      `Delete tunnel ${loaded.config.tunnel.environmentId}? This environment will stop receiving events. [y/N] `,
     );
     if (answer.toLowerCase() !== "y" && answer.toLowerCase() !== "yes") {
-      console.log("Connector revocation cancelled.");
+      console.log("Tunnel revocation cancelled.");
       return;
     }
   }
-  await revokeConnector({
-    relayUrl,
-    adminToken,
-    connectorId: command.connectorId,
+  const paths = localStatePaths({ stateDirectory: loaded.config.stateDirectory });
+  const running = await existingDaemon(paths);
+  if (running !== undefined) {
+    await requestLocalControl(paths.controlEndpoint, { method: "stop" });
+  }
+  const managementToken = process.env.PAGENT_MANAGEMENT_TOKEN?.trim();
+  if (!managementToken) {
+    throw new Error("PAGENT_MANAGEMENT_TOKEN is required to revoke this tunnel.");
+  }
+  const provisioner = new TunnelProvisioningClient({
+    serviceUrl: loaded.config.tunnel.provisionerUrl,
   });
-  console.log(`Revoked connector ${command.connectorId}.`);
+  await provisioner.delete({
+    environmentId: loaded.config.tunnel.environmentId,
+    managementToken,
+    idempotencyKey: `revoke-${loaded.config.tunnel.environmentId}`,
+  });
+  console.log(`Revoked tunnel ${loaded.config.tunnel.environmentId}.`);
 }
 
 async function initCommand(
   command: Extract<CliCommand, { name: "init" }>,
 ): Promise<void> {
   const interactive = isInteractive();
-  const relayUrl = await cliValue({
-    value: command.relay ?? process.env.PAGENT_RELAY_URL,
+  const provisionerUrl = await cliValue({
+    value: command.provisioner ?? process.env.PAGENT_PROVISIONER_URL,
     interactive,
-    prompt: "Relay URL: ",
+    prompt: "Provisioning service URL: ",
     missing:
-      "Relay URL is required. Pass `--relay <url>` or set PAGENT_RELAY_URL.",
+      "Provisioning service URL is required. Pass `--provisioner <url>` or set PAGENT_PROVISIONER_URL.",
   });
-  const enrollmentCode = await cliValue({
-    value: command.enrollment ?? process.env.PAGENT_ENROLLMENT_CODE,
-    interactive,
-    prompt: "Enrollment code: ",
-    hidden: true,
-    missing:
-      "Enrollment code is required. Pass `--enrollment <code>` or set PAGENT_ENROLLMENT_CODE.",
-  });
+  const enrollmentToken = command.reset
+    ? "unused-during-reset"
+    : await cliValue({
+        value: command.enrollment ?? process.env.PAGENT_ENROLLMENT_TOKEN,
+        interactive,
+        prompt: "Enrollment token: ",
+        hidden: true,
+        missing:
+          "Enrollment token is required. Pass `--enrollment <token>` or set PAGENT_ENROLLMENT_TOKEN.",
+      });
 
   if (!command.yes) {
     if (!interactive) {
@@ -172,9 +197,9 @@ async function initCommand(
       );
     }
     const action = command.reset
-      ? "Rotate this connector and invalidate its current cloud credentials now"
-      : `Enroll this repository for ${command.environments.join(", ")} and ${
-          command.noStart ? "leave the connector stopped" : "start the connector"
+      ? "Rotate this tunnel and its credentials now"
+      : `Provision this repository for ${command.environments.join(", ")} and ${
+          command.noStart ? "leave Pagent stopped" : "start Pagent"
         }`;
     const answer = await question(`${action}? [y/N] `);
     if (answer.toLowerCase() !== "y" && answer.toLowerCase() !== "yes") {
@@ -183,86 +208,60 @@ async function initCommand(
     }
   }
 
-  console.log("Checking Git, Codex, and relay enrollment.");
-  const connectorEnvironment = {
-    token: process.env.PAGENT_CONNECTOR_TOKEN,
-    keys: process.env.PAGENT_CONTEXT_KEYS,
-  };
-  let existingConnectorId: string | undefined;
+  console.log("Checking Git, Codex, and tunnel provisioning.");
+  let managementToken = process.env.PAGENT_MANAGEMENT_TOKEN;
+  let existing: LoadedConnectorConfig | undefined;
   if (command.reset) {
     try {
-      existingConnectorId = (await loadConnectorConfig()).config.relay.connectorId;
+      existing = await loadConnectorConfig();
+      managementToken = process.env.PAGENT_MANAGEMENT_TOKEN;
     } catch {
       throw new Error(
-        "Pagent could not read the existing connector identity. Repair the current config or revoke the connector before resetting it.",
+        "Pagent could not read the existing tunnel identity. Repair the config or revoke the tunnel before resetting it.",
       );
     }
+    await stopConnectorForRotation();
   }
   const initialized = await runProjectInit({
-    relayUrl,
-    enrollmentCode,
+    provisionerUrl,
+    enrollmentToken,
     environments: command.environments,
     reset: command.reset,
-    connectorId: existingConnectorId,
+    environmentId: existing?.config.tunnel.environmentId,
+    originPort: existing?.config.ingress.port,
+    managementToken,
   });
   process.chdir(initialized.projectDirectory);
 
   if (command.reset) {
-    restoreEnvironment("PAGENT_CONNECTOR_TOKEN", connectorEnvironment.token);
-    restoreEnvironment("PAGENT_CONTEXT_KEYS", connectorEnvironment.keys);
+    delete process.env.PAGENT_SOURCE_TOKEN;
+    delete process.env.PAGENT_MANAGEMENT_TOKEN;
+    delete process.env.PAGENT_CONTEXT_KEYS;
     invalidateConnectorConfigCache();
-    await stopConnectorForRotation();
   }
 
   console.log(`\nPagent initialized for ${initialized.repositoryKey}.`);
-  console.log(`Connector config: ${initialized.configPath}`);
-  console.log(`Cloud environment: ${initialized.cloudEnvironmentPath}`);
+  console.log(`Tunnel hostname: ${initialized.eventOrigin}`);
+  console.log(`Local config: ${initialized.configPath}`);
+  console.log(`Application environment: ${initialized.cloudEnvironmentPath}`);
   if (command.reset) {
     console.log(
-      "Cloud credentials changed. Update the deployment from cloud.env before sending more events.",
+      "Application credentials changed. Update the deployment from cloud.env before sending more events.",
     );
   }
 
   if (command.noStart) {
     await doctorCommand(false);
     if (process.exitCode === undefined) {
-      console.log("\nThe connector is stopped. Run `pagent start` when you are ready.");
+      console.log("\nPagent is stopped. Run `pagent start` when you are ready.");
     }
     return;
   }
   await startCommand(false, false);
 }
 
-async function adminCredentials(command: {
-  relay: string | undefined;
-  adminToken: string | undefined;
-}): Promise<{ relayUrl: string; adminToken: string; interactive: boolean }> {
-  const interactive = isInteractive();
-  const relayUrl = await cliValue({
-    value: command.relay ?? process.env.PAGENT_RELAY_URL,
-    prompt: "Relay URL: ",
-    missing:
-      "Relay URL is required. Pass `--relay <url>` or set PAGENT_RELAY_URL.",
-    interactive,
-  });
-  const adminToken = await cliValue({
-    value: command.adminToken ?? process.env.PAGENT_ADMIN_TOKEN,
-    prompt: "Relay administrator token: ",
-    missing:
-      "Relay administrator token is required. Pass `--admin-token <token>` or set PAGENT_ADMIN_TOKEN.",
-    interactive,
-    hidden: true,
-  });
-  return { relayUrl, adminToken, interactive };
-}
-
 function isInteractive(): boolean {
   return process.stdin.isTTY === true && process.stdout.isTTY === true;
-}
-
-function restoreEnvironment(name: string, value: string | undefined): void {
-  if (value === undefined) delete process.env[name];
-  else process.env[name] = value;
 }
 
 async function stopConnectorForRotation(): Promise<void> {
@@ -380,7 +379,7 @@ async function startCommand(
 
   const status = await startBackground(loaded, paths);
   console.log(
-    `\nPagent started in the background (PID ${status.pid}, relay connected).`,
+    `\nPagent started in the background (PID ${status.pid}, tunnel connected).`,
   );
 }
 
@@ -494,8 +493,11 @@ async function statusCommand(json: boolean): Promise<void> {
   }
   console.log(`Pagent is ${status.phase}.`);
   console.log(`PID: ${status.pid}`);
-  console.log(`Relay: ${status.relayConnected ? "connected" : "disconnected"}`);
-  console.log(`Pending tasks: ${status.pendingTasks}`);
+  console.log(
+    `Ingress: ${status.ingressReady ? `listening on 127.0.0.1:${status.ingressPort}` : "stopped"}`,
+  );
+  console.log(`Tunnel: ${status.tunnelConnected ? "connected" : "disconnected"}`);
+  console.log(`Hostname: ${status.tunnelHostname}`);
   if (status.lastHandoff !== undefined) {
     console.log(
       `Last handoff: ${status.lastHandoff.eventType} → ${status.lastHandoff.threadId ?? "unknown thread"}`,
@@ -575,16 +577,16 @@ async function doctorReport(
   paths: LocalStatePaths,
   includeAdvisories: boolean,
 ): Promise<DoctorReport> {
+  const daemon = await existingDaemon(paths);
   return runDoctor({
-    relayUrl: loaded.config.relay.url,
-    connectorId: loaded.config.relay.connectorId,
-    connectorToken: loaded.config.relay.token,
-    inboxPath: paths.inboxPath,
+    ingress: loaded.config.ingress,
+    tunnel: loaded.config.tunnel,
     repositories: loaded.config.repositories,
     environments: loaded.config.environments,
     encryption: loaded.config.encryption,
     codex: loaded.config.codex,
     includeAdvisories,
+    ingressPortInUseByPagent: daemon !== undefined,
   });
 }
 
@@ -666,7 +668,7 @@ function safeErrorMessage(error: unknown): string {
   return messages
     .join(" ")
     .replace(/Bearer\s+\S+/giu, "Bearer [redacted]")
-    .replace(/https?:\/\/[^\s]+/giu, "[relay URL]");
+    .replace(/https?:\/\/[^\s]+/giu, "[endpoint URL]");
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

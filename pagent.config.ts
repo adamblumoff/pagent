@@ -6,10 +6,17 @@ import { defineConnectorConfig } from "pagent/connector";
 const repositoryDirectory = dirname(fileURLToPath(import.meta.url));
 
 export default defineConnectorConfig({
-  relay: {
-    url: "https://relay-production-4b69.up.railway.app",
-    token: required("PAGENT_CONNECTOR_TOKEN"),
-    connectorId: "pagent-adam-blumoff-dell-06qEm7BG",
+  ingress: {
+    host: "127.0.0.1",
+    port: requiredPort("PAGENT_INGRESS_PORT"),
+    token: required("PAGENT_SOURCE_TOKEN"),
+  },
+  tunnel: {
+    environmentId: required("PAGENT_TUNNEL_ENVIRONMENT_ID"),
+    tunnelId: required("PAGENT_TUNNEL_ID"),
+    hostname: required("PAGENT_TUNNEL_HOSTNAME"),
+    provisionerUrl: required("PAGENT_PROVISIONER_URL"),
+    tokenFile: join(repositoryDirectory, ".pagent", "tunnel-token"),
   },
   repositories: {
     "pagent": repositoryDirectory,
@@ -27,6 +34,14 @@ export default defineConnectorConfig({
 function required(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} is required.`);
+  return value;
+}
+
+function requiredPort(name: string): number {
+  const value = Number(required(name));
+  if (!Number.isSafeInteger(value) || value < 1 || value > 65_535) {
+    throw new Error(`${name} must be an integer from 1 to 65535.`);
+  }
   return value;
 }
 

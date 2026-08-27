@@ -9,19 +9,21 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { createServer } from "node:net";
 import { hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
+import { parseEnv, promisify } from "node:util";
 
+import { parseConnectorKeyring } from "./config.js";
 import { probeCodexAppServer } from "./codex.js";
+import { ensureCloudflared } from "./cloudflared-install.js";
 import {
-  readExistingContextKeys,
-  retireUnusedContextKeys,
-} from "./key-rotation.js";
+  TunnelProvisioningClient,
+  type ProvisionedTunnel,
+} from "./tunnel-provisioning.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_ENVIRONMENTS = ["staging"] as const;
-const DEFAULT_TIMEOUT_MS = 10_000;
 const CONFIG_NAMES = [
   "pagent.config.ts",
   "pagent.config.mts",
@@ -31,40 +33,39 @@ const CONFIG_NAMES = [
 
 export interface ProjectInitOptions {
   cwd?: string | undefined;
-  relayUrl: string;
-  enrollmentCode: string;
+  provisionerUrl: string;
+  enrollmentToken: string;
   environments?: readonly string[] | undefined;
   reset?: boolean | undefined;
-  /** Existing connector identity required when reset rotates credentials. */
-  connectorId?: string | undefined;
+  environmentId?: string | undefined;
+  originPort?: number | undefined;
+  managementToken?: string | undefined;
 }
 
 export interface ProjectInitResult {
   projectDirectory: string;
   repositoryKey: string;
-  connectorId: string;
-  relayUrl: string;
+  environmentId: string;
+  tunnelId: string;
+  eventOrigin: string;
   environments: readonly string[];
   configPath: string;
   localEnvironmentPath: string;
   cloudEnvironmentPath: string;
+  tunnelTokenPath: string;
   gitIgnorePath: string;
 }
 
 export interface ProjectInitDependencies {
-  fetch?: EnrollmentFetch | undefined;
+  provisioner?: Pick<TunnelProvisioningClient, "createOrResume" | "rotate"> | undefined;
   findGitRoot?: ((cwd: string) => Promise<string>) | undefined;
   findGitStateDirectory?: ((cwd: string) => Promise<string>) | undefined;
+  findAvailablePort?: (() => Promise<number>) | undefined;
+  ensureCloudflared?: (() => Promise<string>) | undefined;
   probeCodex?: (() => Promise<void>) | undefined;
   randomBytes?: ((size: number) => Uint8Array) | undefined;
   hostname?: (() => string) | undefined;
-  timeoutMs?: number | undefined;
 }
-
-export type EnrollmentFetch = (
-  input: string | URL,
-  init: RequestInit,
-) => Promise<Pick<Response, "json" | "ok" | "status">>;
 
 interface SetupFile {
   path: string;
@@ -79,42 +80,41 @@ interface FileSnapshot {
 }
 
 interface PendingInit {
-  version: 1;
+  version: 2;
   projectDirectory: string;
-  relayUrl: string;
-  enrollmentCodeHash: string;
-  connectorId: string;
+  provisionerUrl: string;
+  authorizationHash: string;
+  environmentId: string;
   repositoryKey: string;
   environments: string[];
-  replace: boolean;
+  reset: boolean;
+  originPort: number;
+  idempotencyKey: string;
   sourceToken: string;
-  connectorToken: string;
   contextKey: string;
-}
-
-class EnrollmentRequestError extends Error {
-  readonly retrySameCode: boolean;
-
-  constructor(message: string, retrySameCode: boolean) {
-    super(message);
-    this.name = "EnrollmentRequestError";
-    this.retrySameCode = retrySameCode;
-  }
 }
 
 export async function runProjectInit(
   options: ProjectInitOptions,
   dependencies: ProjectInitDependencies = {},
 ): Promise<ProjectInitResult> {
-  const relayUrl = normalizeRelayUrl(options.relayUrl);
-  const enrollmentCode = requiredSecret(
-    options.enrollmentCode,
-    "Enrollment code",
-  );
+  const provisionerUrl = normalizeProvisionerUrl(options.provisionerUrl);
   const environments = normalizeEnvironments(options.environments);
+  const reset = options.reset === true;
+  const authorization = requiredSecret(
+    reset ? options.managementToken : options.enrollmentToken,
+    reset ? "Management token" : "Enrollment token",
+  );
+  const requestedEnvironmentId = options.environmentId;
+  if (reset && requestedEnvironmentId === undefined) {
+    throw new Error(
+      "Pagent reset needs the existing tunnel environment ID. Repair the config or revoke the tunnel before resetting it.",
+    );
+  }
   const cwd = resolve(options.cwd ?? process.cwd());
-  const findGitRoot = dependencies.findGitRoot ?? defaultFindGitRoot;
-  const projectDirectory = resolve(await findGitRoot(cwd));
+  const projectDirectory = resolve(
+    await (dependencies.findGitRoot ?? defaultFindGitRoot)(cwd),
+  );
   const gitStateDirectory = resolve(
     await (dependencies.findGitStateDirectory ?? defaultGitStateDirectory)(
       projectDirectory,
@@ -124,135 +124,90 @@ export async function runProjectInit(
   const paths = setupPaths(projectDirectory);
   const pendingPath = join(gitStateDirectory, "pending-init.json");
 
-  await requireAvailableTargets(projectDirectory, paths, options.reset === true);
-  const existingGitIgnore = await readOptionalText(paths.gitIgnorePath);
+  await requireAvailableTargets(projectDirectory, paths, reset);
   await requireCodex(dependencies.probeCodex);
-
-  const retainedContextKeys =
-    options.reset === true
-      ? await readExistingContextKeys(paths.localEnvironmentPath)
-      : {};
-
+  const cloudflaredPath = await (
+    dependencies.ensureCloudflared ?? (() => ensureCloudflared())
+  )();
+  const existingGitIgnore = await readOptionalText(paths.gitIgnorePath);
+  const previousKeys = reset
+    ? await readExistingContextKeys(paths.localEnvironmentPath)
+    : {};
   const makeRandomBytes = dependencies.randomBytes ?? randomBytes;
-  if (options.reset === true && options.connectorId === undefined) {
-    throw new Error(
-      "Pagent reset needs the existing connector identity. Restore the current config or revoke the connector before initializing again.",
-    );
-  }
-  const requestedConnectorId =
-    options.connectorId === undefined
-      ? undefined
-      : requiredIdentifier(options.connectorId, "Connector ID");
   const previousPending = await readPendingInit(pendingPath);
-  const pending =
-    previousPending ??
-    {
-      version: 1,
+  const originPort =
+    options.originPort ??
+    previousPending?.originPort ??
+    (await (dependencies.findAvailablePort ?? findAvailableLoopbackPort)());
+  requirePort(originPort);
+  const pending: PendingInit =
+    previousPending ?? {
+      version: 2,
       projectDirectory,
-      relayUrl,
-      enrollmentCodeHash: tokenHash(enrollmentCode),
-      connectorId:
-        requestedConnectorId ??
-        generatedConnectorId(
+      provisionerUrl,
+      authorizationHash: tokenHash(authorization),
+      environmentId:
+        requestedEnvironmentId ??
+        generatedEnvironmentId(
           repositoryKey,
           (dependencies.hostname ?? hostname)(),
           makeRandomBytes,
         ),
       repositoryKey,
       environments,
-      replace: options.reset === true,
-      sourceToken: `pgsrc_${encode(makeRandomBytes(32))}`,
-      connectorToken: `pgcon_${encode(makeRandomBytes(32))}`,
+      reset,
+      originPort,
+      idempotencyKey: `pgi_${encode(makeRandomBytes(24))}`,
+      sourceToken: `pgs_${encode(makeRandomBytes(32))}`,
       contextKey: encode(makeRandomBytes(32)),
-    } satisfies PendingInit;
+    };
   assertPendingMatches(pending, {
     projectDirectory,
-    relayUrl,
-    enrollmentCode,
-    connectorId: requestedConnectorId,
+    provisionerUrl,
+    authorization,
+    environmentId: requestedEnvironmentId,
     repositoryKey,
     environments,
-    replace: options.reset === true,
+    reset,
+    originPort,
   });
-
-  const contextKeyId = encryptionKeyId(pending.contextKey);
-  const existingKey = retainedContextKeys[contextKeyId];
-  if (existingKey !== undefined && existingKey !== pending.contextKey) {
-    throw new Error(
-      `Pagent generated an encryption key ID that conflicts with an existing key. Run \`pagent init --reset\` again.`,
-    );
-  }
   if (previousPending === undefined) await writePendingInit(pendingPath, pending);
 
-  try {
-    await enroll(
-      { ...pending, enrollmentCode },
-      dependencies.fetch ?? defaultFetch,
-      dependencies.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    );
-  } catch (error) {
-    if (error instanceof EnrollmentRequestError && !error.retrySameCode) {
-      await rm(pendingPath, { force: true });
-    }
-    throw error;
-  }
+  const provisioner =
+    dependencies.provisioner ?? new TunnelProvisioningClient({ serviceUrl: provisionerUrl });
+  const tunnel = reset
+    ? await provisioner.rotate({
+        environmentId: pending.environmentId,
+        managementToken: authorization,
+        idempotencyKey: pending.idempotencyKey,
+        originPort: pending.originPort,
+      })
+    : await provisioner.createOrResume({
+        environmentId: pending.environmentId,
+        enrollmentToken: authorization,
+        idempotencyKey: pending.idempotencyKey,
+        originPort: pending.originPort,
+      });
 
-  const activeContextKeys =
-    options.reset === true
-      ? await retireUnusedContextKeys(
-          {
-            relayUrl,
-            connectorId: pending.connectorId,
-            connectorToken: pending.connectorToken,
-            keys: retainedContextKeys,
-          },
-          dependencies.fetch ?? defaultFetch,
-          dependencies.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        )
-      : retainedContextKeys;
+  const contextKeyId = encryptionKeyId(pending.contextKey);
+  const retainedKeys = Object.fromEntries(Object.entries(previousKeys).slice(-1));
   const keyring = JSON.stringify({
-    ...activeContextKeys,
+    ...retainedKeys,
     [contextKeyId]: pending.contextKey,
   });
-
-  const { connectorId, sourceToken, connectorToken, contextKey } = pending;
-  const files: SetupFile[] = [
-    {
-      path: paths.configPath,
-      contents: connectorConfig({
-        connectorId,
-        environments,
-        relayUrl,
-        repositoryKey,
-      }),
-      mode: 0o644,
-    },
-    {
-      path: paths.localEnvironmentPath,
-      contents: environmentFile({
-        PAGENT_CONNECTOR_TOKEN: connectorToken,
-        PAGENT_CONTEXT_KEYS: keyring,
-      }),
-      mode: 0o600,
-    },
-    {
-      path: paths.cloudEnvironmentPath,
-      contents: environmentFile({
-        PAGENT_ENABLED: "true",
-        PAGENT_ENV: environments[0]!,
-        PAGENT_RELAY_URL: new URL("/v1/events", relayUrl).toString(),
-        PAGENT_RELAY_TOKEN: sourceToken,
-        PAGENT_ENCRYPTION_KEY_ID: contextKeyId,
-        PAGENT_ENCRYPTION_KEY: contextKey,
-      }),
-      mode: 0o600,
-    },
-    {
-      path: paths.gitIgnorePath,
-      contents: addGitIgnoreEntry(existingGitIgnore),
-      mode: 0o644,
-    },
-  ];
+  const files = setupFiles({
+    paths,
+    projectDirectory,
+    provisionerUrl,
+    pending,
+    tunnel,
+    environments,
+    repositoryKey,
+    contextKeyId,
+    keyring,
+    existingGitIgnore,
+    cloudflaredPath,
+  });
 
   await writeSetupFiles(paths.setupDirectory, files);
   await rm(pendingPath, { force: true });
@@ -260,288 +215,102 @@ export async function runProjectInit(
   return {
     projectDirectory,
     repositoryKey,
-    connectorId,
-    relayUrl,
+    environmentId: pending.environmentId,
+    tunnelId: tunnel.tunnelId,
+    eventOrigin: tunnel.eventOrigin,
     environments,
     configPath: paths.configPath,
     localEnvironmentPath: paths.localEnvironmentPath,
     cloudEnvironmentPath: paths.cloudEnvironmentPath,
+    tunnelTokenPath: paths.tunnelTokenPath,
     gitIgnorePath: paths.gitIgnorePath,
   };
 }
 
-async function defaultFindGitRoot(cwd: string): Promise<string> {
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["rev-parse", "--show-toplevel"],
-      { cwd, encoding: "utf8" },
-    );
-    const root = stdout.trim();
-    if (root !== "") {
-      return root;
-    }
-  } catch {
-    // Replaced with a stable, actionable error below.
-  }
-  throw new Error(
-    "Pagent init must run inside a Git repository. Create or clone the repository, then run `pagent init` again.",
-  );
-}
-
-async function defaultGitStateDirectory(cwd: string): Promise<string> {
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["rev-parse", "--git-path", "pagent"],
-      { cwd, encoding: "utf8" },
-    );
-    const path = stdout.trim();
-    if (path !== "") return resolve(cwd, path);
-  } catch {
-    // The Git-root check already gives the common remediation.
-  }
-  throw new Error(
-    "Pagent could not find writable Git metadata for enrollment recovery.",
-  );
-}
-
-async function requireCodex(probe: (() => Promise<void>) | undefined): Promise<void> {
-  try {
-    await (probe ?? (() => probeCodexAppServer({ timeoutMs: 5_000 })))();
-  } catch {
-    throw new Error(
-      "Codex must be installed and signed in before Pagent can initialize. Run `codex login`, then run `pagent init` again.",
-    );
-  }
-}
-
-async function enroll(
-  input: {
-    relayUrl: string;
-    enrollmentCode: string;
-    connectorId: string;
-    repositoryKey: string;
-    environments: readonly string[];
-    sourceToken: string;
-    connectorToken: string;
-    replace: boolean;
-  },
-  fetchEnrollment: EnrollmentFetch,
-  timeoutMs: number,
-): Promise<void> {
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
-    throw new Error("Enrollment timeout must be a positive integer.");
-  }
-
-  let response: Pick<Response, "json" | "ok" | "status">;
-  try {
-    response = await fetchEnrollment(new URL("/v1/enroll", input.relayUrl), {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${input.enrollmentCode}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        version: 1,
-        connectorId: input.connectorId,
+function setupFiles(input: {
+  paths: ReturnType<typeof setupPaths>;
+  projectDirectory: string;
+  provisionerUrl: string;
+  pending: PendingInit;
+  tunnel: ProvisionedTunnel;
+  environments: readonly string[];
+  repositoryKey: string;
+  contextKeyId: string;
+  keyring: string;
+  existingGitIgnore: string | undefined;
+  cloudflaredPath: string;
+}): SetupFile[] {
+  const hostname = new URL(input.tunnel.eventOrigin).hostname;
+  return [
+    {
+      path: input.paths.configPath,
+      contents: connectorConfig({
+        environmentId: input.pending.environmentId,
+        tunnelId: input.tunnel.tunnelId,
+        hostname,
+        provisionerUrl: input.provisionerUrl,
+        originPort: input.pending.originPort,
+        environments: input.environments,
         repositoryKey: input.repositoryKey,
-        allowedEnvironments: input.environments,
-        sourceTokenHash: tokenHash(input.sourceToken),
-        connectorTokenHash: tokenHash(input.connectorToken),
-        replace: input.replace,
+        cloudflaredPath: input.cloudflaredPath,
       }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch {
-    throw new EnrollmentRequestError(
-      "Pagent could not reach the relay enrollment endpoint. Check the relay URL and network connection, then run `pagent init` again.",
-      true,
-    );
-  }
-
-  if (!response.ok) {
-    const remediation = input.replace
-      ? `Issue a rotation code for connector ${input.connectorId} with \`pagent enrollment create --connector ${input.connectorId}\`, then run \`pagent init --reset\` again.`
-      : "Check the enrollment code and relay configuration, then run `pagent init` again.";
-    throw new EnrollmentRequestError(
-      `Relay enrollment failed with HTTP ${response.status}. ${remediation}`,
-      response.status >= 500,
-    );
-  }
-
-  let result: unknown;
-  try {
-    result = await response.json();
-  } catch {
-    throw invalidEnrollmentResponse(response.status);
-  }
-  if (
-    typeof result !== "object" ||
-    result === null ||
-    !("status" in result) ||
-    result.status !== "enrolled" &&
-    result.status !== "rotated" &&
-    result.status !== "existing"
-  ) {
-    throw invalidEnrollmentResponse(response.status);
-  }
+      mode: 0o644,
+    },
+    {
+      path: input.paths.localEnvironmentPath,
+      contents: environmentFile({
+        PAGENT_SOURCE_TOKEN: input.pending.sourceToken,
+        PAGENT_MANAGEMENT_TOKEN: input.tunnel.managementToken,
+        PAGENT_CONTEXT_KEYS: input.keyring,
+      }),
+      mode: 0o600,
+    },
+    {
+      path: input.paths.cloudEnvironmentPath,
+      contents: environmentFile({
+        PAGENT_ENABLED: "true",
+        PAGENT_ENV: input.environments[0]!,
+        PAGENT_ENDPOINT_URL: new URL("/v1/events", input.tunnel.eventOrigin).toString(),
+        PAGENT_SOURCE_TOKEN: input.pending.sourceToken,
+        PAGENT_ENCRYPTION_KEY_ID: input.contextKeyId,
+        PAGENT_ENCRYPTION_KEY: input.pending.contextKey,
+      }),
+      mode: 0o600,
+    },
+    {
+      path: input.paths.tunnelTokenPath,
+      contents: `${input.tunnel.tunnelToken}\n`,
+      mode: 0o600,
+    },
+    {
+      path: input.paths.gitIgnorePath,
+      contents: addGitIgnoreEntry(input.existingGitIgnore),
+      mode: 0o644,
+    },
+  ];
 }
 
-function invalidEnrollmentResponse(status: number): Error {
-  return new EnrollmentRequestError(
-    `Relay enrollment returned an invalid response with HTTP ${status}. Check that the relay supports enrollment, then run \`pagent init\` again.`,
-    true,
-  );
-}
-
-async function defaultFetch(
-  input: string | URL,
-  init: RequestInit,
-): Promise<Response> {
-  if (typeof globalThis.fetch !== "function") {
-    throw new Error("This Node.js installation does not provide fetch.");
-  }
-  return globalThis.fetch(input, init);
-}
-
-function setupPaths(projectDirectory: string): {
-  setupDirectory: string;
-  configPath: string;
-  localEnvironmentPath: string;
-  cloudEnvironmentPath: string;
-  gitIgnorePath: string;
-} {
+function setupPaths(projectDirectory: string) {
   const setupDirectory = join(projectDirectory, ".pagent");
   return {
     setupDirectory,
     configPath: join(projectDirectory, "pagent.config.ts"),
     localEnvironmentPath: join(setupDirectory, "local.env"),
     cloudEnvironmentPath: join(setupDirectory, "cloud.env"),
+    tunnelTokenPath: join(setupDirectory, "tunnel-token"),
     gitIgnorePath: join(projectDirectory, ".gitignore"),
   };
 }
 
-async function requireAvailableTargets(
-  projectDirectory: string,
-  paths: ReturnType<typeof setupPaths>,
-  reset: boolean,
-): Promise<void> {
-  for (const name of CONFIG_NAMES) {
-    const path = join(projectDirectory, name);
-    if (path !== paths.configPath && (await exists(path))) {
-      throw new Error(
-        `Pagent found ${name}. Remove or rename it before running \`pagent init\`.`,
-      );
-    }
-  }
-
-  const managed = [
-    paths.configPath,
-    paths.localEnvironmentPath,
-    paths.cloudEnvironmentPath,
-  ];
-  const existing = (
-    await Promise.all(
-      managed.map(async (path) => ((await exists(path)) ? path : undefined)),
-    )
-  ).filter((path): path is string => path !== undefined);
-
-  if (existing.length > 0 && !reset) {
-    throw new Error(
-      `Pagent is already initialized at ${projectDirectory}. Run \`pagent init --reset\` to replace only pagent.config.ts and the managed .pagent environment files.`,
-    );
-  }
-
-  for (const path of existing) {
-    if (!(await stat(path)).isFile()) {
-      throw new Error(`Pagent cannot replace ${path} because it is not a file.`);
-    }
-  }
-}
-
-async function writeSetupFiles(
-  setupDirectory: string,
-  files: readonly SetupFile[],
-): Promise<void> {
-  const setupDirectoryExisted = await exists(setupDirectory);
-  await mkdir(setupDirectory, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") {
-    await chmod(setupDirectory, 0o700);
-  }
-
-  const snapshots = await Promise.all(files.map(snapshotFile));
-  const staged = files.map((file) => ({
-    ...file,
-    temporaryPath: join(
-      dirname(file.path),
-      `.${basename(file.path)}.${randomUUID()}.tmp`,
-    ),
-  }));
-
-  try {
-    for (const file of staged) {
-      await writeFile(file.temporaryPath, file.contents, {
-        flag: "wx",
-        mode: file.mode,
-      });
-    }
-    for (const file of staged) {
-      await rename(file.temporaryPath, file.path);
-      if (process.platform !== "win32") {
-        await chmod(file.path, file.mode);
-      }
-    }
-  } catch {
-    await Promise.allSettled(
-      staged.map((file) => rm(file.temporaryPath, { force: true })),
-    );
-    await Promise.allSettled(snapshots.map(restoreSnapshot));
-    if (!setupDirectoryExisted) {
-      await rm(setupDirectory, { recursive: false, force: true }).catch(
-        () => undefined,
-      );
-    }
-    throw new Error(
-      "Pagent enrolled the repository but could not write the local setup files. Check repository permissions, then run `pagent init --reset`.",
-    );
-  }
-}
-
-async function snapshotFile(file: SetupFile): Promise<FileSnapshot> {
-  try {
-    const metadata = await stat(file.path);
-    return {
-      path: file.path,
-      contents: await readFile(file.path),
-      mode: metadata.mode & 0o777,
-    };
-  } catch (error) {
-    if (isMissing(error)) {
-      return { path: file.path };
-    }
-    throw error;
-  }
-}
-
-async function restoreSnapshot(snapshot: FileSnapshot): Promise<void> {
-  if (snapshot.contents === undefined) {
-    await rm(snapshot.path, { force: true });
-    return;
-  }
-  await writeFile(snapshot.path, snapshot.contents, {
-    mode: snapshot.mode ?? 0o600,
-  });
-  if (process.platform !== "win32" && snapshot.mode !== undefined) {
-    await chmod(snapshot.path, snapshot.mode);
-  }
-}
-
 function connectorConfig(input: {
-  connectorId: string;
+  environmentId: string;
+  tunnelId: string;
+  hostname: string;
+  provisionerUrl: string;
+  originPort: number;
   environments: readonly string[];
-  relayUrl: string;
   repositoryKey: string;
+  cloudflaredPath: string;
 }): string {
   return `import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -551,10 +320,18 @@ import { defineConnectorConfig } from "pagent/connector";
 const repositoryDirectory = dirname(fileURLToPath(import.meta.url));
 
 export default defineConnectorConfig({
-  relay: {
-    url: ${JSON.stringify(input.relayUrl)},
-    token: required("PAGENT_CONNECTOR_TOKEN"),
-    connectorId: ${JSON.stringify(input.connectorId)},
+  ingress: {
+    host: "127.0.0.1",
+    port: ${input.originPort},
+    token: required("PAGENT_SOURCE_TOKEN"),
+  },
+  tunnel: {
+    environmentId: ${JSON.stringify(input.environmentId)},
+    tunnelId: ${JSON.stringify(input.tunnelId)},
+    hostname: ${JSON.stringify(input.hostname)},
+    provisionerUrl: ${JSON.stringify(input.provisionerUrl)},
+    tokenFile: join(repositoryDirectory, ".pagent", "tunnel-token"),
+    cloudflaredPath: ${JSON.stringify(input.cloudflaredPath)},
   },
   repositories: {
     ${JSON.stringify(input.repositoryKey)}: repositoryDirectory,
@@ -585,50 +362,191 @@ function keyring(): Record<string, string> {
 `;
 }
 
-function environmentFile(values: Readonly<Record<string, string>>): string {
-  return `${Object.entries(values)
-    .map(([name, value]) => `${name}='${value}'`)
-    .join("\n")}\n`;
+async function requireAvailableTargets(
+  projectDirectory: string,
+  paths: ReturnType<typeof setupPaths>,
+  reset: boolean,
+): Promise<void> {
+  for (const name of CONFIG_NAMES) {
+    const path = join(projectDirectory, name);
+    if (path !== paths.configPath && (await exists(path))) {
+      throw new Error(
+        `Pagent found ${name}. Remove or rename it before running \`pagent init\`.`,
+      );
+    }
+  }
+  const managed = [
+    paths.configPath,
+    paths.localEnvironmentPath,
+    paths.cloudEnvironmentPath,
+    paths.tunnelTokenPath,
+  ];
+  const existing = (
+    await Promise.all(
+      managed.map(async (path) => ((await exists(path)) ? path : undefined)),
+    )
+  ).filter((path): path is string => path !== undefined);
+  if (existing.length > 0 && !reset) {
+    throw new Error(
+      `Pagent is already initialized at ${projectDirectory}. Run \`pagent init --reset\` to rotate this environment.`,
+    );
+  }
+  for (const path of existing) {
+    if (!(await stat(path)).isFile()) {
+      throw new Error(`Pagent cannot replace ${path} because it is not a file.`);
+    }
+  }
 }
 
-function addGitIgnoreEntry(current: string | undefined): string {
-  if (current?.split(/\r?\n/u).some((line) => line.trim() === ".pagent/")) {
-    return current;
+async function writeSetupFiles(
+  setupDirectory: string,
+  files: readonly SetupFile[],
+): Promise<void> {
+  const setupDirectoryExisted = await exists(setupDirectory);
+  await mkdir(setupDirectory, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await chmod(setupDirectory, 0o700);
+  const snapshots = await Promise.all(files.map(snapshotFile));
+  const staged = files.map((file) => ({
+    ...file,
+    temporaryPath: join(
+      dirname(file.path),
+      `.${basename(file.path)}.${randomUUID()}.tmp`,
+    ),
+  }));
+  try {
+    for (const file of staged) {
+      await writeFile(file.temporaryPath, file.contents, {
+        flag: "wx",
+        mode: file.mode,
+      });
+    }
+    for (const file of staged) {
+      await rename(file.temporaryPath, file.path);
+      if (process.platform !== "win32") await chmod(file.path, file.mode);
+    }
+  } catch {
+    await Promise.allSettled(staged.map((file) => rm(file.temporaryPath, { force: true })));
+    await Promise.allSettled(snapshots.map(restoreSnapshot));
+    if (!setupDirectoryExisted) {
+      await rm(setupDirectory, { recursive: false, force: true }).catch(() => undefined);
+    }
+    throw new Error(
+      "Pagent provisioned the tunnel but could not write the local setup files. Check permissions, then run the same init command again.",
+    );
   }
-  if (current === undefined || current === "") {
-    return ".pagent/\n";
-  }
-  return `${current.endsWith("\n") ? current : `${current}\n`}.pagent/\n`;
 }
 
-export function normalizeRelayUrl(value: string): string {
+async function snapshotFile(file: SetupFile): Promise<FileSnapshot> {
+  try {
+    const metadata = await stat(file.path);
+    return {
+      path: file.path,
+      contents: await readFile(file.path),
+      mode: metadata.mode & 0o777,
+    };
+  } catch (error) {
+    if (isMissing(error)) return { path: file.path };
+    throw error;
+  }
+}
+
+async function restoreSnapshot(snapshot: FileSnapshot): Promise<void> {
+  if (snapshot.contents === undefined) {
+    await rm(snapshot.path, { force: true });
+    return;
+  }
+  await writeFile(snapshot.path, snapshot.contents, { mode: snapshot.mode ?? 0o600 });
+  if (process.platform !== "win32" && snapshot.mode !== undefined) {
+    await chmod(snapshot.path, snapshot.mode);
+  }
+}
+
+async function readExistingContextKeys(path: string): Promise<Record<string, string>> {
+  try {
+    const serialized = parseEnv(await readFile(path, "utf8")).PAGENT_CONTEXT_KEYS;
+    if (serialized === undefined) throw new Error();
+    return { ...parseConnectorKeyring(JSON.parse(serialized)) };
+  } catch {
+    throw new Error(
+      `Pagent cannot rotate credentials because ${path} has no valid PAGENT_CONTEXT_KEYS keyring. Restore it or revoke the tunnel.`,
+    );
+  }
+}
+
+async function defaultFindGitRoot(cwd: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      encoding: "utf8",
+    });
+    if (stdout.trim() !== "") return stdout.trim();
+  } catch {
+    // Use the stable error below.
+  }
+  throw new Error(
+    "Pagent init must run inside a Git repository. Create or clone one, then try again.",
+  );
+}
+
+async function defaultGitStateDirectory(cwd: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--git-path", "pagent"], {
+      cwd,
+      encoding: "utf8",
+    });
+    if (stdout.trim() !== "") return resolve(cwd, stdout.trim());
+  } catch {
+    // The Git-root check reports the common failure first.
+  }
+  throw new Error("Pagent could not find writable Git metadata for init recovery.");
+}
+
+async function requireCodex(probe: (() => Promise<void>) | undefined): Promise<void> {
+  try {
+    await (probe ?? (() => probeCodexAppServer({ timeoutMs: 5_000 })))();
+  } catch {
+    throw new Error(
+      "Codex must be installed and signed in before Pagent can initialize. Run `codex login`, then try again.",
+    );
+  }
+}
+
+function findAvailableLoopbackPort(): Promise<number> {
+  return new Promise((resolvePort, rejectPort) => {
+    const server = createServer();
+    server.once("error", rejectPort);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (address === null || typeof address === "string") {
+        server.close();
+        rejectPort(new Error("Pagent could not allocate a loopback port."));
+        return;
+      }
+      server.close((error) => {
+        if (error === undefined) resolvePort(address.port);
+        else rejectPort(error);
+      });
+    });
+  });
+}
+
+function normalizeProvisionerUrl(value: string): string {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    throw new Error("Relay URL must be a valid HTTPS URL.");
+    throw new Error("Provisioner URL must be a valid HTTPS origin.");
   }
-
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
   if (
+    (url.protocol !== "https:" && !(url.protocol === "http:" && local)) ||
     url.username !== "" ||
     url.password !== "" ||
+    url.pathname !== "/" ||
     url.search !== "" ||
     url.hash !== ""
   ) {
-    throw new Error("Relay URL cannot contain credentials, a query, or a fragment.");
-  }
-  if (url.pathname !== "/") {
-    throw new Error("Relay URL must be an origin without a path.");
-  }
-
-  const localHost =
-    url.hostname === "localhost" ||
-    url.hostname === "127.0.0.1" ||
-    url.hostname === "[::1]";
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && localHost)) {
-    throw new Error(
-      "Relay URL must use HTTPS. Plain HTTP is allowed only for localhost, 127.0.0.1, or ::1.",
-    );
+    throw new Error("Provisioner URL must be an HTTPS origin.");
   }
   return url.origin;
 }
@@ -638,22 +556,18 @@ function normalizeEnvironments(values: readonly string[] | undefined): string[] 
   if (
     environments.length === 0 ||
     environments.some(
-      (value) =>
-        value.length > 100 ||
-        !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value),
-    )
+      (value) => value.length > 100 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value),
+    ) ||
+    new Set(environments).size !== environments.length
   ) {
     throw new Error(
-      "Allowed environments must use letters, numbers, periods, underscores, or hyphens and be at most 100 characters.",
+      "Allowed environments must be unique names up to 100 characters using letters, numbers, periods, underscores, or hyphens.",
     );
-  }
-  if (new Set(environments).size !== environments.length) {
-    throw new Error("Allowed environments cannot contain duplicates.");
   }
   return [...environments];
 }
 
-function generatedConnectorId(
+function generatedEnvironmentId(
   repositoryKey: string,
   machineName: string,
   makeRandomBytes: (size: number) => Uint8Array,
@@ -662,117 +576,80 @@ function generatedConnectorId(
   return `${repositoryKey.slice(0, 80)}-${machine}-${encode(makeRandomBytes(6))}`;
 }
 
-function requiredIdentifier(value: string, name: string): string {
-  if (
-    value === "" ||
-    value !== value.trim() ||
-    value.length > 200 ||
-    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value)
-  ) {
-    throw new Error(
-      `${name} must use letters, numbers, periods, underscores, or hyphens and be at most 200 characters.`,
-    );
-  }
-  return value;
-}
-
 function identifier(value: string, fallback: string): string {
   return (
     value
       .normalize("NFKD")
       .toLowerCase()
       .replace(/[^a-z0-9]+/gu, "-")
-      .replace(/^-+|-+$/gu, "")
-      .slice(0, 80) || fallback
+      .replace(/^-+|-+$/gu, "") || fallback
   );
-}
-
-function requiredSecret(value: string, name: string): string {
-  if (value === "" || value !== value.trim() || /[\r\n]/u.test(value)) {
-    throw new Error(
-      `${name} must be a non-empty value without surrounding whitespace.`,
-    );
-  }
-  return value;
-}
-
-function tokenHash(token: string): string {
-  return createHash("sha256").update(token).digest("base64url");
-}
-
-function encryptionKeyId(key: string): string {
-  return `key-${tokenHash(key)}`;
-}
-
-function encode(value: Uint8Array): string {
-  return Buffer.from(value).toString("base64url");
-}
-
-async function readPendingInit(path: string): Promise<PendingInit | undefined> {
-  const contents = await readOptionalText(path);
-  if (contents === undefined) return undefined;
-  let value: unknown;
-  try {
-    value = JSON.parse(contents);
-  } catch {
-    throw invalidPendingInit(path);
-  }
-  const pending = record(value);
-  if (
-    pending?.version !== 1 ||
-    typeof pending.projectDirectory !== "string" ||
-    typeof pending.relayUrl !== "string" ||
-    typeof pending.enrollmentCodeHash !== "string" ||
-    typeof pending.connectorId !== "string" ||
-    typeof pending.repositoryKey !== "string" ||
-    !Array.isArray(pending.environments) ||
-    !pending.environments.every((item) => typeof item === "string") ||
-    typeof pending.replace !== "boolean" ||
-    typeof pending.sourceToken !== "string" ||
-    typeof pending.connectorToken !== "string" ||
-    typeof pending.contextKey !== "string"
-  ) {
-    throw invalidPendingInit(path);
-  }
-  return pending as unknown as PendingInit;
 }
 
 function assertPendingMatches(
   pending: PendingInit,
   requested: {
     projectDirectory: string;
-    relayUrl: string;
-    enrollmentCode: string;
-    connectorId: string | undefined;
+    provisionerUrl: string;
+    authorization: string;
+    environmentId: string | undefined;
     repositoryKey: string;
     environments: readonly string[];
-    replace: boolean;
+    reset: boolean;
+    originPort: number;
   },
 ): void {
   if (
     pending.projectDirectory !== requested.projectDirectory ||
-    pending.relayUrl !== requested.relayUrl ||
-    pending.enrollmentCodeHash !== tokenHash(requested.enrollmentCode) ||
-    (requested.connectorId !== undefined &&
-      pending.connectorId !== requested.connectorId) ||
+    pending.provisionerUrl !== requested.provisionerUrl ||
+    pending.authorizationHash !== tokenHash(requested.authorization) ||
     pending.repositoryKey !== requested.repositoryKey ||
-    pending.replace !== requested.replace ||
-    JSON.stringify(pending.environments) !==
-      JSON.stringify(requested.environments)
+    pending.reset !== requested.reset ||
+    pending.originPort !== requested.originPort ||
+    (requested.environmentId !== undefined &&
+      pending.environmentId !== requested.environmentId) ||
+    JSON.stringify(pending.environments) !== JSON.stringify(requested.environments)
   ) {
     throw new Error(
-      "Pagent found an unfinished enrollment with different options. Retry the original command and enrollment code before changing the setup.",
+      "Pagent found an unfinished init with different options. Retry the original command before changing the setup.",
     );
   }
 }
 
-async function writePendingInit(
-  path: string,
-  pending: PendingInit,
-): Promise<void> {
-  const directory = dirname(path);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") await chmod(directory, 0o700);
+async function readPendingInit(path: string): Promise<PendingInit | undefined> {
+  const contents = await readOptionalText(path);
+  if (contents === undefined) return undefined;
+  try {
+    const value: unknown = JSON.parse(contents);
+    const candidate = record(value);
+    if (
+      candidate?.version !== 2 ||
+      typeof candidate.projectDirectory !== "string" ||
+      typeof candidate.provisionerUrl !== "string" ||
+      typeof candidate.authorizationHash !== "string" ||
+      typeof candidate.environmentId !== "string" ||
+      typeof candidate.repositoryKey !== "string" ||
+      !Array.isArray(candidate.environments) ||
+      !candidate.environments.every((value) => typeof value === "string") ||
+      typeof candidate.reset !== "boolean" ||
+      !Number.isSafeInteger(candidate.originPort) ||
+      typeof candidate.idempotencyKey !== "string" ||
+      typeof candidate.sourceToken !== "string" ||
+      typeof candidate.contextKey !== "string"
+    ) {
+      throw new Error();
+    }
+    return candidate as unknown as PendingInit;
+  } catch {
+    throw new Error(
+      `Pagent cannot read its pending init at ${path}. Restore or remove that file after checking the provisioner.`,
+    );
+  }
+}
+
+async function writePendingInit(path: string, pending: PendingInit): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await chmod(dirname(path), 0o700);
   const temporaryPath = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporaryPath, `${JSON.stringify(pending)}\n`, {
@@ -787,19 +664,50 @@ async function writePendingInit(
   }
 }
 
-function invalidPendingInit(path: string): Error {
-  return new Error(
-    `Pagent cannot read its pending enrollment at ${path}. Restore that file or revoke the connector before trying again.`,
-  );
+function environmentFile(values: Readonly<Record<string, string>>): string {
+  return `${Object.entries(values)
+    .map(([name, value]) => `${name}='${value}'`)
+    .join("\n")}\n`;
+}
+
+function addGitIgnoreEntry(current: string | undefined): string {
+  if (current?.split(/\r?\n/u).some((line) => line.trim() === ".pagent/")) {
+    return current;
+  }
+  if (current === undefined || current === "") return ".pagent/\n";
+  return `${current.endsWith("\n") ? current : `${current}\n`}.pagent/\n`;
+}
+
+function requiredSecret(value: string | undefined, name: string): string {
+  if (value === undefined || value.trim() === "" || /[\r\n]/u.test(value)) {
+    throw new Error(`${name} is required.`);
+  }
+  return value.trim();
+}
+
+function requirePort(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 65_535) {
+    throw new Error("Pagent local ingress port must be from 1 to 65535.");
+  }
+}
+
+function encryptionKeyId(key: string): string {
+  return `key_${createHash("sha256").update(key).digest("base64url").slice(0, 16)}`;
+}
+
+function tokenHash(value: string): string {
+  return createHash("sha256").update(value).digest("base64url");
+}
+
+function encode(value: Uint8Array): string {
+  return Buffer.from(value).toString("base64url");
 }
 
 async function readOptionalText(path: string): Promise<string | undefined> {
   try {
     return await readFile(path, "utf8");
   } catch (error) {
-    if (isMissing(error)) {
-      return undefined;
-    }
+    if (isMissing(error)) return undefined;
     throw error;
   }
 }
@@ -809,9 +717,7 @@ async function exists(path: string): Promise<boolean> {
     await stat(path);
     return true;
   } catch (error) {
-    if (isMissing(error)) {
-      return false;
-    }
+    if (isMissing(error)) return false;
     throw error;
   }
 }

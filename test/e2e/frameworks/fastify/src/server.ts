@@ -7,8 +7,8 @@ const app = buildApp(
     environment: process.env.PAGENT_ENV,
     encryptionKey: process.env.PAGENT_ENCRYPTION_KEY,
     encryptionKeyId: process.env.PAGENT_ENCRYPTION_KEY_ID,
-    relayToken: process.env.PAGENT_RELAY_TOKEN,
-    relayUrl: process.env.PAGENT_RELAY_URL,
+    sourceToken: process.env.PAGENT_SOURCE_TOKEN,
+    endpointUrl: process.env.PAGENT_ENDPOINT_URL,
   }),
 );
 

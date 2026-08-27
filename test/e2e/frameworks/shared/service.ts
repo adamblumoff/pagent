@@ -108,8 +108,8 @@ export function pagentOptions(config: {
   environment?: string | undefined;
   encryptionKey?: string | undefined;
   encryptionKeyId?: string | undefined;
-  relayToken?: string | undefined;
-  relayUrl?: string | undefined;
+  sourceToken?: string | undefined;
+  endpointUrl?: string | undefined;
 }): PagentOptions {
   const enabled = config.enabled === "true";
   const environment = config.environment?.trim() || undefined;
@@ -127,15 +127,15 @@ export function pagentOptions(config: {
               "PAGENT_ENCRYPTION_KEY_ID",
             ),
           },
-          relay: {
+          endpoint: {
             timeoutMs: 5_000,
-            token: required(config.relayToken, "PAGENT_RELAY_TOKEN"),
-            url: required(config.relayUrl, "PAGENT_RELAY_URL"),
+            token: required(config.sourceToken, "PAGENT_SOURCE_TOKEN"),
+            url: required(config.endpointUrl, "PAGENT_ENDPOINT_URL"),
           },
         }
       : {}),
     onDeliveryError: (error) => {
-      console.error("[pagent-e2e] relay delivery failed", error);
+      console.error("[pagent-e2e] endpoint delivery failed", error);
     },
   };
 }

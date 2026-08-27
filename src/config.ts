@@ -8,16 +8,25 @@ export interface ConnectorEncryptionConfig {
   keys: ConnectorKeyring;
 }
 
-export interface ConnectorRelayConfig {
-  /** Relay origin, such as https://relay.example.com. */
-  url: string;
+export interface LocalIngressConfig {
+  host?: "127.0.0.1" | "::1" | undefined;
+  port: number;
   token: string;
-  connectorId: string;
+}
+
+export interface TunnelConfig {
+  environmentId: string;
+  tunnelId: string;
+  hostname: string;
+  provisionerUrl: string;
+  tokenFile: string;
+  cloudflaredPath?: string | undefined;
 }
 
 /** Local settings for the connector process that launches Codex. */
 export interface ConnectorConfig {
-  relay: ConnectorRelayConfig;
+  ingress: LocalIngressConfig;
+  tunnel: TunnelConfig;
   repositories: Readonly<Record<string, string>>;
   environments: readonly string[];
   codex?: CodexAgentOptions | undefined;
@@ -48,19 +57,47 @@ export function parseConnectorKeyring(value: unknown): ConnectorKeyring {
 
 export function connectorConfigIssue(value: unknown): string | undefined {
   const config = record(value);
-  const relay = record(config?.relay);
-  if (relay === undefined) {
-    return "Relay settings are required.";
+  const ingress = record(config?.ingress);
+  if (ingress === undefined) {
+    return "Local ingress settings are required.";
+  }
+  if (
+    ingress.host !== undefined &&
+    ingress.host !== "127.0.0.1" &&
+    ingress.host !== "::1"
+  ) {
+    return "Local ingress host must be 127.0.0.1 or ::1.";
+  }
+  if (
+    typeof ingress.port !== "number" ||
+    !Number.isSafeInteger(ingress.port) ||
+    ingress.port < 1 ||
+    ingress.port > 65_535
+  ) {
+    return "Local ingress port must be an integer from 1 to 65535.";
+  }
+  if (!trimmed(ingress.token) || /[\r\n]/u.test(ingress.token)) {
+    return "Local ingress token must be a non-empty bearer token.";
   }
 
-  if (!httpUrl(relay.url)) {
-    return "Relay URL must be an HTTP or HTTPS URL without embedded credentials.";
+  const tunnel = record(config?.tunnel);
+  if (tunnel === undefined) {
+    return "Cloudflare Tunnel settings are required.";
   }
-  if (!trimmed(relay.token) || /[\r\n]/u.test(relay.token)) {
-    return "Relay token must be a non-empty bearer token.";
+  if (!trimmed(tunnel.environmentId) || !trimmed(tunnel.tunnelId)) {
+    return "Tunnel environment and tunnel IDs must be non-empty strings.";
   }
-  if (!trimmed(relay.connectorId)) {
-    return "Connector ID must be a non-empty string.";
+  if (!hostname(tunnel.hostname)) {
+    return "Tunnel hostname must be a valid DNS hostname without a URL scheme.";
+  }
+  if (!provisioningOrigin(tunnel.provisionerUrl)) {
+    return "Tunnel provisioner URL must be an HTTPS origin.";
+  }
+  if (!trimmed(tunnel.tokenFile)) {
+    return "Tunnel token file must be a non-empty path.";
+  }
+  if (tunnel.cloudflaredPath !== undefined && !trimmed(tunnel.cloudflaredPath)) {
+    return "cloudflared path must be a non-empty path when set.";
   }
 
   const repositories = record(config?.repositories);
@@ -136,16 +173,36 @@ function connectorKeyringIssue(value: unknown): string | undefined {
   return undefined;
 }
 
-function httpUrl(value: unknown): boolean {
+function hostname(value: unknown): boolean {
   if (typeof value !== "string") {
     return false;
   }
+  if (value !== value.trim() || value.length > 253 || value.includes(":")) {
+    return false;
+  }
+  try {
+    const url = new URL(`https://${value}`);
+    return url.hostname === value.toLowerCase() && url.pathname === "/";
+  } catch {
+    return false;
+  }
+}
+
+function provisioningOrigin(value: unknown): boolean {
+  if (typeof value !== "string") return false;
   try {
     const url = new URL(value);
+    const loopback =
+      url.hostname === "127.0.0.1" ||
+      url.hostname === "[::1]" ||
+      url.hostname === "localhost";
     return (
-      (url.protocol === "http:" || url.protocol === "https:") &&
+      (url.protocol === "https:" || (url.protocol === "http:" && loopback)) &&
       url.username === "" &&
-      url.password === ""
+      url.password === "" &&
+      url.pathname === "/" &&
+      url.search === "" &&
+      url.hash === ""
     );
   } catch {
     return false;

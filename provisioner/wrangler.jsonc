@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pagent-provisioner",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  // Set PAGENT_PROVISIONER_ADMIN_TOKEN, PAGENT_CREDENTIAL_SECRET, and the Cloudflare API
+  // credentials with `wrangler secret put`. Enrollment tokens are minted by
+  // the admin endpoint and are never configured as reusable Worker secrets.
+  "kv_namespaces": [
+    {
+      "binding": "PAGENT_ENVIRONMENTS",
+      "id": "replace-with-production-kv-namespace-id",
+      "preview_id": "replace-with-preview-kv-namespace-id"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PAGENT_ENROLLMENT_LOCKS",
+        "class_name": "EnrollmentTokenLock"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["EnrollmentTokenLock"]
+    }
+  ]
+}

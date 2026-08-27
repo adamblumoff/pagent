@@ -129,8 +129,11 @@ function daemonStatus(controlEndpoint: string): LocalDaemonStatus {
     startedAt: "2026-08-25T12:00:00.000Z",
     controlEndpoint,
     phase: "ready",
-    relayConnected: true,
-    pendingTasks: 0,
+    ingressReady: true,
+    ingressPort: 43123,
+    tunnelConnected: true,
+    tunnelHostname: "env-test.pagent.example.com",
+    cloudflaredPid: 9876,
     lastHandoff: {
       eventType: "health.failed",
       threadId: "thread-1",

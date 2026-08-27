@@ -10,7 +10,7 @@
     "src/encoding.ts",
     "src/index.ts",
     "src/pagent.ts",
-    "src/relay.ts",
+    "src/delivery.ts",
     "src/types.ts"
   ]
 }

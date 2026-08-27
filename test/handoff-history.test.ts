@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   FileHandoffHistory,
   type HandoffHistoryRecord,
+  type HandoffStatus,
 } from "../src/handoff-history.js";
 
 const temporaryDirectories: string[] = [];
@@ -20,40 +21,30 @@ afterEach(async () => {
 });
 
 describe("file handoff history", () => {
-  it("records and updates local handoff metadata", async () => {
+  it("records local lifecycle updates by event ID", async () => {
     const path = await historyPath();
     const history = new FileHandoffHistory(path);
-    await history.upsert(handoff({ taskId: "1", eventId: "event-1" }));
+    await history.upsert(handoff({ eventId: "event-1" }));
 
-    await expect(
-      history.update("1", {
-        status: "retrying",
-        attempts: 3,
-        lastAttemptAt: "2026-08-26T12:02:00.000Z",
-        lastErrorCode: "codex_unavailable",
-        lastErrorMessage: "Start Codex, then run `pagent doctor`.",
-      }),
-    ).resolves.toMatchObject({
-      status: "retrying",
-      attempts: 3,
-      lastErrorCode: "codex_unavailable",
-      lastErrorMessage: "Start Codex, then run `pagent doctor`.",
-    });
-    await history.update("1", {
+    await expect(history.update("event-1", {
+      status: "running",
+      startedAt: "2026-08-26T12:02:00.000Z",
+    })).resolves.toMatchObject({ status: "running" });
+    await expect(history.update("event-1", {
       status: "completed",
       completedAt: "2026-08-26T12:03:00.000Z",
+      threadId: "thread-1",
+    })).resolves.toMatchObject({
+      status: "completed",
       threadId: "thread-1",
     });
 
     await expect(history.findByEventId("event-1")).resolves.toMatchObject({
-      taskId: "1",
+      eventId: "event-1",
       status: "completed",
-      attempts: 3,
       threadId: "thread-1",
     });
-    await expect(history.update("missing", { status: "running" })).resolves.toBe(
-      undefined,
-    );
+    await expect(history.update("missing", { status: "running" })).resolves.toBeUndefined();
     expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
       version: 1,
       records: [{ eventId: "event-1", threadId: "thread-1" }],
@@ -63,69 +54,73 @@ describe("file handoff history", () => {
     }
   });
 
-  it("keeps the newest 100 records and replaces duplicate tasks", async () => {
+  it.each<HandoffStatus>([
+    "received",
+    "running",
+    "completed",
+    "suppressed",
+    "failed",
+  ])("stores the local %s status", async (status) => {
+    const history = new FileHandoffHistory(await historyPath());
+    await expect(history.upsert(handoff({ status }))).resolves.toMatchObject({ status });
+  });
+
+  it("stores failure details without event context", async () => {
     const path = await historyPath();
     const history = new FileHandoffHistory(path);
+    await history.upsert(handoff({
+      status: "failed",
+      errorCode: "codex_failed",
+      errorMessage: "Codex app server is unavailable.",
+      completedAt: "2026-08-26T12:03:00.000Z",
+    }));
 
+    const serialized = await readFile(path, "utf8");
+    expect(serialized).toContain("codex_failed");
+    expect(serialized).not.toContain("payload");
+    expect(serialized).not.toContain("context");
+  });
+
+  it("keeps the newest 100 records and replaces duplicate events", async () => {
+    const history = new FileHandoffHistory(await historyPath());
     for (let index = 0; index < 101; index += 1) {
-      await history.upsert(
-        handoff({ taskId: String(index), eventId: `event-${index}` }),
-      );
+      await history.upsert(handoff({ eventId: `event-${index}` }));
     }
-    await history.upsert(
-      handoff({
-        taskId: "100",
-        eventId: "event-replaced",
-        status: "running",
-      }),
-    );
+    await history.upsert(handoff({ eventId: "event-100", status: "running" }));
 
     const records = await history.list();
     expect(records).toHaveLength(100);
-    expect(records[0]).toMatchObject({
-      taskId: "100",
-      eventId: "event-replaced",
-      status: "running",
-    });
-    expect(records.some((record) => record.taskId === "0")).toBe(false);
-    expect(records.filter((record) => record.taskId === "100")).toHaveLength(1);
+    expect(records[0]).toMatchObject({ eventId: "event-100", status: "running" });
+    expect(records.some((record) => record.eventId === "event-0")).toBe(false);
+    expect(records.filter((record) => record.eventId === "event-100")).toHaveLength(1);
   });
 
-  it("migrates legacy arrays and drops invalid records", async () => {
+  it("migrates direct legacy arrays and drops queue-era statuses", async () => {
     const path = await historyPath();
-    await writeFile(
-      path,
-      JSON.stringify([
-        handoff({ taskId: "valid", eventId: "event-valid" }),
-        { taskId: "invalid", eventId: "event-invalid" },
-      ]),
-    );
+    await writeFile(path, JSON.stringify([
+      handoff({ eventId: "event-valid" }),
+      { ...handoff({ eventId: "event-queued" }), status: "queued", attempts: 2 },
+    ]));
 
     const history = new FileHandoffHistory(path);
-    await expect(history.list()).resolves.toEqual([
-      handoff({ taskId: "valid", eventId: "event-valid" }),
-    ]);
+    await expect(history.list()).resolves.toEqual([handoff({ eventId: "event-valid" })]);
     expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
       version: 1,
-      records: [{ taskId: "valid" }],
+      records: [{ eventId: "event-valid" }],
     });
   });
 
-  it("recovers from malformed JSON without exposing event context", async () => {
+  it("recovers from malformed JSON", async () => {
     const path = await historyPath();
     await writeFile(path, "{broken", "utf8");
     const history = new FileHandoffHistory(path);
 
     await expect(history.list()).resolves.toEqual([]);
-    await history.upsert(handoff({ taskId: "1", eventId: "event-1" }));
-
-    const serialized = await readFile(path, "utf8");
-    expect(JSON.parse(serialized)).toMatchObject({
+    await history.upsert(handoff({ eventId: "event-1" }));
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
       version: 1,
-      records: [{ taskId: "1" }],
+      records: [{ eventId: "event-1" }],
     });
-    expect(serialized).not.toContain("payload");
-    expect(serialized).not.toContain("context");
   });
 
   it("rejects invalid records and limits", async () => {
@@ -136,25 +131,19 @@ describe("file handoff history", () => {
     expect(() => new FileHandoffHistory(path, { limit: 101 })).toThrow(
       "Handoff history limit must be between 1 and 100.",
     );
-    await expect(
-      new FileHandoffHistory(path).upsert({
-        ...handoff({ taskId: "1", eventId: "event-1" }),
-        attempts: -1,
-      }),
-    ).rejects.toThrow("Handoff history record is invalid.");
+    await expect(new FileHandoffHistory(path).upsert({
+      ...handoff({ eventId: "event-1" }),
+      status: "retrying" as HandoffStatus,
+    })).rejects.toThrow("Handoff history record is invalid.");
   });
 });
 
-function handoff(
-  overrides: Partial<HandoffHistoryRecord>,
-): HandoffHistoryRecord {
+function handoff(overrides: Partial<HandoffHistoryRecord>): HandoffHistoryRecord {
   return {
-    taskId: "task-1",
     eventId: "event-1",
     eventType: "checkout.failure-rate",
     environment: "staging",
     status: "received",
-    attempts: 0,
     receivedAt: "2026-08-26T12:00:00.000Z",
     ...overrides,
   };

@@ -145,7 +145,7 @@ async function install(directory: string, archive: string): Promise<void> {
   );
 }
 
-function consumerProgram(relayUrl: string): string {
+function consumerProgram(endpointUrl: string): string {
   return `import { createPagent, defineEvent } from "pagent";
 
 const failure = defineEvent({
@@ -155,8 +155,8 @@ const failure = defineEvent({
 const pagent = createPagent({
   enabled: true,
   environment: "ci",
-  relay: {
-    url: ${JSON.stringify(relayUrl)},
+  endpoint: {
+    url: ${JSON.stringify(endpointUrl)},
     token: "release-smoke-token",
   },
   encryption: {

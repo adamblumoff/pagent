@@ -5,22 +5,20 @@ import { dirname, resolve } from "node:path";
 export type HandoffStatus =
   | "received"
   | "running"
-  | "retrying"
-  | "completed";
+  | "completed"
+  | "suppressed"
+  | "failed";
 
 export interface HandoffHistoryRecord {
-  taskId: string;
   eventId: string;
   eventType: string;
   environment: string;
   status: HandoffStatus;
-  attempts: number;
   receivedAt: string;
   startedAt?: string | undefined;
-  lastAttemptAt?: string | undefined;
   completedAt?: string | undefined;
-  lastErrorCode?: string | undefined;
-  lastErrorMessage?: string | undefined;
+  errorCode?: string | undefined;
+  errorMessage?: string | undefined;
   threadId?: string | undefined;
 }
 
@@ -28,12 +26,10 @@ export type HandoffHistoryPatch = Partial<
   Pick<
     HandoffHistoryRecord,
     | "status"
-    | "attempts"
     | "startedAt"
-    | "lastAttemptAt"
     | "completedAt"
-    | "lastErrorCode"
-    | "lastErrorMessage"
+    | "errorCode"
+    | "errorMessage"
     | "threadId"
   >
 >;
@@ -71,18 +67,18 @@ export class FileHandoffHistory {
     const state = await this.#load();
     state.records = [
       next,
-      ...state.records.filter((entry) => entry.taskId !== next.taskId),
+      ...state.records.filter((entry) => entry.eventId !== next.eventId),
     ].slice(0, this.#limit);
     await this.#save();
     return copyRecord(next);
   }
 
   async update(
-    taskId: string,
+    eventId: string,
     patch: HandoffHistoryPatch,
   ): Promise<HandoffHistoryRecord | undefined> {
     const state = await this.#load();
-    const index = state.records.findIndex((record) => record.taskId === taskId);
+    const index = state.records.findIndex((record) => record.eventId === eventId);
     const current = state.records[index];
     if (current === undefined) {
       return undefined;
@@ -180,47 +176,38 @@ function parseRecord(value: unknown): HandoffHistoryRecord | undefined {
   const candidate = record(value);
   if (
     candidate === undefined ||
-    !nonEmptyString(candidate.taskId) ||
     !nonEmptyString(candidate.eventId) ||
     !nonEmptyString(candidate.eventType) ||
     !nonEmptyString(candidate.environment) ||
     !handoffStatus(candidate.status) ||
-    !Number.isSafeInteger(candidate.attempts) ||
-    (candidate.attempts as number) < 0 ||
     !isoDate(candidate.receivedAt) ||
     !optionalIsoDate(candidate.startedAt) ||
-    !optionalIsoDate(candidate.lastAttemptAt) ||
     !optionalIsoDate(candidate.completedAt) ||
-    !optionalString(candidate.lastErrorCode) ||
-    !optionalString(candidate.lastErrorMessage) ||
+    !optionalString(candidate.errorCode) ||
+    !optionalString(candidate.errorMessage) ||
     !optionalString(candidate.threadId)
   ) {
     return undefined;
   }
 
   return {
-    taskId: candidate.taskId,
     eventId: candidate.eventId,
     eventType: candidate.eventType,
     environment: candidate.environment,
     status: candidate.status,
-    attempts: candidate.attempts as number,
     receivedAt: candidate.receivedAt,
     ...(candidate.startedAt === undefined
       ? {}
       : { startedAt: candidate.startedAt }),
-    ...(candidate.lastAttemptAt === undefined
-      ? {}
-      : { lastAttemptAt: candidate.lastAttemptAt }),
     ...(candidate.completedAt === undefined
       ? {}
       : { completedAt: candidate.completedAt }),
-    ...(candidate.lastErrorCode === undefined
+    ...(candidate.errorCode === undefined
       ? {}
-      : { lastErrorCode: candidate.lastErrorCode }),
-    ...(candidate.lastErrorMessage === undefined
+      : { errorCode: candidate.errorCode }),
+    ...(candidate.errorMessage === undefined
       ? {}
-      : { lastErrorMessage: candidate.lastErrorMessage }),
+      : { errorMessage: candidate.errorMessage }),
     ...(candidate.threadId === undefined
       ? {}
       : { threadId: candidate.threadId }),
@@ -247,8 +234,9 @@ function handoffStatus(value: unknown): value is HandoffStatus {
   return (
     value === "received" ||
     value === "running" ||
-    value === "retrying" ||
-    value === "completed"
+    value === "completed" ||
+    value === "suppressed" ||
+    value === "failed"
   );
 }
 

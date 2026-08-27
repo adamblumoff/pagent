@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { decryptEventContext } from "../src/crypto.js";
 import { createPagent, defineEvent } from "../src/index.js";
-import type { EncryptedRelayEvent } from "../src/types.js";
+import type { EncryptedPagentEvent } from "../src/types.js";
 
 const TEST_ENCRYPTION_KEY =
   "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -21,11 +21,11 @@ afterEach(() => {
 
 describe("Pagent", () => {
   it("sends a developer-approved result trigger in the background", async () => {
-    const relayFetch = successfulRelay();
+    const endpointFetch = successfulEndpoint();
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
     });
     const checkHealth = pagent.observe(
@@ -42,11 +42,11 @@ describe("Pagent", () => {
       status: "unhealthy",
       reason: "pool exhausted",
     });
-    expect(relayFetch).not.toHaveBeenCalled();
+    expect(endpointFetch).not.toHaveBeenCalled();
     await pagent.flush();
 
-    expect(relayFetch).toHaveBeenCalledTimes(1);
-    const body = requestBody(relayFetch);
+    expect(endpointFetch).toHaveBeenCalledTimes(1);
+    const body = requestBody(endpointFetch);
     expect(body.version).toBe(2);
     expect(body.event).toMatchObject({
       type: "health.failed",
@@ -64,12 +64,12 @@ describe("Pagent", () => {
   });
 
   it("reports the accepted event ID without changing the wrapped return", async () => {
-    const relayFetch = successfulRelay();
+    const endpointFetch = successfulEndpoint();
     const receipts: Array<{ eventId: string; deliveredAt: string }> = [];
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
       onDelivery: (receipt) => receipts.push(receipt),
     });
@@ -84,7 +84,7 @@ describe("Pagent", () => {
     await pagent.flush();
 
     expect(receipts).toHaveLength(1);
-    expect(receipts[0]).toMatchObject({ eventId: eventBody(relayFetch).id });
+    expect(receipts[0]).toMatchObject({ eventId: eventBody(endpointFetch).id });
     expect(new Date(receipts[0]!.deliveredAt).toISOString()).toBe(
       receipts[0]!.deliveredAt,
     );
@@ -95,12 +95,12 @@ describe("Pagent", () => {
     { name: "missing environment", enabled: true, environment: undefined },
     { name: "unlisted environment", enabled: true, environment: "local" },
   ])("fails closed when $name", async ({ enabled, environment }) => {
-    const relayFetch = successfulRelay();
+    const endpointFetch = successfulEndpoint();
     const triggerWhen = vi.fn(() => true);
     const pagent = createPagent({
       enabled,
       environment,
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
     });
     const observed = pagent.observe(() => "unchanged", {
@@ -114,22 +114,22 @@ describe("Pagent", () => {
     await pagent.flush();
 
     expect(triggerWhen).not.toHaveBeenCalled();
-    expect(relayFetch).not.toHaveBeenCalled();
+    expect(endpointFetch).not.toHaveBeenCalled();
   });
 
   it("delivers every qualifying trigger even while the same event is in flight", async () => {
     const responses: Array<(response: Response) => void> = [];
-    const relayFetch = vi.fn(
+    const endpointFetch = vi.fn(
       () =>
         new Promise<Response>((resolve) => {
           responses.push(resolve);
         }),
     );
-    vi.stubGlobal("fetch", relayFetch);
+    vi.stubGlobal("fetch", endpointFetch);
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
     });
     const observed = pagent.observe(() => "failed", {
@@ -141,7 +141,7 @@ describe("Pagent", () => {
 
     observed();
     observed();
-    await vi.waitFor(() => expect(relayFetch).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(endpointFetch).toHaveBeenCalledTimes(2));
 
     for (const respond of responses) {
       respond(new Response(null, { status: 202 }));
@@ -151,15 +151,15 @@ describe("Pagent", () => {
 
   it("does not let a failed delivery suppress a later trigger", async () => {
     const errors: unknown[] = [];
-    const relayFetch = vi
+    const endpointFetch = vi
       .fn()
       .mockResolvedValueOnce(new Response(null, { status: 503 }))
       .mockResolvedValueOnce(new Response(null, { status: 202 }));
-    vi.stubGlobal("fetch", relayFetch);
+    vi.stubGlobal("fetch", endpointFetch);
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
       onDeliveryError: (error) => errors.push(error),
     });
@@ -175,18 +175,18 @@ describe("Pagent", () => {
     observed();
     await pagent.flush();
 
-    expect(relayFetch).toHaveBeenCalledTimes(2);
+    expect(endpointFetch).toHaveBeenCalledTimes(2);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({
       name: "PagentDeliveryError",
-      code: "relay_rejected",
-      retryable: true,
+      code: "endpoint_rejected",
+      retryable: false,
       statusCode: 503,
     });
   });
 
   it("preserves async resolutions and rejections", async () => {
-    const relayFetch = successfulRelay();
+    const endpointFetch = successfulEndpoint();
     const event = defineEvent<{ message: string }>({
       name: "operation.failed",
       enabledIn: ["staging"],
@@ -194,7 +194,7 @@ describe("Pagent", () => {
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
     });
     const successful = pagent.observe(async () => 42, {
@@ -225,19 +225,19 @@ describe("Pagent", () => {
     await expect(failing()).rejects.toBe(failure);
     await pagent.flush();
 
-    expect(relayFetch).toHaveBeenCalledTimes(1);
-    await expect(decryptedPayload(eventBody(relayFetch))).resolves.toEqual({
+    expect(endpointFetch).toHaveBeenCalledTimes(1);
+    await expect(decryptedPayload(eventBody(endpointFetch))).resolves.toEqual({
       message: "database offline",
     });
   });
 
   it("preserves synchronous errors while observing them", async () => {
-    const relayFetch = successfulRelay();
+    const endpointFetch = successfulEndpoint();
     const failure = new Error("synchronous failure");
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
     });
     const observed = pagent.observe(
@@ -254,15 +254,15 @@ describe("Pagent", () => {
 
     expect(observed).toThrow(failure);
     await pagent.flush();
-    expect(relayFetch).toHaveBeenCalledTimes(1);
+    expect(endpointFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("adds a dynamic group to the relay investigation policy", async () => {
-    const relayFetch = successfulRelay();
+  it("adds a dynamic group to the endpoint investigation policy", async () => {
+    const endpointFetch = successfulEndpoint();
     const pagent = createPagent({
       enabled: true,
       environment: "staging",
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
     });
     const observed = pagent.observe(() => ({ region: "us-east-1" }), {
@@ -276,7 +276,7 @@ describe("Pagent", () => {
     observed();
     await pagent.flush();
 
-    expect(eventBody(relayFetch).investigation).toEqual({
+    expect(eventBody(endpointFetch).investigation).toEqual({
       cooldownMs: 60_000,
       group: "us-east-1",
     });
@@ -291,7 +291,7 @@ describe("Pagent", () => {
     const pagent = createPagent({
       enabled: true,
       environment: "production",
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
       onDeliveryError: (error) => errors.push(error),
     });
@@ -307,19 +307,19 @@ describe("Pagent", () => {
 
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({
-      message: "Pagent relay rejected the event with HTTP 503.",
-      code: "relay_rejected",
-      retryable: true,
+      message: "Pagent endpoint rejected the event with HTTP 503.",
+      code: "endpoint_rejected",
+      retryable: false,
       statusCode: 503,
     });
   });
 
   it("uses zero cooldown by default", async () => {
-    const relayFetch = successfulRelay();
+    const endpointFetch = successfulEndpoint();
     const pagent = createPagent({
       enabled: true,
       environment: "production",
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       encryption: encryptionOptions(),
     });
     const observed = pagent.observe(() => "application result", {
@@ -332,16 +332,16 @@ describe("Pagent", () => {
     observed();
     await pagent.flush();
 
-    expect(eventBody(relayFetch).investigation).toEqual({ cooldownMs: 0 });
+    expect(eventBody(endpointFetch).investigation).toEqual({ cooldownMs: 0 });
   });
 
-  it("uses an injected host-neutral relay transport", async () => {
+  it("uses an injected host-neutral endpoint transport", async () => {
     const transport = vi.fn(async () => ({ ok: true, status: 202 }));
     const pagent = createPagent({
       enabled: true,
       environment: "production",
       encryption: encryptionOptions(),
-      relay: { ...relayOptions(), transport },
+      endpoint: { ...endpointOptions(), transport },
     });
     const observed = pagent.observe(() => "failed", {
       event: defineEvent<{ reason: string }>({ name: "job.failed" }),
@@ -355,11 +355,11 @@ describe("Pagent", () => {
 
     expect(transport).toHaveBeenCalledTimes(1);
     expect(transport).toHaveBeenCalledWith(
-      "https://relay.example.test/v1/events",
+      "https://endpoint.example.test/v1/events",
       expect.objectContaining({
         method: "POST",
         headers: expect.objectContaining({
-          authorization: "Bearer relay-secret",
+          authorization: "Bearer source-secret",
         }),
       }),
     );
@@ -372,7 +372,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "production",
       encryption: encryptionOptions(),
-      relay: { ...relayOptions(), transport },
+      endpoint: { ...endpointOptions(), transport },
     });
     const observed = pagent.observe(() => "failed", {
       event: defineEvent<{ reason: string }>({ name: "job.failed" }),
@@ -403,7 +403,7 @@ describe("Pagent", () => {
       enabled: true,
       environment: "production",
       encryption: encryptionOptions(),
-      relay: { ...relayOptions(), transport },
+      endpoint: { ...endpointOptions(), transport },
     });
     const observed = pagent.observe(() => "failed", {
       event: defineEvent<{ reason: string }>({ name: "job.failed" }),
@@ -426,12 +426,12 @@ describe("Pagent", () => {
 
   it("rejects context that JSON would silently alter", async () => {
     const errors: unknown[] = [];
-    const relayFetch = successfulRelay();
+    const endpointFetch = successfulEndpoint();
     const pagent = createPagent({
       enabled: true,
       environment: "production",
       encryption: encryptionOptions(),
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
       onDeliveryError: (error) => errors.push(error),
     });
     const observed = pagent.observe(() => "failed", {
@@ -444,7 +444,7 @@ describe("Pagent", () => {
     expect(observed()).toBe("failed");
     await pagent.flush();
 
-    expect(relayFetch).not.toHaveBeenCalled();
+    expect(endpointFetch).not.toHaveBeenCalled();
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({
       code: "event_preparation_failed",
@@ -456,12 +456,12 @@ describe("Pagent", () => {
   });
 
   it("authenticates visible metadata with the encrypted context", async () => {
-    const relayFetch = successfulRelay();
+    const endpointFetch = successfulEndpoint();
     const pagent = createPagent({
       enabled: true,
       environment: "production",
       encryption: encryptionOptions(),
-      relay: relayOptions(),
+      endpoint: endpointOptions(),
     });
     const observed = pagent.observe(() => "failed", {
       event: defineEvent<{ reason: string }>({ name: "job.failed" }),
@@ -472,7 +472,7 @@ describe("Pagent", () => {
 
     observed();
     await pagent.flush();
-    const event = eventBody(relayFetch);
+    const event = eventBody(endpointFetch);
 
     await expect(
       decryptEventContext(
@@ -483,14 +483,14 @@ describe("Pagent", () => {
     ).rejects.toThrow("Pagent could not decrypt context");
   });
 
-  it("rejects oversized relay envelopes before sending them", async () => {
-    const relayFetch = vi.fn();
+  it("rejects oversized event envelopes before sending them", async () => {
+    const endpointFetch = vi.fn();
     const errors: unknown[] = [];
-    vi.stubGlobal("fetch", relayFetch);
+    vi.stubGlobal("fetch", endpointFetch);
     const pagent = createPagent({
       enabled: true,
       environment: "production",
-      relay: { ...relayOptions(), maxEnvelopeBytes: 128 },
+      endpoint: { ...endpointOptions(), maxEnvelopeBytes: 128 },
       encryption: encryptionOptions(),
       onDeliveryError: (error) => errors.push(error),
     });
@@ -504,7 +504,7 @@ describe("Pagent", () => {
     expect(observed()).toBe("application result");
     await pagent.flush();
 
-    expect(relayFetch).not.toHaveBeenCalled();
+    expect(endpointFetch).not.toHaveBeenCalled();
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({
       code: "payload_too_large",
@@ -513,10 +513,10 @@ describe("Pagent", () => {
     expect((errors[0] as Error).message).toMatch(/the limit is 128 bytes/);
   });
 
-  it("aborts relay requests after the configured timeout", async () => {
+  it("aborts endpoint requests after the configured timeout", async () => {
     vi.useFakeTimers();
     const errors: unknown[] = [];
-    const relayFetch = vi.fn(
+    const endpointFetch = vi.fn(
       (_url: URL, request: RequestInit) =>
         new Promise<Response>((_resolve, reject) => {
           request.signal?.addEventListener("abort", () => {
@@ -524,11 +524,11 @@ describe("Pagent", () => {
           });
         }),
     );
-    vi.stubGlobal("fetch", relayFetch);
+    vi.stubGlobal("fetch", endpointFetch);
     const pagent = createPagent({
       enabled: true,
       environment: "production",
-      relay: { ...relayOptions(), timeoutMs: 25 },
+      endpoint: { ...endpointOptions(), timeoutMs: 25 },
       encryption: encryptionOptions(),
       onDeliveryError: (error) => errors.push(error),
     });
@@ -540,7 +540,7 @@ describe("Pagent", () => {
     });
 
     expect(observed()).toBe("application result");
-    await vi.waitFor(() => expect(relayFetch).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(endpointFetch).toHaveBeenCalledTimes(1));
     await vi.advanceTimersByTimeAsync(25);
     await pagent.flush();
 
@@ -548,18 +548,44 @@ describe("Pagent", () => {
     expect(errors[0]).toMatchObject({
       name: "PagentDeliveryError",
       code: "timeout",
-      retryable: true,
+      retryable: false,
     });
   });
 
-  it("requires relay configuration when enabled", () => {
+  it("requires endpoint configuration when enabled", () => {
     expect(() =>
       createPagent({
         enabled: true,
         environment: "production",
         encryption: encryptionOptions(),
       }),
-    ).toThrow("Pagent requires a relay when enabled.");
+    ).toThrow("Pagent requires an endpoint when enabled.");
+  });
+
+  it.each([
+    "http://public.example.test/v1/events",
+    credentialedEndpoint(),
+    "https://public.example.test/v1/events#secret",
+  ])("rejects an unsafe endpoint URL %s", (url) => {
+    expect(() => createPagent({
+      enabled: true,
+      environment: "production",
+      endpoint: { url, token: "source-secret" },
+      encryption: encryptionOptions(),
+    })).toThrow("must use HTTPS");
+  });
+
+  it("allows HTTP only for local development loopback endpoints", () => {
+    expect(() => createPagent({
+      enabled: true,
+      environment: "local",
+      endpoint: {
+        url: "http://127.0.0.1:43121/v1/events",
+        token: "source-secret",
+        transport: async () => ({ ok: true, status: 202 }),
+      },
+      encryption: encryptionOptions(),
+    })).not.toThrow();
   });
 
   it("requires encryption configuration when enabled", () => {
@@ -567,7 +593,7 @@ describe("Pagent", () => {
       createPagent({
         enabled: true,
         environment: "production",
-        relay: relayOptions(),
+        endpoint: endpointOptions(),
       }),
     ).toThrow("Pagent requires encryption when enabled.");
   });
@@ -577,19 +603,19 @@ describe("Pagent", () => {
       createPagent({
         enabled: true,
         environment: "production",
-        relay: relayOptions(),
+        endpoint: endpointOptions(),
         encryption: { keyId: "invalid", key: "AA" },
       }),
     ).toThrow("Pagent encryption key must decode to 32 bytes.");
   });
 
-  it("does not require or validate relay configuration while inert", () => {
+  it("does not require or validate endpoint configuration while inert", () => {
     expect(() => createPagent({ enabled: true })).not.toThrow();
     expect(() =>
       createPagent({
         enabled: false,
         environment: "production",
-        relay: { url: "not a URL", token: "" },
+        endpoint: { url: "not a URL", token: "" },
       }),
     ).not.toThrow();
   });
@@ -607,40 +633,47 @@ describe("Pagent", () => {
   });
 });
 
-function relayOptions() {
+function endpointOptions() {
   return {
-    url: "https://relay.example.test/v1/events",
-    token: "relay-secret",
+    url: "https://endpoint.example.test/v1/events",
+    token: "source-secret",
   };
+}
+
+function credentialedEndpoint(): string {
+  const url = new URL("https://public.example.test/v1/events");
+  url.username = "test-user";
+  url.password = "synthetic-password";
+  return url.toString();
 }
 
 function encryptionOptions() {
   return { keyId: "test-key", key: TEST_ENCRYPTION_KEY };
 }
 
-function successfulRelay() {
-  const relayFetch = vi.fn(
+function successfulEndpoint() {
+  const endpointFetch = vi.fn(
     async () => new Response(null, { status: 202 }),
   );
-  vi.stubGlobal("fetch", relayFetch);
-  return relayFetch;
+  vi.stubGlobal("fetch", endpointFetch);
+  return endpointFetch;
 }
 
-function requestBody(relayFetch: ReturnType<typeof vi.fn>) {
-  const request = relayFetch.mock.calls[0]?.[1] as RequestInit | undefined;
+function requestBody(endpointFetch: ReturnType<typeof vi.fn>) {
+  const request = endpointFetch.mock.calls[0]?.[1] as RequestInit | undefined;
   if (typeof request?.body !== "string") {
     throw new Error("Expected a JSON request body");
   }
   return JSON.parse(request.body) as {
     version: number;
-    event: EncryptedRelayEvent;
+    event: EncryptedPagentEvent;
   };
 }
 
-function eventBody(relayFetch: ReturnType<typeof vi.fn>): EncryptedRelayEvent {
-  return requestBody(relayFetch).event;
+function eventBody(endpointFetch: ReturnType<typeof vi.fn>): EncryptedPagentEvent {
+  return requestBody(endpointFetch).event;
 }
 
-function decryptedPayload(event: EncryptedRelayEvent) {
+function decryptedPayload(event: EncryptedPagentEvent) {
   return decryptEventContext(event, event.context, TEST_ENCRYPTION_KEY);
 }
