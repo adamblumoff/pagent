@@ -107,7 +107,7 @@ Options:
   --enrollment <token>   Short-lived enrollment token
   --environments <list>  Comma-separated environments (default: staging)
   --yes                   Skip the confirmation prompt
-  --no-start              Do not start Pagent after setup
+  --no-start              Do not start Pagent or enable automatic startup
   --reset                 Replace an existing Pagent setup
   -h, --help              Show help for init`,
   enrollment: `Usage: pagent enrollment create [options]
@@ -128,7 +128,7 @@ Options:
   -h, --help             Show help for tunnel`,
   start: `Usage: pagent start [options]
 
-Start the local connector in the background.
+Start the local connector and enable automatic startup.
 
 Options:
   --foreground   Run in the current terminal
@@ -136,7 +136,7 @@ Options:
   -h, --help     Show help for start`,
   stop: `Usage: pagent stop
 
-Stop the local connector gracefully.
+Stop the current run without disabling startup after reboot.
 
 Options:
   -h, --help  Show help for stop`,
@@ -188,7 +188,7 @@ Commands:
   init        Provision a tunnel and write local configuration
   enrollment  Create a one-time setup token
   tunnel      Revoke this environment's tunnel
-  start       Start Pagent (background by default)
+  start       Start Pagent and enable automatic startup
   stop        Stop Pagent gracefully
   status      Show ingress and tunnel state
   events      Show recent event handoffs

@@ -33,3 +33,5 @@ pagent init \
 ```
 
 Init checks Git and Codex, installs a pinned checksum-verified `cloudflared` build when needed, provisions the environment, writes owner-only local credentials, and starts Pagent. The generated `.pagent/cloud.env` contains the application SDK settings; it does not contain Cloudflare account credentials.
+
+Pagent also registers a per-user startup entry on Linux, macOS, and Windows. It returns after the user signs in following a reboot and restarts after an unexpected exit. `pagent stop` stops the current run without disabling startup; revoking the tunnel removes the startup entry.

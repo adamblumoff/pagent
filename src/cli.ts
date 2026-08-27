@@ -34,10 +34,17 @@ import {
   localStatePaths,
   type LocalStatePaths,
 } from "./local-state.js";
+import {
+  installStartupService,
+  removeStartupService,
+  type StartupServiceOptions,
+  type StartupServiceRegistration,
+} from "./startup-service.js";
 import { PAGENT_VERSION } from "./version.js";
 
 const DAEMON_ENVIRONMENT_KEY = "PAGENT_INTERNAL_DAEMON";
 const START_RECEIPT_TIMEOUT_MS = 15_000;
+const MANAGED_START_TIMEOUT_MS = 30_000;
 
 interface DaemonReceipt {
   type: "ready" | "error";
@@ -149,10 +156,6 @@ async function tunnelCommand(
     }
   }
   const paths = localStatePaths({ stateDirectory: loaded.config.stateDirectory });
-  const running = await existingDaemon(paths);
-  if (running !== undefined) {
-    await requestLocalControl(paths.controlEndpoint, { method: "stop" });
-  }
   const managementToken = process.env.PAGENT_MANAGEMENT_TOKEN?.trim();
   if (!managementToken) {
     throw new Error("PAGENT_MANAGEMENT_TOKEN is required to revoke this tunnel.");
@@ -165,6 +168,11 @@ async function tunnelCommand(
     managementToken,
     idempotencyKey: `revoke-${loaded.config.tunnel.environmentId}`,
   });
+  const running = await existingDaemon(paths);
+  if (running !== undefined) {
+    await requestLocalControl(paths.controlEndpoint, { method: "stop" });
+  }
+  await removeStartupService(startupServiceOptions(loaded, paths));
   console.log(`Revoked tunnel ${loaded.config.tunnel.environmentId}.`);
 }
 
@@ -359,6 +367,7 @@ async function startCommand(
   const paths = localStatePaths({ stateDirectory: loaded.config.stateDirectory });
   const existing = await existingDaemon(paths);
   if (existing !== undefined) {
+    if (!foreground) await enableStartup(loaded, paths, false);
     console.log(
       `Pagent is already running (PID ${existing.pid}, ${existing.phase}).`,
     );
@@ -377,10 +386,82 @@ async function startCommand(
     return;
   }
 
+  const managed = await enableStartup(loaded, paths, true);
+  if (managed !== undefined) {
+    const status = await waitForManagedStart(paths, managed.manager);
+    console.log(
+      `\nPagent started with ${managed.manager} (PID ${status.pid}, tunnel connected).`,
+    );
+    return;
+  }
+
   const status = await startBackground(loaded, paths);
   console.log(
     `\nPagent started in the background (PID ${status.pid}, tunnel connected).`,
   );
+}
+
+async function enableStartup(
+  loaded: LoadedConnectorConfig,
+  paths: LocalStatePaths,
+  startImmediately: boolean,
+): Promise<StartupServiceRegistration | undefined> {
+  try {
+    const options = {
+      ...startupServiceOptions(loaded, paths),
+      startImmediately,
+    };
+    const service = await installStartupService(options);
+    if (service === undefined) {
+      console.warn(
+        `Automatic startup is not supported on ${process.platform}. Start Pagent again after reboot.`,
+      );
+      return undefined;
+    }
+    console.log(`Automatic startup enabled with ${service.manager}.`);
+    return service;
+  } catch (error) {
+    if (startImmediately) {
+      try {
+        await removeStartupService(startupServiceOptions(loaded, paths));
+      } catch {
+        // The original installation error is more useful than cleanup failure here.
+      }
+    }
+    console.warn(
+      `Automatic startup could not be enabled: ${safeErrorMessage(error)}`,
+    );
+    return undefined;
+  }
+}
+
+async function waitForManagedStart(
+  paths: LocalStatePaths,
+  manager: string,
+): Promise<LocalDaemonStatus> {
+  const deadline = Date.now() + MANAGED_START_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const status = await existingDaemon(paths);
+    if (status?.phase === "ready") return status;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  throw new Error(
+    `Pagent is registered with ${manager}, but it has not connected yet. The service will keep retrying; run \`pagent status\` to check it.`,
+  );
+}
+
+function startupServiceOptions(
+  loaded: LoadedConnectorConfig,
+  paths: LocalStatePaths,
+): StartupServiceOptions {
+  return {
+    projectDirectory: loaded.projectDirectory,
+    stateDirectory: paths.directory,
+    logPath: paths.logPath,
+    executablePath: process.execPath,
+    cliPath: fileURLToPath(import.meta.url),
+    ...(typeof process.getuid === "function" ? { userId: process.getuid() } : {}),
+  };
 }
 
 async function startBackground(
