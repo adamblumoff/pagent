@@ -52,29 +52,29 @@ export interface EventDefinition<TPayload> {
   readonly [eventPayload]?: () => TPayload;
 }
 
-export interface RelayOptions {
+export interface EndpointOptions {
   url: string;
   token: string;
-  transport?: RelayTransport | undefined;
+  transport?: DeliveryTransport | undefined;
   timeoutMs?: number | undefined;
   maxEnvelopeBytes?: number | undefined;
 }
 
-export interface RelayTransportRequest {
+export interface DeliveryTransportRequest {
   method: "POST";
   headers: Readonly<Record<string, string>>;
   body: string;
 }
 
-export interface RelayTransportResponse {
+export interface DeliveryTransportResponse {
   readonly ok: boolean;
   readonly status: number;
 }
 
-export type RelayTransport = (
+export type DeliveryTransport = (
   url: string,
-  request: RelayTransportRequest,
-) => Promise<RelayTransportResponse>;
+  request: DeliveryTransportRequest,
+) => Promise<DeliveryTransportResponse>;
 
 export interface PagentEncryptionOptions {
   keyId: string;
@@ -85,7 +85,7 @@ export interface PagentEncryptionOptions {
 export type PagentDeliveryErrorCode =
   | "event_preparation_failed"
   | "payload_too_large"
-  | "relay_rejected"
+  | "endpoint_rejected"
   | "timeout"
   | "network";
 
@@ -108,13 +108,13 @@ export interface EncryptedContext {
   ciphertext: string;
 }
 
-export interface EncryptedRelayEvent extends PagentEventMetadata {
+export interface EncryptedPagentEvent extends PagentEventMetadata {
   context: EncryptedContext;
 }
 
-export interface RelayEventEnvelope {
+export interface EventEnvelope {
   version: typeof EVENT_PROTOCOL_VERSION;
-  event: EncryptedRelayEvent;
+  event: EncryptedPagentEvent;
 }
 
 export interface ResultObservation<
@@ -184,7 +184,7 @@ export interface PagentClient {
 export interface PagentOptions {
   enabled?: boolean | undefined;
   environment?: string | undefined;
-  relay?: RelayOptions | undefined;
+  endpoint?: EndpointOptions | undefined;
   encryption?: PagentEncryptionOptions | undefined;
   onDelivery?: ((receipt: PagentDeliveryReceipt) => void) | undefined;
   onDeliveryError?: ((error: PagentDeliveryError) => void) | undefined;

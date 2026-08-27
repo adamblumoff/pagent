@@ -20,8 +20,8 @@ export default defineRailway(() => {
       PAGENT_ENCRYPTION_KEY: preserve(),
       PAGENT_ENCRYPTION_KEY_ID: preserve(),
       PAGENT_ENV: preserve(),
-      PAGENT_RELAY_TOKEN: preserve(),
-      PAGENT_RELAY_URL: preserve(),
+      PAGENT_SOURCE_TOKEN: preserve(),
+      PAGENT_ENDPOINT_URL: preserve(),
     },
   });
 

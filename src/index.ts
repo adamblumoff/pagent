@@ -15,9 +15,9 @@ export {
   type PagentDeliveryReceipt,
   type PagentEncryptionOptions,
   type PagentOptions,
-  type RelayOptions,
-  type RelayTransport,
-  type RelayTransportRequest,
-  type RelayTransportResponse,
+  type DeliveryTransport,
+  type DeliveryTransportRequest,
+  type DeliveryTransportResponse,
+  type EndpointOptions,
   type ResultObservation,
 } from "./types.js";

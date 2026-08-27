@@ -9,20 +9,20 @@ import type { Readable } from "node:stream";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { RelayEventEnvelope } from "../../src/types.js";
+import type { EventEnvelope } from "../../src/types.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 const FRAMEWORK_ROOT = resolve(ROOT, "test/e2e/frameworks");
 const TEST_ENCRYPTION_KEY =
   "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const TEST_RELAY_TOKEN = "e2e-relay-token";
+const TEST_SOURCE_TOKEN = "e2e-source-token";
 type FixtureProcess = ChildProcessByStdio<null, Readable, Readable>;
 const children = new Set<FixtureProcess>();
 
 interface CapturedRequest {
   authorization: string | undefined;
   body: string;
-  envelope: RelayEventEnvelope;
+  envelope: EventEnvelope;
   method: string | undefined;
   url: string | undefined;
 }
@@ -43,10 +43,10 @@ afterEach(async () => {
 });
 
 describe.each(fixtures)("$name framework fixture", (fixture) => {
-  it("preserves HTTP behavior and sends encrypted relay events", async () => {
-    const relay = await startRelayCapture();
+  it("preserves HTTP behavior and sends encrypted events", async () => {
+    const endpoint = await startEndpointCapture();
     const port = await availablePort();
-    const process = startFixture(fixture, port, relay.url);
+    const process = startFixture(fixture, port, endpoint.url);
 
     try {
       await waitForHealthy(process, port);
@@ -57,7 +57,7 @@ describe.each(fixtures)("$name framework fixture", (fixture) => {
         body: { status: "ok", framework: fixture.name },
       });
       await delay(100);
-      expect(relay.requests).toHaveLength(0);
+      expect(endpoint.requests).toHaveLength(0);
 
       const failure = await resolvesWithin(getJson(port, "/failure"), 2_000);
       expect(failure).toEqual({
@@ -69,9 +69,9 @@ describe.each(fixtures)("$name framework fixture", (fixture) => {
           route: "failure",
         },
       });
-      await waitForRequests(relay.requests, 1);
-      expectRelayEvent(relay.requests[0], fixture.name, "fixture.failure", "failure");
-      relay.releaseAll();
+      await waitForRequests(endpoint.requests, 1);
+      expectEndpointEvent(endpoint.requests[0], fixture.name, "fixture.failure", "failure");
+      endpoint.releaseAll();
 
       const thrown = await resolvesWithin(getJson(port, "/throw"), 2_000);
       expect(thrown).toEqual({
@@ -82,29 +82,29 @@ describe.each(fixtures)("$name framework fixture", (fixture) => {
           sameError: true,
         },
       });
-      await waitForRequests(relay.requests, 2);
-      expectRelayEvent(relay.requests[1], fixture.name, "fixture.error", "throw");
-      relay.releaseAll();
+      await waitForRequests(endpoint.requests, 2);
+      expectEndpointEvent(endpoint.requests[1], fixture.name, "fixture.error", "throw");
+      endpoint.releaseAll();
 
       const burst = await resolvesWithin(getJson(port, "/burst"), 2_000);
       expect(burst).toEqual({
         status: 503,
         body: { status: "unhealthy", framework: fixture.name, count: 3 },
       });
-      await waitForRequests(relay.requests, 5);
-      for (const request of relay.requests.slice(2)) {
-        expectRelayEvent(request, fixture.name, "fixture.failure", "burst");
+      await waitForRequests(endpoint.requests, 5);
+      for (const request of endpoint.requests.slice(2)) {
+        expectEndpointEvent(request, fixture.name, "fixture.failure", "burst");
       }
-      relay.releaseAll();
+      endpoint.releaseAll();
     } finally {
-      relay.releaseAll();
+      endpoint.releaseAll();
       await stopFixture(process);
-      await relay.close();
+      await endpoint.close();
     }
   });
 });
 
-function expectRelayEvent(
+function expectEndpointEvent(
   request: CapturedRequest | undefined,
   framework: FrameworkFixture["name"],
   type: string,
@@ -112,7 +112,7 @@ function expectRelayEvent(
 ): void {
   expect(request).toBeDefined();
   expect(request).toMatchObject({
-    authorization: `Bearer ${TEST_RELAY_TOKEN}`,
+    authorization: `Bearer ${TEST_SOURCE_TOKEN}`,
     method: "POST",
     url: "/v1/events",
   });
@@ -140,7 +140,7 @@ function expectRelayEvent(
 function startFixture(
   fixture: FrameworkFixture,
   port: number,
-  relayUrl: string,
+  endpointUrl: string,
 ): FixtureProcess {
   const command = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
   const commonEnvironment = {
@@ -149,8 +149,8 @@ function startFixture(
     PAGENT_ENV: "e2e",
     PAGENT_ENCRYPTION_KEY: TEST_ENCRYPTION_KEY,
     PAGENT_ENCRYPTION_KEY_ID: "e2e-key",
-    PAGENT_RELAY_TOKEN: TEST_RELAY_TOKEN,
-    PAGENT_RELAY_URL: relayUrl,
+    PAGENT_SOURCE_TOKEN: TEST_SOURCE_TOKEN,
+    PAGENT_ENDPOINT_URL: endpointUrl,
     PORT: String(port),
   };
   const args =
@@ -176,9 +176,9 @@ function startFixture(
           "--var",
           "PAGENT_ENCRYPTION_KEY_ID:e2e-key",
           "--var",
-          `PAGENT_RELAY_TOKEN:${TEST_RELAY_TOKEN}`,
+          `PAGENT_SOURCE_TOKEN:${TEST_SOURCE_TOKEN}`,
           "--var",
-          `PAGENT_RELAY_URL:${relayUrl}`,
+          `PAGENT_ENDPOINT_URL:${endpointUrl}`,
         ]
       : ["--filter", fixture.packageName, "start"];
   const child = spawn(command, args, {
@@ -229,7 +229,7 @@ async function getJson(
   return { status: response.status, body };
 }
 
-async function startRelayCapture(): Promise<{
+async function startEndpointCapture(): Promise<{
   close(): Promise<void>;
   releaseAll(): void;
   requests: CapturedRequest[];
@@ -243,7 +243,7 @@ async function startRelayCapture(): Promise<{
       requests.push({
         authorization: request.headers.authorization,
         body,
-        envelope: JSON.parse(body) as RelayEventEnvelope,
+        envelope: JSON.parse(body) as EventEnvelope,
         method: request.method,
         url: request.url,
       });
@@ -258,7 +258,7 @@ async function startRelayCapture(): Promise<{
   });
   const address = server.address();
   if (address === null || typeof address === "string") {
-    throw new Error("Relay capture did not bind to a TCP port.");
+    throw new Error("Endpoint capture did not bind to a TCP port.");
   }
   return {
     requests,

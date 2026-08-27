@@ -18,7 +18,7 @@ try {
   const pagent = createPagent({
     enabled: true,
     environment: "staging",
-    relay: {
+    endpoint: {
       url: `http://127.0.0.1:${server.port}/v1/events`,
       token: "bun-source-token",
     },

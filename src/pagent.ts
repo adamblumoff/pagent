@@ -4,9 +4,9 @@ import {
 } from "./crypto.js";
 import {
   asDeliveryError,
-  createRelayEmitter,
-  type RelayEmitter,
-} from "./relay.js";
+  createEndpointEmitter,
+  type EndpointEmitter,
+} from "./delivery.js";
 import type {
   ErrorObservation,
   EventDefinition,
@@ -44,7 +44,7 @@ class Pagent implements PagentClient {
   readonly #onDeliveryError: PagentOptions["onDeliveryError"];
   readonly #onDelivery: PagentOptions["onDelivery"];
   readonly #pending = new Set<Promise<void>>();
-  readonly #relay: RelayEmitter | undefined;
+  readonly #endpoint: EndpointEmitter | undefined;
 
   constructor(options: PagentOptions) {
     this.#environment = options.environment?.trim() || undefined;
@@ -53,15 +53,15 @@ class Pagent implements PagentClient {
       this.#enabled && options.encryption !== undefined
         ? createEventContextEncryptor(options.encryption)
         : undefined;
-    this.#relay =
-      !this.#enabled || options.relay === undefined
+    this.#endpoint =
+      !this.#enabled || options.endpoint === undefined
         ? undefined
-        : createRelayEmitter(options.relay);
+        : createEndpointEmitter(options.endpoint);
     this.#onDeliveryError = options.onDeliveryError;
     this.#onDelivery = options.onDelivery;
 
-    if (this.#enabled && this.#relay === undefined) {
-      throw new Error("Pagent requires a relay when enabled.");
+    if (this.#enabled && this.#endpoint === undefined) {
+      throw new Error("Pagent requires an endpoint when enabled.");
     }
     if (this.#enabled && this.#encrypt === undefined) {
       throw new Error("Pagent requires encryption when enabled.");
@@ -207,7 +207,7 @@ class Pagent implements PagentClient {
       ...metadata,
       context: await this.#encrypt!(metadata, payload),
     };
-    await this.#relay!(event);
+    await this.#endpoint!(event);
     try {
       this.#onDelivery?.({
         eventId: metadata.id,

@@ -100,12 +100,12 @@ export async function buildRelease({ tag, outputDirectory, skipBuild }) {
   const packageJson = JSON.parse(
     await readFile(join(repositoryRoot, "package.json"), "utf8"),
   );
-  const relayPackageJson = JSON.parse(
-    await readFile(join(repositoryRoot, "relay/package.json"), "utf8"),
+  const provisionerPackageJson = JSON.parse(
+    await readFile(join(repositoryRoot, "provisioner/package.json"), "utf8"),
   );
-  const compatibility = await inspectBuiltRelease(
+  const releaseMetadata = await inspectBuiltRelease(
     packageJson.version,
-    relayPackageJson.version,
+    provisionerPackageJson.version,
     version,
   );
 
@@ -132,7 +132,7 @@ export async function buildRelease({ tag, outputDirectory, skipBuild }) {
       version,
       commit: releaseCommit(),
       requirements: { node: packageJson.engines.node, codex: "installed locally" },
-      protocols: compatibility.protocols,
+      eventProtocol: releaseMetadata.eventProtocol,
       artifacts,
     };
     const manifestPath = join(outputDirectory, "release-manifest.json");
@@ -160,37 +160,29 @@ async function stagePackage(directory, packageJson, version) {
   await chmod(join(directory, "dist/cli.js"), 0o755);
 }
 
-async function inspectBuiltRelease(packageVersion, relayPackageVersion, releaseVersion) {
+async function inspectBuiltRelease(
+  packageVersion,
+  provisionerPackageVersion,
+  releaseVersion,
+) {
   const sdkVersionModule = await import(
     pathToFileURL(join(repositoryRoot, "dist/version.js")).href + `?release=${Date.now()}`
-  );
-  const relayVersionModule = await import(
-    pathToFileURL(join(repositoryRoot, "relay/dist/src/version.js")).href +
-      `?release=${Date.now()}`
   );
   const cliVersion = run(process.execPath, [join(repositoryRoot, "dist/cli.js"), "--version"], {
     encoding: "utf8",
   }).trim();
   assertVersionAgreement(releaseVersion, {
     "package.json": packageVersion,
-    "relay/package.json": relayPackageVersion,
+    "provisioner/package.json": provisionerPackageVersion,
     SDK: sdkVersionModule.PAGENT_VERSION,
-    relay: relayVersionModule.PAGENT_VERSION,
     CLI: cliVersion,
   });
 
-  const protocols = {
-    event: sdkVersionModule.EVENT_PROTOCOL_VERSION,
-    relay: sdkVersionModule.RELAY_PROTOCOL_VERSION,
-  };
-  if (
-    protocols.event !== relayVersionModule.EVENT_PROTOCOL_VERSION ||
-    protocols.relay !== relayVersionModule.RELAY_PROTOCOL_VERSION
-  ) {
-    throw new Error("SDK and relay protocol versions do not agree.");
+  if (!Number.isSafeInteger(sdkVersionModule.EVENT_PROTOCOL_VERSION)) {
+    throw new Error("SDK event protocol version must be an integer.");
   }
 
-  return { protocols };
+  return { eventProtocol: sdkVersionModule.EVENT_PROTOCOL_VERSION };
 }
 
 async function packPackage(packageDirectory, outputDirectory, version) {

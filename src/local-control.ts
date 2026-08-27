@@ -8,9 +8,7 @@ const MAX_MESSAGE_BYTES = 64 * 1024;
 
 export type LocalDaemonPhase =
   | "starting"
-  | "connecting"
   | "ready"
-  | "reconnecting"
   | "stopping";
 
 export interface LocalDaemonErrorSummary {
@@ -30,8 +28,11 @@ export interface LocalDaemonStatus {
   startedAt: string;
   controlEndpoint: string;
   phase: LocalDaemonPhase;
-  relayConnected: boolean;
-  pendingTasks: number;
+  ingressReady: boolean;
+  ingressPort: number;
+  tunnelConnected: boolean;
+  tunnelHostname: string;
+  cloudflaredPid?: number | undefined;
   lastHandoff?: LocalHandoffSummary | undefined;
   lastError?: LocalDaemonErrorSummary | undefined;
 }
@@ -389,11 +390,28 @@ function localDaemonStatus(value: unknown): LocalDaemonStatus {
   if (!isDaemonPhase(value.phase)) {
     throw new Error("Pagent daemon returned an invalid phase.");
   }
-  if (typeof value.relayConnected !== "boolean") {
-    throw new Error("Pagent daemon returned an invalid relay status.");
+  if (typeof value.ingressReady !== "boolean") {
+    throw new Error("Pagent daemon returned an invalid ingress status.");
   }
-  if (!Number.isSafeInteger(value.pendingTasks) || (value.pendingTasks as number) < 0) {
-    throw new Error("Pagent daemon returned an invalid pending task count.");
+  if (
+    !Number.isSafeInteger(value.ingressPort) ||
+    (value.ingressPort as number) < 1 ||
+    (value.ingressPort as number) > 65_535
+  ) {
+    throw new Error("Pagent daemon returned an invalid ingress port.");
+  }
+  if (typeof value.tunnelConnected !== "boolean") {
+    throw new Error("Pagent daemon returned an invalid tunnel status.");
+  }
+  if (typeof value.tunnelHostname !== "string" || value.tunnelHostname === "") {
+    throw new Error("Pagent daemon returned an invalid tunnel hostname.");
+  }
+  if (
+    value.cloudflaredPid !== undefined &&
+    (!Number.isSafeInteger(value.cloudflaredPid) ||
+      (value.cloudflaredPid as number) <= 0)
+  ) {
+    throw new Error("Pagent daemon returned an invalid cloudflared PID.");
   }
 
   return {
@@ -402,8 +420,13 @@ function localDaemonStatus(value: unknown): LocalDaemonStatus {
     startedAt: value.startedAt,
     controlEndpoint: value.controlEndpoint,
     phase: value.phase,
-    relayConnected: value.relayConnected,
-    pendingTasks: value.pendingTasks as number,
+    ingressReady: value.ingressReady,
+    ingressPort: value.ingressPort as number,
+    tunnelConnected: value.tunnelConnected,
+    tunnelHostname: value.tunnelHostname,
+    ...(value.cloudflaredPid === undefined
+      ? {}
+      : { cloudflaredPid: value.cloudflaredPid as number }),
     ...(value.lastHandoff === undefined
       ? {}
       : { lastHandoff: handoffSummary(value.lastHandoff) }),
@@ -450,11 +473,7 @@ function localStopResult(value: unknown): LocalStopResult {
 
 function isDaemonPhase(value: unknown): value is LocalDaemonPhase {
   return (
-    value === "starting" ||
-    value === "connecting" ||
-    value === "ready" ||
-    value === "reconnecting" ||
-    value === "stopping"
+    value === "starting" || value === "ready" || value === "stopping"
   );
 }
 

@@ -3,7 +3,8 @@ export {
   type ConnectorConfig,
   type ConnectorEncryptionConfig,
   type ConnectorKeyring,
-  type ConnectorRelayConfig,
+  type LocalIngressConfig,
+  type TunnelConfig,
 } from "./config.js";
 export type {
   CodexAgentOptions,

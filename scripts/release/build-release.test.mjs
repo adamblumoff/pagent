@@ -14,7 +14,7 @@ test("requires every component to match the release version", () => {
     assertVersionAgreement("0.1.0-rc.1", {
       "package.json": "0.1.0-rc.1",
       SDK: "0.1.0-rc.1",
-      relay: "0.1.0-rc.1",
+      CLI: "0.1.0-rc.1",
     }),
   );
   assert.throws(

@@ -1,8 +1,8 @@
 packages:
   - .
   - demo
-  - relay
+  - provisioner
 
-allowBuilds:
-  esbuild: true
-  workerd: true
+onlyBuiltDependencies:
+  - esbuild
+  - workerd

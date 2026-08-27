@@ -17,21 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: pagent_test
-          POSTGRES_USER: pagent
-          POSTGRES_PASSWORD: pagent
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U pagent -d pagent_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -65,11 +50,6 @@ jobs:
         run: |
           pnpm test
           pnpm test:release
-
-      - name: Test PostgreSQL store
-        run: pnpm --filter pagent-relay test:postgres
-        env:
-          PAGENT_TEST_DATABASE_URL: postgresql://pagent:pagent@127.0.0.1:5432/pagent_test
 
       - name: Test framework consumers
         run: pnpm test:e2e:frameworks

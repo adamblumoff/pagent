@@ -1,7 +1,7 @@
 export const cliCommandNames = [
   "init",
   "enrollment",
-  "connector",
+  "tunnel",
   "start",
   "stop",
   "status",
@@ -15,13 +15,11 @@ export const cliCommandNames = [
 export type CliCommandName = (typeof cliCommandNames)[number];
 
 export const eventLifecycleStatuses = [
-  "queued",
   "received",
   "running",
-  "retrying",
-  "needs-attention",
   "completed",
   "suppressed",
+  "failed",
 ] as const;
 
 export type EventLifecycleStatus = (typeof eventLifecycleStatuses)[number];
@@ -29,7 +27,7 @@ export type EventLifecycleStatus = (typeof eventLifecycleStatuses)[number];
 export type CliCommand =
   | {
       name: "init";
-      relay: string | undefined;
+      provisioner: string | undefined;
       enrollment: string | undefined;
       environments: string[];
       yes: boolean;
@@ -38,16 +36,14 @@ export type CliCommand =
     }
   | {
       name: "enrollment";
-      relay: string | undefined;
+      action: "create";
+      provisioner: string | undefined;
       adminToken: string | undefined;
       ttlMinutes: number;
-      connectorId: string | undefined;
     }
   | {
-      name: "connector";
-      connectorId: string;
-      relay: string | undefined;
-      adminToken: string | undefined;
+      name: "tunnel";
+      action: "revoke";
       yes: boolean;
     }
   | {
@@ -104,35 +100,32 @@ export class CliUsageError extends Error {
 const helpByCommand: Record<CliCommandName, string> = {
   init: `Usage: pagent init [options]
 
-Enroll this repository and write its local configuration.
+Provision a Cloudflare Tunnel and write this repository's local configuration.
 
 Options:
-  --relay <url>           Relay URL
-  --enrollment <code>    Single-use enrollment code
+  --provisioner <url>     Pagent provisioning service URL
+  --enrollment <token>   Short-lived enrollment token
   --environments <list>  Comma-separated environments (default: staging)
   --yes                   Skip the confirmation prompt
-  --no-start              Do not start the connector after setup
+  --no-start              Do not start Pagent after setup
   --reset                 Replace an existing Pagent setup
   -h, --help              Show help for init`,
   enrollment: `Usage: pagent enrollment create [options]
 
-Create a short-lived, single-use enrollment code.
+Create a short-lived, single-use token for \`pagent init\`.
 
 Options:
-  --relay <url>          Relay URL
-  --admin-token <token> Relay administrator token
-  --ttl <minutes>       Code lifetime from 1 to 1440 minutes (default: 15)
-  --connector <id>      Scope the code to rotating this connector
-  -h, --help            Show help for enrollment`,
-  connector: `Usage: pagent connector revoke <connector-id> [options]
+  --provisioner <url>    Pagent provisioning service URL
+  --admin-token <token>  Provisioner admin token (prefer the environment variable)
+  --ttl <minutes>        Token lifetime from 1 to 1440 minutes (default: 10)
+  -h, --help             Show help for enrollment`,
+  tunnel: `Usage: pagent tunnel revoke [options]
 
-Revoke a dynamic connector and close its relay streams.
+Delete this environment's Cloudflare Tunnel and revoke its management token.
 
 Options:
-  --relay <url>          Relay URL
-  --admin-token <token> Relay administrator token
   --yes                  Skip the confirmation prompt
-  -h, --help             Show help for connector`,
+  -h, --help             Show help for tunnel`,
   start: `Usage: pagent start [options]
 
 Start the local connector in the background.
@@ -149,7 +142,7 @@ Options:
   -h, --help  Show help for stop`,
   status: `Usage: pagent status [options]
 
-Show connector state and relay connectivity.
+Show local ingress and Cloudflare Tunnel state.
 
 Options:
   --json      Print machine-readable JSON
@@ -189,15 +182,15 @@ Print the installed Pagent version.`,
 
 const generalHelp = `Usage: pagent <command> [options]
 
-Run and inspect the local Pagent connector.
+Run and inspect local Pagent.
 
 Commands:
-  init        Enroll this repository and write its configuration
-  enrollment  Create a single-use enrollment code
-  connector   Revoke a connector
-  start       Start the connector (background by default)
-  stop        Stop the connector gracefully
-  status      Show connector state
+  init        Provision a tunnel and write local configuration
+  enrollment  Create a one-time setup token
+  tunnel      Revoke this environment's tunnel
+  start       Start Pagent (background by default)
+  stop        Stop Pagent gracefully
+  status      Show ingress and tunnel state
   events      Show recent event handoffs
   logs        Read connector logs
   doctor      Check the local setup without changing it
@@ -249,8 +242,8 @@ export function parseCliArgs(args: readonly string[]): CliCommand {
       return parseInit(rest);
     case "enrollment":
       return parseEnrollment(rest);
-    case "connector":
-      return parseConnector(rest);
+    case "tunnel":
+      return parseTunnel(rest);
     case "start":
       return parseStart(rest);
     case "stop":
@@ -275,87 +268,54 @@ export function parseCliArgs(args: readonly string[]): CliCommand {
 function parseEnrollment(args: readonly string[]): CliCommand {
   if (args[0] !== "create") {
     throw new CliUsageError(
-      'The enrollment command requires the action "create".',
+      "Usage: pagent enrollment create [--provisioner <url>] [--admin-token <token>] [--ttl <minutes>].",
     );
   }
-  let relay: string | undefined;
+  let provisioner: string | undefined;
   let adminToken: string | undefined;
-  let connectorId: string | undefined;
-  let ttlMinutes = 15;
+  let ttlMinutes = 10;
   let hasTtl = false;
-
   for (let index = 1; index < args.length; index += 1) {
     const arg = args[index]!;
-    const option = valueOption(arg, [
-      "--relay",
-      "--admin-token",
-      "--ttl",
-      "--connector",
-    ]);
+    const option = valueOption(arg, ["--provisioner", "--admin-token", "--ttl"]);
     if (!option) rejectCommandArg("enrollment", arg);
-    const duplicate =
-      (option.flag === "--relay" && relay !== undefined) ||
+    if (
+      (option.flag === "--provisioner" && provisioner !== undefined) ||
       (option.flag === "--admin-token" && adminToken !== undefined) ||
-      (option.flag === "--connector" && connectorId !== undefined) ||
-      (option.flag === "--ttl" && hasTtl);
-    if (duplicate) throw duplicateOption("enrollment", option.flag);
+      (option.flag === "--ttl" && hasTtl)
+    ) {
+      throw duplicateOption("enrollment", option.flag);
+    }
     const value = optionValue(option, args[index + 1]);
     if (option.inlineValue === undefined) index += 1;
-    if (option.flag === "--relay") relay = value;
-    else if (option.flag === "--admin-token") adminToken = value;
-    else if (option.flag === "--connector") connectorId = value;
-    else {
-      ttlMinutes = parsePositiveInteger("--ttl", value);
+    if (option.flag === "--provisioner") {
+      provisioner = value;
+    } else if (option.flag === "--admin-token") {
+      adminToken = value;
+    } else {
+      ttlMinutes = parsePositiveInteger(option.flag, value);
       if (ttlMinutes > 1_440) {
         throw new CliUsageError('Option "--ttl" cannot exceed 1440 minutes.');
       }
       hasTtl = true;
     }
   }
-  return {
-    name: "enrollment",
-    relay,
-    adminToken,
-    ttlMinutes,
-    connectorId,
-  };
+  return { name: "enrollment", action: "create", provisioner, adminToken, ttlMinutes };
 }
 
-function parseConnector(args: readonly string[]): CliCommand {
-  if (args[0] !== "revoke" || args[1] === undefined || args[1].startsWith("-")) {
-    throw new CliUsageError(
-      'Usage: pagent connector revoke <connector-id> [options].',
-    );
+function parseTunnel(args: readonly string[]): CliCommand {
+  if (args[0] !== "revoke") {
+    throw new CliUsageError('Usage: pagent tunnel revoke [--yes].');
   }
-  const connectorId = args[1];
-  let relay: string | undefined;
-  let adminToken: string | undefined;
   let yes = false;
-
-  for (let index = 2; index < args.length; index += 1) {
-    const arg = args[index]!;
+  for (const arg of args.slice(1)) {
     if (arg === "--yes") {
-      yes = setOnce("connector", arg, yes);
+      yes = setOnce("tunnel", arg, yes);
       continue;
     }
-    const option = valueOption(arg, ["--relay", "--admin-token"]);
-    if (!option) rejectCommandArg("connector", arg);
-    const duplicate =
-      (option.flag === "--relay" && relay !== undefined) ||
-      (option.flag === "--admin-token" && adminToken !== undefined);
-    if (duplicate) throw duplicateOption("connector", option.flag);
-    const value = optionValue(option, args[index + 1]);
-    if (option.inlineValue === undefined) index += 1;
-    if (option.flag === "--relay") relay = value;
-    else adminToken = value;
+    rejectCommandArg("tunnel", arg);
   }
-  return {
-    name: "connector",
-    connectorId,
-    relay,
-    adminToken,
-    yes,
-  };
+  return { name: "tunnel", action: "revoke", yes };
 }
 
 function valueOption<const TFlag extends string>(
@@ -387,7 +347,7 @@ function optionValue(
 }
 
 function parseInit(args: readonly string[]): CliCommand {
-  let relay: string | undefined;
+  let provisioner: string | undefined;
   let enrollment: string | undefined;
   let environments = ["staging"];
   let hasEnvironments = false;
@@ -412,13 +372,13 @@ function parseInit(args: readonly string[]): CliCommand {
     }
 
     const option = valueOption(arg, [
-      "--relay",
+      "--provisioner",
       "--enrollment",
       "--environments",
     ]);
     if (option !== undefined) {
       const duplicate =
-        (option.flag === "--relay" && relay !== undefined) ||
+        (option.flag === "--provisioner" && provisioner !== undefined) ||
         (option.flag === "--enrollment" && enrollment !== undefined) ||
         (option.flag === "--environments" && hasEnvironments);
       if (duplicate) {
@@ -427,8 +387,8 @@ function parseInit(args: readonly string[]): CliCommand {
 
       const value = optionValue(option, args[index + 1]);
 
-      if (option.flag === "--relay") {
-        relay = value;
+      if (option.flag === "--provisioner") {
+        provisioner = value;
       } else if (option.flag === "--enrollment") {
         enrollment = value;
       } else {
@@ -447,7 +407,7 @@ function parseInit(args: readonly string[]): CliCommand {
 
   return {
     name: "init",
-    relay,
+    provisioner,
     enrollment,
     environments,
     yes,

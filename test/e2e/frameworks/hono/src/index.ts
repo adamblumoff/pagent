@@ -12,8 +12,8 @@ interface Bindings {
   PAGENT_ENV?: string;
   PAGENT_ENCRYPTION_KEY?: string;
   PAGENT_ENCRYPTION_KEY_ID?: string;
-  PAGENT_RELAY_TOKEN?: string;
-  PAGENT_RELAY_URL?: string;
+  PAGENT_SOURCE_TOKEN?: string;
+  PAGENT_ENDPOINT_URL?: string;
 }
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -64,8 +64,8 @@ function service(bindings: Bindings): FixtureService {
       environment: bindings.PAGENT_ENV,
       encryptionKey: bindings.PAGENT_ENCRYPTION_KEY,
       encryptionKeyId: bindings.PAGENT_ENCRYPTION_KEY_ID,
-      relayToken: bindings.PAGENT_RELAY_TOKEN,
-      relayUrl: bindings.PAGENT_RELAY_URL,
+      sourceToken: bindings.PAGENT_SOURCE_TOKEN,
+      endpointUrl: bindings.PAGENT_ENDPOINT_URL,
     }),
   );
 }

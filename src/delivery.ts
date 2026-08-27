@@ -1,18 +1,18 @@
 import type {
+  DeliveryTransportRequest,
+  DeliveryTransportResponse,
+  EncryptedPagentEvent,
+  EndpointOptions,
+  EventEnvelope,
   PagentDeliveryError,
   PagentDeliveryErrorCode,
-  EncryptedRelayEvent,
-  RelayEventEnvelope,
-  RelayOptions,
-  RelayTransportRequest,
-  RelayTransportResponse,
 } from "./types.js";
 import { EVENT_PROTOCOL_VERSION } from "./version.js";
 
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_MAX_ENVELOPE_BYTES = 64 * 1024;
 
-export type RelayEmitter = (event: EncryptedRelayEvent) => Promise<void>;
+export type EndpointEmitter = (event: EncryptedPagentEvent) => Promise<void>;
 
 export function asDeliveryError(error: unknown): PagentDeliveryError {
   if (isDeliveryError(error)) {
@@ -26,30 +26,30 @@ export function asDeliveryError(error: unknown): PagentDeliveryError {
   );
 }
 
-export function createRelayEmitter(options: RelayOptions): RelayEmitter {
+export function createEndpointEmitter(options: EndpointOptions): EndpointEmitter {
   const url = requireHttpUrl(options.url);
   const token = options.token.trim();
   const timeoutMs = positiveInteger(
     options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    "relay.timeoutMs",
+    "endpoint.timeoutMs",
   );
   const maxEnvelopeBytes = positiveInteger(
     options.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
-    "relay.maxEnvelopeBytes",
+    "endpoint.maxEnvelopeBytes",
   );
 
-  if (token.length === 0) {
-    throw new Error("Pagent relay token is required.");
+  if (token.length === 0 || /[\r\n]/u.test(token)) {
+    throw new Error("Pagent endpoint token is required.");
   }
   if (
     options.transport !== undefined &&
     typeof options.transport !== "function"
   ) {
-    throw new Error("Pagent relay transport must be a function.");
+    throw new Error("Pagent endpoint transport must be a function.");
   }
 
   return async (event) => {
-    const envelope: RelayEventEnvelope = {
+    const envelope: EventEnvelope = {
       version: EVENT_PROTOCOL_VERSION,
       event,
     };
@@ -69,7 +69,7 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
     if (byteLength > maxEnvelopeBytes) {
       throw deliveryError(
         "payload_too_large",
-        `Pagent relay event is ${byteLength} bytes; the limit is ${maxEnvelopeBytes} bytes.`,
+        `Pagent event is ${byteLength} bytes; the limit is ${maxEnvelopeBytes} bytes.`,
         false,
       );
     }
@@ -78,7 +78,7 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
     try {
-      const request: RelayTransportRequest = {
+      const request: DeliveryTransportRequest = {
         method: "POST",
         headers: {
           authorization: `Bearer ${token}`,
@@ -88,7 +88,7 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
       };
       const delivery =
         options.transport === undefined
-          ? nativeRelayTransport(url, request, controller.signal)
+          ? nativeTransport(url, request, controller.signal)
           : options.transport(url.toString(), request);
       const response = await Promise.race([
         delivery,
@@ -98,8 +98,8 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
             reject(
               deliveryError(
                 "timeout",
-                `Pagent relay delivery timed out after ${timeoutMs}ms.`,
-                true,
+                `Pagent endpoint delivery timed out after ${timeoutMs}ms.`,
+                false,
               ),
             );
           }, timeoutMs);
@@ -108,11 +108,9 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
 
       if (!response.ok) {
         throw deliveryError(
-          "relay_rejected",
-          `Pagent relay rejected the event with HTTP ${response.status}.`,
-          response.status === 408 ||
-            response.status === 429 ||
-            response.status >= 500,
+          "endpoint_rejected",
+          `Pagent endpoint rejected the event with HTTP ${response.status}.`,
+          false,
           undefined,
           response.status,
         );
@@ -123,8 +121,8 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
       }
       throw deliveryError(
         "network",
-        "Pagent could not reach the relay.",
-        true,
+        "Pagent could not reach the endpoint.",
+        false,
         error,
       );
     } finally {
@@ -135,14 +133,14 @@ export function createRelayEmitter(options: RelayOptions): RelayEmitter {
   };
 }
 
-async function nativeRelayTransport(
+async function nativeTransport(
   url: URL,
-  request: RelayTransportRequest,
+  request: DeliveryTransportRequest,
   signal: AbortSignal,
-): Promise<RelayTransportResponse> {
+): Promise<DeliveryTransportResponse> {
   if (typeof globalThis.fetch !== "function") {
     throw new Error(
-      "This runtime does not provide fetch; configure relay.transport.",
+      "This runtime does not provide fetch; configure endpoint.transport.",
     );
   }
   return globalThis.fetch(url, { ...request, signal });
@@ -179,7 +177,7 @@ function isDeliveryErrorCode(value: unknown): value is PagentDeliveryErrorCode {
   return (
     value === "event_preparation_failed" ||
     value === "payload_too_large" ||
-    value === "relay_rejected" ||
+    value === "endpoint_rejected" ||
     value === "timeout" ||
     value === "network"
   );
@@ -190,10 +188,21 @@ function requireHttpUrl(value: string): URL {
   try {
     url = new URL(value);
   } catch {
-    throw new Error("Pagent relay URL must be a valid HTTP or HTTPS URL.");
+    throw new Error("Pagent endpoint URL must be a valid HTTP or HTTPS URL.");
   }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("Pagent relay URL must be a valid HTTP or HTTPS URL.");
+  const loopback =
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]" ||
+    url.hostname === "localhost";
+  if (
+    (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.hash !== ""
+  ) {
+    throw new Error(
+      "Pagent endpoint URL must use HTTPS, except for an HTTP loopback address, and must not contain credentials or a fragment.",
+    );
   }
   return url;
 }

@@ -22,17 +22,17 @@ const pagent = createPagent({
           keyId: requireEnvironment("PAGENT_ENCRYPTION_KEY_ID"),
           key: requireEnvironment("PAGENT_ENCRYPTION_KEY"),
         },
-        relay: {
+        endpoint: {
           url: new URL(
             "/v1/events",
-            requireEnvironment("PAGENT_RELAY_URL"),
+            requireEnvironment("PAGENT_ENDPOINT_URL"),
           ).toString(),
-          token: requireEnvironment("PAGENT_RELAY_TOKEN"),
+          token: requireEnvironment("PAGENT_SOURCE_TOKEN"),
         },
       }
     : {}),
   onDeliveryError: (error) =>
-    console.error("[pagent] relay emission failed", error),
+    console.error("[pagent] endpoint delivery failed", error),
 });
 
 const observedHealthCheck = pagent.observe(checkHealth, {
