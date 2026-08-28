@@ -235,21 +235,33 @@ class Pagent implements PagentClient {
     const now = Date.now();
     if (
       cooldownKey !== undefined &&
-      (this.#inFlightCooldowns.has(cooldownKey) ||
-        (this.#cooldownExpirations.get(cooldownKey) ?? -Infinity) > now)
+      !cooldownAvailable(
+        this.#cooldownExpirations,
+        this.#inFlightCooldowns,
+        cooldownKey,
+        now,
+      )
     ) {
       return;
-    }
-    if (cooldownKey !== undefined) {
-      this.#inFlightCooldowns.add(cooldownKey);
     }
 
     const investigation = {
       cooldownMs,
       ...(group === undefined ? {} : { group }),
     };
+    const payload = await options.context(observation);
+    if (
+      cooldownKey !== undefined &&
+      !reserveCooldown(
+        this.#cooldownExpirations,
+        this.#inFlightCooldowns,
+        cooldownKey,
+        Date.now(),
+      )
+    ) {
+      return;
+    }
     try {
-      const payload = await options.context(observation);
       const metadata: PagentEventMetadata = {
         id: crypto.randomUUID(),
         type: options.event.name,
@@ -310,20 +322,45 @@ function rememberCooldown(
   );
   expirations.delete(key);
   expirations.set(key, expiresAt);
-  if (expirations.size <= LOCAL_COOLDOWN_LIMIT) {
-    return;
-  }
+}
 
+function pruneExpiredCooldowns(
+  expirations: Map<string, number>,
+  now: number,
+): void {
   for (const [storedKey, storedExpiresAt] of expirations) {
-    if (storedExpiresAt <= deliveredAt) {
+    if (storedExpiresAt <= now) {
       expirations.delete(storedKey);
     }
   }
-  while (expirations.size > LOCAL_COOLDOWN_LIMIT) {
-    const oldest = expirations.keys().next().value;
-    if (oldest === undefined) {
-      return;
-    }
-    expirations.delete(oldest);
+}
+
+function cooldownAvailable(
+  expirations: Map<string, number>,
+  inFlight: Set<string>,
+  key: string,
+  now: number,
+): boolean {
+  const expiresAt = expirations.get(key);
+  if (inFlight.has(key) || (expiresAt !== undefined && expiresAt > now)) {
+    return false;
   }
+  if (expirations.size + inFlight.size < LOCAL_COOLDOWN_LIMIT) {
+    return true;
+  }
+  pruneExpiredCooldowns(expirations, now);
+  return expirations.size + inFlight.size < LOCAL_COOLDOWN_LIMIT;
+}
+
+function reserveCooldown(
+  expirations: Map<string, number>,
+  inFlight: Set<string>,
+  key: string,
+  now: number,
+): boolean {
+  if (!cooldownAvailable(expirations, inFlight, key, now)) {
+    return false;
+  }
+  inFlight.add(key);
+  return true;
 }

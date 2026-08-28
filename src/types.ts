@@ -143,15 +143,15 @@ export interface ObserveResultOptions<
 > {
   event: EventDefinition<TPayload>;
   on: "result";
-  triggerWhen(
+  triggerWhen: (
     observation: ResultObservation<TArgs, TResult>,
-  ): boolean | Promise<boolean>;
-  group?(
+  ) => boolean | Promise<boolean>;
+  group?: (
     observation: ResultObservation<TArgs, TResult>,
-  ): string | undefined | Promise<string | undefined>;
-  context(
+  ) => string | undefined | Promise<string | undefined>;
+  context: (
     observation: ResultObservation<TArgs, TResult>,
-  ): JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
+  ) => JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
 }
 
 export interface ObserveErrorOptions<
@@ -160,15 +160,15 @@ export interface ObserveErrorOptions<
 > {
   event: EventDefinition<TPayload>;
   on: "error";
-  triggerWhen(
+  triggerWhen: (
     observation: ErrorObservation<TArgs>,
-  ): boolean | Promise<boolean>;
-  group?(
+  ) => boolean | Promise<boolean>;
+  group?: (
     observation: ErrorObservation<TArgs>,
-  ): string | undefined | Promise<string | undefined>;
-  context(
+  ) => string | undefined | Promise<string | undefined>;
+  context: (
     observation: ErrorObservation<TArgs>,
-  ): JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
+  ) => JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
 }
 
 export interface ObserveResultAndErrorOptions<
@@ -180,15 +180,15 @@ export interface ObserveResultAndErrorOptions<
   on:
     | readonly ["result", "error"]
     | readonly ["error", "result"];
-  triggerWhen(
+  triggerWhen: (
     observation: Observation<TArgs, TResult>,
-  ): boolean | Promise<boolean>;
-  group?(
+  ) => boolean | Promise<boolean>;
+  group?: (
     observation: Observation<TArgs, TResult>,
-  ): string | undefined | Promise<string | undefined>;
-  context(
+  ) => string | undefined | Promise<string | undefined>;
+  context: (
     observation: Observation<TArgs, TResult>,
-  ): JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
+  ) => JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
 }
 
 export type ObserveOptions<

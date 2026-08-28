@@ -6,6 +6,7 @@ import type {
   ObserveOptions,
   ObserveResultAndErrorOptions,
   ObserveResultOptions,
+  ResultObservation,
 } from "../src/index.js";
 
 type CloudExports = typeof import("../src/index.js");
@@ -46,6 +47,17 @@ const validResultAndErrorObservation = {
 } satisfies ObserveResultAndErrorOptions<[], string, { reason: string }>;
 
 void validResultAndErrorObservation;
+
+const invalidNarrowCombinedObservation = {
+  event: typedEvent,
+  on: ["result", "error"],
+  // @ts-expect-error Combined callbacks must accept both observation branches.
+  triggerWhen: (observation: ResultObservation<[], string>) =>
+    observation.result === "failed",
+  context: () => ({ reason: "expected" }),
+} satisfies ObserveResultAndErrorOptions<[], string, { reason: string }>;
+
+void invalidNarrowCombinedObservation;
 
 const storedObservation: ObserveOptions<[], string, { reason: string }> =
   Math.random() < 0.5

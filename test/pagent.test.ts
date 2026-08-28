@@ -246,6 +246,69 @@ describe("Pagent", () => {
     expect(endpointFetch).toHaveBeenCalledTimes(1_001);
   });
 
+  it("drops unseen groups instead of evicting active cooldowns", async () => {
+    const endpointFetch = successfulEndpoint();
+    const pagent = createPagent({
+      enabled: true,
+      environment: "staging",
+      endpoint: endpointOptions(),
+      encryption: encryptionOptions(),
+    });
+    const observed = pagent.observe((group: string) => group, {
+      event: defineEvent<{ reason: string }>({
+        name: "health.bounded-cooldowns",
+        investigation: { cooldownMs: 86_400_000 },
+      }),
+      on: "result",
+      triggerWhen: () => true,
+      group: ({ result }) => result,
+      context: () => ({ reason: "still unhealthy" }),
+    });
+
+    for (let index = 0; index < 1_000; index += 1) {
+      observed(`active-${index}`);
+    }
+    await pagent.flush();
+    observed("over-capacity");
+    observed("active-0");
+    await pagent.flush();
+
+    expect(endpointFetch).toHaveBeenCalledTimes(1_000);
+  });
+
+  it("does not lock a cooldown group behind pending context", async () => {
+    const endpointFetch = successfulEndpoint();
+    let releaseContext!: (value: { reason: string }) => void;
+    const pendingContext = new Promise<{ reason: string }>((resolve) => {
+      releaseContext = resolve;
+    });
+    const context = vi.fn(({ result }: { result: string }) =>
+      result === "blocked"
+        ? pendingContext
+        : { reason: "ready" });
+    const pagent = createPagent({
+      enabled: true,
+      environment: "staging",
+      endpoint: endpointOptions(),
+      encryption: encryptionOptions(),
+    });
+    const observed = pagent.observe((state: string) => state, {
+      event: healthFailed,
+      on: "result",
+      triggerWhen: () => true,
+      context,
+    });
+
+    observed("blocked");
+    await vi.waitFor(() => expect(context).toHaveBeenCalledTimes(1));
+    observed("ready");
+    await vi.waitFor(() => expect(endpointFetch).toHaveBeenCalledTimes(1));
+
+    releaseContext({ reason: "unblocked" });
+    await pagent.flush();
+    expect(endpointFetch).toHaveBeenCalledTimes(1);
+  });
+
   it("does not let a failed delivery suppress a later trigger", async () => {
     const errors: unknown[] = [];
     const endpointFetch = vi
