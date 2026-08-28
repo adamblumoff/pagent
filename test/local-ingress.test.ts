@@ -30,19 +30,23 @@ describe("local ingress", () => {
   it("accepts an encrypted event and dispatches Codex from the local repository", async () => {
     const requests: AgentRequest[] = [];
     const lifecycle: LocalIngressLifecycleUpdate[] = [];
-    const results: string[] = [];
+    let finishAgent: (() => void) | undefined;
+    const agentCompletion = new Promise<void>((resolveCompletion) => {
+      finishAgent = resolveCompletion;
+    });
     const server = await start({
       agent: {
         async run(request) {
           requests.push(request);
-          return { threadId: "thread-1" };
+          await request.onThreadStarted({
+            threadId: "thread-1",
+            threadName: request.threadName,
+          });
+          await agentCompletion;
         },
       },
       onLifecycle: (update) => {
         lifecycle.push(update);
-      },
-      onAgentResult: (result) => {
-        results.push(result.threadId ?? "unknown");
       },
     });
 
@@ -54,11 +58,12 @@ describe("local ingress", () => {
       eventId: "event-1",
     });
     await vi.waitFor(() => expect(requests).toHaveLength(1));
-    expect(requests[0]).toEqual({
+    expect(requests[0]).toMatchObject({
       cwd: resolve("."),
       prompt: expect.stringContaining(
         "Find the root cause and report the supporting evidence. Do not modify files.",
       ),
+      threadName: "Investigating health.failed in pagent",
       event: {
         id: "event-1",
         type: "health.failed",
@@ -68,21 +73,36 @@ describe("local ingress", () => {
         payload: { reason: "pool exhausted" },
       },
       signal: expect.any(AbortSignal),
+      onThreadStarted: expect.any(Function),
     });
     expect(requests[0]?.prompt).toContain("Event ID: event-1");
     await vi.waitFor(() =>
       expect(lifecycle.map((update) => update.status)).toEqual([
         "received",
-        "running",
+        "thread-started",
+      ]),
+    );
+    expect(lifecycle[1]).toMatchObject({
+      threadId: "thread-1",
+      threadName: "Investigating health.failed in pagent",
+    });
+
+    finishAgent?.();
+    await vi.waitFor(() =>
+      expect(lifecycle.map((update) => update.status)).toEqual([
+        "received",
+        "thread-started",
         "completed",
       ]),
     );
-    expect(lifecycle[2]).toMatchObject({ threadId: "thread-1" });
-    expect(results).toEqual(["thread-1"]);
+    expect(lifecycle[2]).toMatchObject({
+      threadId: "thread-1",
+      threadName: "Investigating health.failed in pagent",
+    });
   });
 
   it("proves encrypted readiness without dispatching or changing admission state", async () => {
-    const run = vi.fn(async () => ({ threadId: "thread-probe" }));
+    const run = vi.fn(async () => undefined);
     const lifecycle: LocalIngressLifecycleUpdate[] = [];
     const server = await start({
       agent: { run },
@@ -110,7 +130,7 @@ describe("local ingress", () => {
   });
 
   it("rejects requests before Codex for route, method, auth, media, size, and policy failures", async () => {
-    const run = vi.fn(async () => ({}));
+    const run = vi.fn(async () => undefined);
     const server = await start({ agent: { run }, maxBodyBytes: 1_024 });
     const valid = await envelope("event-policy");
 
@@ -150,7 +170,7 @@ describe("local ingress", () => {
   });
 
   it("rejects unknown, malformed, and tampered encryption contexts", async () => {
-    const run = vi.fn(async () => ({}));
+    const run = vi.fn(async () => undefined);
     const server = await start({ agent: { run } });
     const unknownKey = await envelope("unknown-key", {
       keyId: "unknown",
@@ -176,7 +196,7 @@ describe("local ingress", () => {
 
   it("deduplicates event IDs and applies cooldown by event route and group", async () => {
     let now = Date.parse("2026-08-27T12:00:00.000Z");
-    const run = vi.fn(async () => ({}));
+    const run = vi.fn(async () => undefined);
     const lifecycle: LocalIngressLifecycleUpdate[] = [];
     const server = await start({
       agent: { run },
@@ -223,7 +243,13 @@ describe("local ingress", () => {
 
   it("records a failed dispatch without retrying it", async () => {
     const failure = new Error("Codex unavailable");
-    const run = vi.fn(async () => Promise.reject(failure));
+    const run = vi.fn(async (request: AgentRequest) => {
+      await request.onThreadStarted({
+        threadId: "thread-failed",
+        threadName: request.threadName,
+      });
+      throw failure;
+    });
     const lifecycle: LocalIngressLifecycleUpdate[] = [];
     const errors: unknown[] = [];
     const server = await start({
@@ -238,11 +264,21 @@ describe("local ingress", () => {
 
     expect(response.status).toBe(202);
     await vi.waitFor(() =>
-      expect(lifecycle.at(-1)).toMatchObject({
-        status: "failed",
-        errorCode: "codex_failed",
-        errorMessage: "Codex unavailable",
-      }),
+      expect(lifecycle).toEqual([
+        expect.objectContaining({ status: "received" }),
+        expect.objectContaining({
+          status: "thread-started",
+          threadId: "thread-failed",
+          threadName: "Investigating health.failed in pagent",
+        }),
+        expect.objectContaining({
+          status: "failed",
+          errorCode: "codex_failed",
+          errorMessage: "Codex unavailable",
+          threadId: "thread-failed",
+          threadName: "Investigating health.failed in pagent",
+        }),
+      ]),
     );
     expect(run).toHaveBeenCalledOnce();
     expect(errors).toEqual([failure]);
@@ -255,7 +291,7 @@ describe("local ingress", () => {
         source: { token: TOKEN, allowedEnvironments: ["staging"] },
         repositories: { first: ".", second: ".." },
         encryption: { keys: { current: KEY } },
-        agent: { run: vi.fn(async () => ({})) },
+        agent: { run: vi.fn(async () => undefined) },
       }),
     ).rejects.toThrow("exactly one configured repository");
 
@@ -276,7 +312,6 @@ describe("local ingress", () => {
               { once: true },
             );
           });
-          return {};
         },
       },
     });
@@ -298,7 +333,7 @@ async function start(
     source: { token: TOKEN, allowedEnvironments: ["staging"] },
     repositories: { pagent: "." },
     encryption: { keys: { current: KEY } },
-    agent: { run: vi.fn(async () => ({})) },
+    agent: { run: vi.fn(async () => undefined) },
     ...overrides,
   });
   servers.push(server);

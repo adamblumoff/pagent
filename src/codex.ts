@@ -3,7 +3,7 @@ import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 
-import type { AgentAdapter, AgentResult } from "./agent.js";
+import type { AgentAdapter, AgentRequest } from "./agent.js";
 import { PAGENT_VERSION } from "./version.js";
 
 export type CodexApprovalPolicy = "never" | "on-request" | "untrusted";
@@ -62,8 +62,7 @@ interface AppServerConnection {
 
 export function codexAgent(options: CodexAgentOptions = {}): AgentAdapter {
   return {
-    run: (request) =>
-      runCodex(request.cwd, request.prompt, options, request.signal),
+    run: (request) => runCodex(request, options),
   };
 }
 
@@ -178,12 +177,11 @@ function sandboxPolicy(
 }
 
 async function runCodex(
-  requestedCwd: string,
-  prompt: string,
+  request: AgentRequest,
   options: CodexAgentOptions,
-  signal: AbortSignal | undefined,
-): Promise<AgentResult> {
-  const cwd = resolve(requestedCwd);
+): Promise<void> {
+  const cwd = resolve(request.cwd);
+  const signal = request.signal;
   await requireLocalDirectory(cwd);
   throwIfAborted(signal);
 
@@ -220,12 +218,23 @@ async function runCodex(
     );
     const threadId = thread.thread.id;
 
+    await setThreadNameBestEffort(
+      appServer,
+      threadId,
+      request.threadName,
+      signal,
+    );
+    await request.onThreadStarted({
+      threadId,
+      threadName: request.threadName,
+    });
+
     send(appServer.child, {
       method: "turn/start",
-      id: 3,
+      id: 4,
       params: {
         threadId,
-        input: [{ type: "text", text: prompt, text_elements: [] }],
+        input: [{ type: "text", text: request.prompt, text_elements: [] }],
       },
     });
 
@@ -236,7 +245,7 @@ async function runCodex(
         signal,
       );
 
-      if (message.id === 3 && message.error !== undefined) {
+      if (message.id === 4 && message.error !== undefined) {
         throw requestError("turn/start", message.error);
       }
 
@@ -250,11 +259,35 @@ async function runCodex(
             `Codex turn ended with status ${completed.status}.`,
         );
       }
-      return { threadId };
+      return;
     }
   } finally {
     signal?.removeEventListener("abort", abort);
     closeAppServer(appServer);
+  }
+}
+
+async function setThreadNameBestEffort(
+  appServer: AppServerConnection,
+  threadId: string,
+  name: string,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  send(appServer.child, {
+    method: "thread/name/set",
+    id: 3,
+    params: { threadId, name },
+  });
+  try {
+    await waitForResponse(
+      appServer.messages,
+      3,
+      "thread/name/set",
+      appServer.stderr,
+      signal,
+    );
+  } catch {
+    throwIfAborted(signal);
   }
 }
 

@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 
-import type { AgentResult } from "./agent.js";
 import { codexAgent } from "./codex.js";
 import type { ConnectorConfig } from "./config.js";
 import { createEventContextEncryptor } from "./crypto.js";
@@ -29,6 +28,10 @@ import {
 } from "./tunnel-process.js";
 import type { EncryptedPagentEvent, EventEnvelope } from "./types.js";
 import { EVENT_PROTOCOL_VERSION } from "./version.js";
+import {
+  createSlackThreadStartedNotifier,
+  type ThreadStartedNotifier,
+} from "./slack-notifications.js";
 
 const STARTUP_TIMEOUT_MS = 20_000;
 const HEALTH_POLL_MS = 250;
@@ -65,6 +68,11 @@ export async function runLocalConnector(
     tunnelHostname: options.config.tunnel.hostname,
   };
   const history = new FileHandoffHistory(options.paths.historyPath);
+  const slackNotifier =
+    options.config.notifications?.slack === undefined
+      ? undefined
+      : createSlackThreadStartedNotifier(options.config.notifications.slack);
+  const notificationTasks = new Set<Promise<void>>();
   const stop = () => {
     if (abort.signal.aborted) return;
     status.phase = "stopping";
@@ -97,9 +105,18 @@ export async function runLocalConnector(
       repositories: options.config.repositories,
       encryption: options.config.encryption,
       agent: codexAgent(options.config.codex),
-      onLifecycle: (update, event, route) =>
-        recordLifecycle(history, update, event, route),
-      onAgentResult: (result, event) => logAgentResult(log, result, event),
+      onLifecycle: async (update, event, route) => {
+        await recordLifecycle(history, update, event, route);
+        logLifecycle(log, update, event);
+        dispatchThreadStartedNotification({
+          notifier: slackNotifier,
+          tasks: notificationTasks,
+          update,
+          event,
+          route,
+          onError: (error) => recordNotificationError(status, log, error),
+        });
+      },
       onError: (error) => recordDaemonError(status, log, error),
     });
     status.ingressReady = true;
@@ -137,6 +154,7 @@ export async function runLocalConnector(
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
     await Promise.allSettled([tunnel?.stop(), ingress?.close()]);
+    await Promise.allSettled([...notificationTasks]);
     status.ingressReady = false;
     status.tunnelConnected = false;
     await control.close();
@@ -198,14 +216,24 @@ async function recordLifecycle(
 function lifecyclePatch(
   update: LocalIngressLifecycleUpdate,
 ): Partial<HandoffHistoryRecord> & { status: HandoffStatus } {
-  if (update.status === "running") {
-    return { status: "running", startedAt: update.occurredAt };
+  if (update.status === "thread-started") {
+    return {
+      status: "running",
+      startedAt: update.occurredAt,
+      ...(update.threadId === undefined ? {} : { threadId: update.threadId }),
+      ...(update.threadName === undefined
+        ? {}
+        : { threadName: update.threadName }),
+    };
   }
   if (update.status === "completed") {
     return {
       status: "completed",
       completedAt: update.occurredAt,
       ...(update.threadId === undefined ? {} : { threadId: update.threadId }),
+      ...(update.threadName === undefined
+        ? {}
+        : { threadName: update.threadName }),
     };
   }
   if (update.status === "suppressed") {
@@ -223,6 +251,10 @@ function lifecyclePatch(
       ...(update.errorMessage === undefined
         ? {}
         : { errorMessage: update.errorMessage }),
+      ...(update.threadId === undefined ? {} : { threadId: update.threadId }),
+      ...(update.threadName === undefined
+        ? {}
+        : { threadName: update.threadName }),
     };
   }
   return { status: "received" };
@@ -349,12 +381,68 @@ async function within<T>(
   }
 }
 
-function logAgentResult(
+function logLifecycle(
   log: (message: string) => void,
-  result: AgentResult,
+  update: LocalIngressLifecycleUpdate,
   event: EncryptedPagentEvent,
 ): void {
-  log(`[pagent] ${event.type} diagnosis thread: ${result.threadId ?? "unknown"}`);
+  if (update.status === "thread-started") {
+    log(
+      `[pagent] ${event.type} investigation thread started: ${update.threadId ?? "unknown"}`,
+    );
+  } else if (update.status === "completed") {
+    log(`[pagent] ${event.type} investigation completed`);
+  } else if (update.status === "failed") {
+    log(
+      `[pagent] ${event.type} investigation failed: ${update.errorMessage ?? update.errorCode ?? "unknown error"}`,
+    );
+  } else if (update.status === "suppressed") {
+    log(
+      `[pagent] ${event.type} investigation suppressed: ${update.reason ?? "unknown reason"}`,
+    );
+  }
+}
+
+function dispatchThreadStartedNotification(options: {
+  notifier: ThreadStartedNotifier | undefined;
+  tasks: Set<Promise<void>>;
+  update: LocalIngressLifecycleUpdate;
+  event: EncryptedPagentEvent;
+  route: LocalIngressRoute;
+  onError(error: unknown): void;
+}): void {
+  if (
+    options.notifier === undefined ||
+    options.update.status !== "thread-started" ||
+    options.update.threadId === undefined ||
+    options.update.threadName === undefined
+  ) {
+    return;
+  }
+
+  const task = options.notifier({
+    eventId: options.event.id,
+    eventType: options.event.type,
+    environment: options.event.environment,
+    eventOccurredAt: options.event.occurredAt,
+    repositoryKey: options.route.repositoryKey,
+    threadId: options.update.threadId,
+    threadName: options.update.threadName,
+    startedAt: options.update.occurredAt,
+  })
+    .catch(options.onError)
+    .finally(() => options.tasks.delete(task));
+  options.tasks.add(task);
+}
+
+function recordNotificationError(
+  status: LocalDaemonStatus,
+  log: (message: string) => void,
+  error: unknown,
+): void {
+  const message = safeErrorMessage(error);
+  status.lastError = { message, occurredAt: new Date().toISOString() };
+  log(`[pagent] Slack notification error: ${message}`);
 }
 
 function recordDaemonError(

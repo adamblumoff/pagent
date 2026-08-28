@@ -29,29 +29,63 @@ describe("file handoff history", () => {
     await expect(history.update("event-1", {
       status: "running",
       startedAt: "2026-08-26T12:02:00.000Z",
-    })).resolves.toMatchObject({ status: "running" });
+      threadId: "thread-1",
+      threadName: "Investigating checkout.failure-rate in pagent",
+    })).resolves.toMatchObject({
+      status: "running",
+      threadId: "thread-1",
+      threadName: "Investigating checkout.failure-rate in pagent",
+    });
     await expect(history.update("event-1", {
       status: "completed",
       completedAt: "2026-08-26T12:03:00.000Z",
-      threadId: "thread-1",
     })).resolves.toMatchObject({
       status: "completed",
       threadId: "thread-1",
+      threadName: "Investigating checkout.failure-rate in pagent",
     });
 
     await expect(history.findByEventId("event-1")).resolves.toMatchObject({
       eventId: "event-1",
       status: "completed",
       threadId: "thread-1",
+      threadName: "Investigating checkout.failure-rate in pagent",
     });
     await expect(history.update("missing", { status: "running" })).resolves.toBeUndefined();
     expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({
       version: 1,
-      records: [{ eventId: "event-1", threadId: "thread-1" }],
+      records: [{
+        eventId: "event-1",
+        threadId: "thread-1",
+        threadName: "Investigating checkout.failure-rate in pagent",
+      }],
     });
     if (process.platform !== "win32") {
       expect((await stat(path)).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it("preserves a started thread when its investigation fails", async () => {
+    const history = new FileHandoffHistory(await historyPath());
+    await history.upsert(handoff({ eventId: "event-failed" }));
+    await history.update("event-failed", {
+      status: "running",
+      startedAt: "2026-08-26T12:02:00.000Z",
+      threadId: "thread-failed",
+      threadName: "Investigating checkout.failure-rate in pagent",
+    });
+
+    await expect(history.update("event-failed", {
+      status: "failed",
+      completedAt: "2026-08-26T12:03:00.000Z",
+      errorCode: "codex_failed",
+      errorMessage: "Codex turn failed.",
+    })).resolves.toMatchObject({
+      status: "failed",
+      threadId: "thread-failed",
+      threadName: "Investigating checkout.failure-rate in pagent",
+      errorCode: "codex_failed",
+    });
   });
 
   it.each<HandoffStatus>([

@@ -38,7 +38,7 @@ describe("codexAgent", () => {
       return server.child;
     });
 
-    const result = await codexAgent().run(request());
+    await expect(codexAgent().run(request())).resolves.toBeUndefined();
 
     expect(childProcesses.spawn).toHaveBeenCalledWith(
       "codex",
@@ -55,6 +55,10 @@ describe("codexAgent", () => {
     expect(server.message("thread/start")?.params).toEqual({
       cwd: process.cwd(),
     });
+    expect(server.message("thread/name/set")?.params).toEqual({
+      threadId: "codex-thread-1",
+      name: "Pagent · health.failed · staging",
+    });
     expect(server.message("turn/start")?.params).toEqual({
       threadId: "codex-thread-1",
       input: [
@@ -65,7 +69,65 @@ describe("codexAgent", () => {
         },
       ],
     });
-    expect(result).toEqual({ threadId: "codex-thread-1" });
+  });
+
+  it("reports a named thread before its turn completes", async () => {
+    const server = fakeAppServer(false);
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => server.child.emit("spawn"));
+      return server.child;
+    });
+    const abort = new AbortController();
+    let continueRun: (() => void) | undefined;
+    const threadRecorded = new Promise<void>((resolve) => {
+      continueRun = resolve;
+    });
+    const onThreadStarted = vi.fn(() => threadRecorded);
+
+    const run = codexAgent().run({
+      ...request(),
+      onThreadStarted,
+      signal: abort.signal,
+    });
+
+    await vi.waitFor(() => {
+      expect(onThreadStarted).toHaveBeenCalledWith({
+        threadId: "codex-thread-1",
+        threadName: "Pagent · health.failed · staging",
+      });
+    });
+    expect(server.message("thread/name/set")?.params).toEqual({
+      threadId: "codex-thread-1",
+      name: "Pagent · health.failed · staging",
+    });
+    expect(server.message("turn/start")).toBeUndefined();
+
+    continueRun?.();
+    await vi.waitFor(() => {
+      expect(server.message("turn/start")).toBeDefined();
+    });
+
+    abort.abort();
+    await expect(run).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("starts the turn when the app server rejects thread naming", async () => {
+    const server = fakeAppServer(true, undefined, true);
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => server.child.emit("spawn"));
+      return server.child;
+    });
+    const onThreadStarted = vi.fn();
+
+    await expect(
+      codexAgent().run({ ...request(), onThreadStarted }),
+    ).resolves.toBeUndefined();
+
+    expect(onThreadStarted).toHaveBeenCalledWith({
+      threadId: "codex-thread-1",
+      threadName: "Pagent · health.failed · staging",
+    });
+    expect(server.message("turn/start")).toBeDefined();
   });
 
   it("only overrides Codex permissions when configured", async () => {
@@ -199,6 +261,7 @@ function request(cwd = process.cwd()) {
   return {
     cwd,
     prompt: "Investigate the health failure",
+    threadName: "Pagent · health.failed · staging",
     event: {
       id: "event-1",
       type: "health.failed",
@@ -207,12 +270,14 @@ function request(cwd = process.cwd()) {
       investigation: { cooldownMs: 0 },
       payload: { reason: "latency threshold" },
     },
+    onThreadStarted: vi.fn(),
   };
 }
 
 function fakeAppServer(
   completeTurn = true,
   commandResult = { exitCode: 0, stdout: "", stderr: "" },
+  rejectThreadName = false,
 ) {
   const child = fakeChild();
   const sent: SentMessage[] = [];
@@ -227,7 +292,13 @@ function fakeAppServer(
       input = input.slice(newline + 1);
       const message = JSON.parse(line) as SentMessage;
       sent.push(message);
-      respond(child, message, completeTurn, commandResult);
+      respond(
+        child,
+        message,
+        completeTurn,
+        commandResult,
+        rejectThreadName,
+      );
       newline = input.indexOf("\n");
     }
   });
@@ -256,6 +327,7 @@ function respond(
   message: SentMessage,
   completeTurn: boolean,
   commandResult: { exitCode: number; stdout: string; stderr: string },
+  rejectThreadName: boolean,
 ): void {
   const send = (value: unknown) => {
     (child.stdout as PassThrough).write(`${JSON.stringify(value)}\n`);
@@ -268,6 +340,12 @@ function respond(
       id: message.id,
       result: { thread: { id: "codex-thread-1" } },
     });
+  } else if (message.method === "thread/name/set") {
+    send(
+      rejectThreadName
+        ? { id: message.id, error: { message: "method not found" } }
+        : { id: message.id, result: {} },
+    );
   } else if (message.method === "command/exec") {
     send({ id: message.id, result: commandResult });
   } else if (message.method === "turn/start") {

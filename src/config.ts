@@ -1,5 +1,11 @@
 import type { CodexAgentOptions } from "./codex.js";
 import { decodeBase64Url } from "./encoding.js";
+import {
+  slackNotificationConfigIssue,
+  type SlackNotificationConfig,
+} from "./slack-notifications.js";
+
+export type { SlackNotificationConfig } from "./slack-notifications.js";
 
 /** AES-256-GCM decryption keys indexed by the public ID in each event. */
 export type ConnectorKeyring = Readonly<Record<string, string>>;
@@ -23,6 +29,10 @@ export interface TunnelConfig {
   cloudflaredPath?: string | undefined;
 }
 
+export interface ConnectorNotificationsConfig {
+  slack?: SlackNotificationConfig | undefined;
+}
+
 /** Local settings for the connector process that launches Codex. */
 export interface ConnectorConfig {
   ingress: LocalIngressConfig;
@@ -30,6 +40,7 @@ export interface ConnectorConfig {
   repositories: Readonly<Record<string, string>>;
   environments: readonly string[];
   codex?: CodexAgentOptions | undefined;
+  notifications?: ConnectorNotificationsConfig | undefined;
   encryption: ConnectorEncryptionConfig;
   stateDirectory?: string | undefined;
 }
@@ -149,6 +160,14 @@ export function connectorConfigIssue(value: unknown): string | undefined {
     codex.sandboxMode !== "workspace-write"
   ) {
     return "Codex sandbox mode is invalid.";
+  }
+
+  const notifications = record(config?.notifications);
+  if (config?.notifications !== undefined && notifications === undefined) {
+    return "Notification settings must be an object when set.";
+  }
+  if (notifications?.slack !== undefined) {
+    return slackNotificationConfigIssue(notifications.slack);
   }
   return undefined;
 }

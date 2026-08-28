@@ -154,6 +154,97 @@ describe("local connector config", () => {
     });
   });
 
+  it("loads optional Slack notification settings", async () => {
+    const root = await temporaryDirectory();
+    await writeFile(
+      join(root, "pagent.config.mjs"),
+      directConfig(root, '"env.dev.example.test"').replace(
+        'codex: { sandboxMode: "read-only" }',
+        `codex: { sandboxMode: "read-only" },
+        notifications: {
+          slack: {
+            webhookUrl: "https://notify.example.test/slack",
+            timeoutMs: 2500
+          }
+        }`,
+      ),
+    );
+
+    await expect(loadConnectorConfig({ cwd: root })).resolves.toMatchObject({
+      config: {
+        notifications: {
+          slack: {
+            webhookUrl: "https://notify.example.test/slack",
+            timeoutMs: 2_500,
+          },
+        },
+      },
+    });
+  });
+
+  it("allows loopback HTTP Slack webhooks for local testing", async () => {
+    const root = await temporaryDirectory();
+    await writeFile(
+      join(root, "pagent.config.mjs"),
+      directConfig(root, '"env.dev.example.test"').replace(
+        'codex: { sandboxMode: "read-only" }',
+        `codex: { sandboxMode: "read-only" },
+        notifications: {
+          slack: { webhookUrl: "http://localhost:43129/slack" }
+        }`,
+      ),
+    );
+
+    await expect(loadConnectorConfig({ cwd: root })).resolves.toMatchObject({
+      config: {
+        notifications: {
+          slack: { webhookUrl: "http://localhost:43129/slack" },
+        },
+      },
+    });
+  });
+
+  it("rejects unsafe Slack notification settings without exposing the URL", async () => {
+    const root = await temporaryDirectory();
+    const secretUrl =
+      "https://u:p@notify.example.test/private#fragment";
+    await writeFile(
+      join(root, "pagent.config.mjs"),
+      directConfig(root, '"env.dev.example.test"').replace(
+        'codex: { sandboxMode: "read-only" }',
+        `codex: { sandboxMode: "read-only" },
+        notifications: {
+          slack: { webhookUrl: ${JSON.stringify(secretUrl)}, timeoutMs: 30001 }
+        }`,
+      ),
+    );
+
+    const loading = loadConnectorConfig({ cwd: root });
+    await expect(loading).rejects.toThrow("Slack webhook URL must use HTTPS");
+    await expect(loading).rejects.not.toThrow(secretUrl);
+  });
+
+  it("rejects Slack notification timeouts above thirty seconds", async () => {
+    const root = await temporaryDirectory();
+    await writeFile(
+      join(root, "pagent.config.mjs"),
+      directConfig(root, '"env.dev.example.test"').replace(
+        'codex: { sandboxMode: "read-only" }',
+        `codex: { sandboxMode: "read-only" },
+        notifications: {
+          slack: {
+            webhookUrl: "https://notify.example.test/slack",
+            timeoutMs: 30001
+          }
+        }`,
+      ),
+    );
+
+    await expect(loadConnectorConfig({ cwd: root })).rejects.toThrow(
+      "Slack notification timeout must be an integer from 1 to 30000 milliseconds.",
+    );
+  });
+
   it("explains when no config exists", async () => {
     const root = await temporaryDirectory();
     await expect(loadConnectorConfig({ cwd: root })).rejects.toThrow(

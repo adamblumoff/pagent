@@ -8,7 +8,7 @@ import {
 import type { AddressInfo } from "node:net";
 import { resolve } from "node:path";
 
-import type { AgentAdapter, AgentResult } from "./agent.js";
+import type { AgentAdapter } from "./agent.js";
 import {
   createEventContextDecryptor,
   type EventContextDecryptor,
@@ -41,7 +41,7 @@ export interface LocalIngressRoute {
 
 export type LocalIngressStatus =
   | "received"
-  | "running"
+  | "thread-started"
   | "completed"
   | "failed"
   | "suppressed";
@@ -53,6 +53,7 @@ export interface LocalIngressLifecycleUpdate {
   errorCode?: "codex_failed" | "daemon_stopped" | undefined;
   errorMessage?: string | undefined;
   threadId?: string | undefined;
+  threadName?: string | undefined;
 }
 
 export interface LocalIngressOptions {
@@ -68,11 +69,6 @@ export interface LocalIngressOptions {
   now?: (() => number) | undefined;
   onLifecycle?: (
     update: LocalIngressLifecycleUpdate,
-    event: EncryptedPagentEvent,
-    route: LocalIngressRoute,
-  ) => void | Promise<void>;
-  onAgentResult?: (
-    result: AgentResult,
     event: EncryptedPagentEvent,
     route: LocalIngressRoute,
   ) => void | Promise<void>;
@@ -100,7 +96,6 @@ interface PreparedOptions {
   stateLimit: number;
   now: () => number;
   onLifecycle: LocalIngressOptions["onLifecycle"];
-  onAgentResult: LocalIngressOptions["onAgentResult"];
   onError: LocalIngressOptions["onError"];
 }
 
@@ -123,7 +118,6 @@ class LocalIngressHandler {
   readonly #environmentId: string;
   readonly #maxBodyBytes: number;
   readonly #now: () => number;
-  readonly #onAgentResult: LocalIngressOptions["onAgentResult"];
   readonly #onError: LocalIngressOptions["onError"];
   readonly #onLifecycle: LocalIngressOptions["onLifecycle"];
   readonly #recentEventIds = new Map<string, true>();
@@ -143,7 +137,6 @@ class LocalIngressHandler {
     this.#stateLimit = options.stateLimit;
     this.#now = options.now;
     this.#onLifecycle = options.onLifecycle;
-    this.#onAgentResult = options.onAgentResult;
     this.#onError = options.onError;
   }
 
@@ -273,23 +266,38 @@ class LocalIngressHandler {
     event: PagentEvent,
   ): Promise<void> {
     await this.#lifecycle({ status: "received" }, encryptedEvent, route);
-    await this.#lifecycle({ status: "running" }, encryptedEvent, route);
+    let startedThread:
+      | { threadId: string; threadName: string }
+      | undefined;
     try {
-      const result = await this.#agent.run({
+      const threadName = investigationThreadName(route.repositoryKey, event);
+      await this.#agent.run({
         cwd: this.#repositoryPath,
         prompt: investigationPrompt(route.repositoryKey, event),
+        threadName,
         event,
         signal: this.#abort.signal,
+        onThreadStarted: async (thread) => {
+          startedThread = thread;
+          await this.#lifecycle(
+            {
+              status: "thread-started",
+              threadId: thread.threadId,
+              threadName: thread.threadName,
+            },
+            encryptedEvent,
+            route,
+          );
+        },
       });
       await this.#lifecycle(
         {
           status: "completed",
-          ...(result.threadId === undefined ? {} : { threadId: result.threadId }),
+          ...(startedThread ?? {}),
         },
         encryptedEvent,
         route,
       );
-      await this.#agentResult(result, encryptedEvent, route);
     } catch (error) {
       await this.#lifecycle(
         {
@@ -298,6 +306,7 @@ class LocalIngressHandler {
             ? "daemon_stopped"
             : "codex_failed",
           errorMessage: safeErrorMessage(error),
+          ...(startedThread ?? {}),
         },
         encryptedEvent,
         route,
@@ -322,19 +331,6 @@ class LocalIngressHandler {
       ),
       LIFECYCLE_TIMEOUT_MS,
     );
-  }
-
-  async #agentResult(
-    result: AgentResult,
-    event: EncryptedPagentEvent,
-    route: LocalIngressRoute,
-  ): Promise<void> {
-    if (this.#onAgentResult === undefined) return;
-    try {
-      await this.#onAgentResult(result, event, route);
-    } catch (error) {
-      this.#report(error);
-    }
   }
 
   #authorized(authorization: string | undefined): boolean {
@@ -446,7 +442,6 @@ function prepareOptions(options: LocalIngressOptions): PreparedOptions {
     stateLimit,
     now: options.now ?? Date.now,
     onLifecycle: options.onLifecycle,
-    onAgentResult: options.onAgentResult,
     onError: options.onError,
   };
 }
@@ -550,6 +545,17 @@ function investigationPrompt(repositoryKey: string, event: PagentEvent): string 
     "Event context:",
     JSON.stringify(event.payload, null, 2),
   ].join("\n");
+}
+
+function investigationThreadName(
+  repositoryKey: string,
+  event: PagentEvent,
+): string {
+  const name = `Investigating ${event.type} in ${repositoryKey}`.replace(
+    /\s+/gu,
+    " ",
+  );
+  return name.length <= 200 ? name : `${name.slice(0, 197)}...`;
 }
 
 function readBody(request: IncomingMessage, limit: number): Promise<string> {

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ConnectorConfig } from "../src/config.js";
 import { decryptEventContext } from "../src/crypto.js";
+import { FileHandoffHistory } from "../src/handoff-history.js";
 import {
   requestLocalControl,
   type LocalDaemonStatus,
@@ -211,6 +212,106 @@ describe("local connector runner", () => {
     ).rejects.toThrow();
   });
 
+  it("persists a started thread before sending Slack and isolates webhook failures", async () => {
+    const directory = await temporaryDirectory();
+    const paths = localStatePaths({ stateDirectory: join(directory, "state") });
+    const config = connectorConfig();
+    config.notifications = {
+      slack: {
+        webhookUrl: "https://notify.example.test/private-hook",
+        timeoutMs: 1_000,
+      },
+    };
+    const webhookResponse = deferred<Response>();
+    const webhookFetch = vi.fn(() => webhookResponse.promise);
+    vi.stubGlobal("fetch", webhookFetch);
+    const logs: string[] = [];
+    let ingressOptions: LocalIngressOptions | undefined;
+    const runner = runLocalConnector({
+      config,
+      paths,
+      startupTimeoutMs: 1_000,
+      log: (message) => logs.push(message),
+      onReady: () => undefined,
+      dependencies: {
+        startIngress: async (options) => {
+          ingressOptions = options;
+          return {
+            host: "127.0.0.1",
+            port: 43123,
+            eventsUrl: "http://127.0.0.1:43123/v1/events",
+            probeUrl: "http://127.0.0.1:43123/v1/probe",
+            close: async () => undefined,
+          };
+        },
+        startTunnel: async () => ({
+          ready: Promise.resolve(),
+          health: () => tunnelHealth("ready"),
+          stop: async () => undefined,
+        }),
+        probe: async () => undefined,
+      },
+    });
+    await waitFor(() => ingressOptions !== undefined);
+
+    const event = encryptedEvent("event-slack", "health.failed");
+    const route = { repositoryKey: "pagent" };
+    await ingressOptions!.onLifecycle?.(
+      { status: "received", occurredAt: "2026-08-27T12:00:00.000Z" },
+      event,
+      route,
+    );
+    await ingressOptions!.onLifecycle?.(
+      {
+        status: "thread-started",
+        occurredAt: "2026-08-27T12:00:01.000Z",
+        threadId: "thread-1",
+        threadName: "Investigating health.failed in pagent",
+      },
+      event,
+      route,
+    );
+
+    expect(webhookFetch).toHaveBeenCalledOnce();
+    await expect(
+      new FileHandoffHistory(paths.historyPath).findByEventId("event-slack"),
+    ).resolves.toMatchObject({
+      status: "running",
+      threadId: "thread-1",
+      threadName: "Investigating health.failed in pagent",
+      startedAt: "2026-08-27T12:00:01.000Z",
+    });
+
+    webhookResponse.resolve(
+      new Response("private Slack response", { status: 500 }),
+    );
+    await waitFor(() =>
+      logs.some((message) => message.includes("Slack notification error")),
+    );
+    expect(logs.join("\n")).not.toContain("private-hook");
+    expect(logs.join("\n")).not.toContain("private Slack response");
+
+    await ingressOptions!.onLifecycle?.(
+      { status: "completed", occurredAt: "2026-08-27T12:00:02.000Z" },
+      event,
+      route,
+    );
+    await expect(
+      new FileHandoffHistory(paths.historyPath).findByEventId("event-slack"),
+    ).resolves.toMatchObject({
+      status: "completed",
+      threadId: "thread-1",
+      threadName: "Investigating health.failed in pagent",
+    });
+
+    await requestLocalControl(paths.controlEndpoint, { method: "stop" });
+    await runner;
+    expect(logs).toContain(
+      "[pagent] health.failed investigation thread started: thread-1",
+    );
+    expect(logs).toContain("[pagent] health.failed investigation completed");
+  });
+
   it("sends an encrypted end-to-end readiness probe through the tunnel hostname", async () => {
     const directory = await temporaryDirectory();
     const paths = localStatePaths({ stateDirectory: join(directory, "state") });
@@ -330,7 +431,12 @@ async function recordCompletedHandoff(options: LocalIngressOptions): Promise<voi
     route,
   );
   await options.onLifecycle?.(
-    { status: "running", occurredAt: "2026-08-27T12:00:01.000Z" },
+    {
+      status: "thread-started",
+      occurredAt: "2026-08-27T12:00:01.000Z",
+      threadId: "thread-1",
+      threadName: "Investigating health.failed in pagent",
+    },
     event,
     route,
   );
@@ -338,7 +444,6 @@ async function recordCompletedHandoff(options: LocalIngressOptions): Promise<voi
     {
       status: "completed",
       occurredAt: "2026-08-27T12:00:02.000Z",
-      threadId: "thread-1",
     },
     event,
     route,
