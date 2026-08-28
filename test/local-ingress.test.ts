@@ -95,6 +95,10 @@ describe("local ingress", () => {
         "completed",
       ]),
     );
+    expect(lifecycle[2]).toMatchObject({
+      threadId: "thread-1",
+      threadName: "Investigating health.failed in pagent",
+    });
   });
 
   it("proves encrypted readiness without dispatching or changing admission state", async () => {
@@ -271,6 +275,8 @@ describe("local ingress", () => {
           status: "failed",
           errorCode: "codex_failed",
           errorMessage: "Codex unavailable",
+          threadId: "thread-failed",
+          threadName: "Investigating health.failed in pagent",
         }),
       ]),
     );

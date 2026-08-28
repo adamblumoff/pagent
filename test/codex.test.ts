@@ -111,6 +111,25 @@ describe("codexAgent", () => {
     await expect(run).rejects.toMatchObject({ name: "AbortError" });
   });
 
+  it("starts the turn when the app server rejects thread naming", async () => {
+    const server = fakeAppServer(true, undefined, true);
+    childProcesses.spawn.mockImplementation(() => {
+      queueMicrotask(() => server.child.emit("spawn"));
+      return server.child;
+    });
+    const onThreadStarted = vi.fn();
+
+    await expect(
+      codexAgent().run({ ...request(), onThreadStarted }),
+    ).resolves.toBeUndefined();
+
+    expect(onThreadStarted).toHaveBeenCalledWith({
+      threadId: "codex-thread-1",
+      threadName: "Pagent · health.failed · staging",
+    });
+    expect(server.message("turn/start")).toBeDefined();
+  });
+
   it("only overrides Codex permissions when configured", async () => {
     const server = fakeAppServer();
     childProcesses.spawn.mockImplementation(() => {
@@ -258,6 +277,7 @@ function request(cwd = process.cwd()) {
 function fakeAppServer(
   completeTurn = true,
   commandResult = { exitCode: 0, stdout: "", stderr: "" },
+  rejectThreadName = false,
 ) {
   const child = fakeChild();
   const sent: SentMessage[] = [];
@@ -272,7 +292,13 @@ function fakeAppServer(
       input = input.slice(newline + 1);
       const message = JSON.parse(line) as SentMessage;
       sent.push(message);
-      respond(child, message, completeTurn, commandResult);
+      respond(
+        child,
+        message,
+        completeTurn,
+        commandResult,
+        rejectThreadName,
+      );
       newline = input.indexOf("\n");
     }
   });
@@ -301,6 +327,7 @@ function respond(
   message: SentMessage,
   completeTurn: boolean,
   commandResult: { exitCode: number; stdout: string; stderr: string },
+  rejectThreadName: boolean,
 ): void {
   const send = (value: unknown) => {
     (child.stdout as PassThrough).write(`${JSON.stringify(value)}\n`);
@@ -314,7 +341,11 @@ function respond(
       result: { thread: { id: "codex-thread-1" } },
     });
   } else if (message.method === "thread/name/set") {
-    send({ id: message.id, result: {} });
+    send(
+      rejectThreadName
+        ? { id: message.id, error: { message: "method not found" } }
+        : { id: message.id, result: {} },
+    );
   } else if (message.method === "command/exec") {
     send({ id: message.id, result: commandResult });
   } else if (message.method === "turn/start") {

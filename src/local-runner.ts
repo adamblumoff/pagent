@@ -230,6 +230,10 @@ function lifecyclePatch(
     return {
       status: "completed",
       completedAt: update.occurredAt,
+      ...(update.threadId === undefined ? {} : { threadId: update.threadId }),
+      ...(update.threadName === undefined
+        ? {}
+        : { threadName: update.threadName }),
     };
   }
   if (update.status === "suppressed") {
@@ -247,6 +251,10 @@ function lifecyclePatch(
       ...(update.errorMessage === undefined
         ? {}
         : { errorMessage: update.errorMessage }),
+      ...(update.threadId === undefined ? {} : { threadId: update.threadId }),
+      ...(update.threadName === undefined
+        ? {}
+        : { threadName: update.threadName }),
     };
   }
   return { status: "received" };

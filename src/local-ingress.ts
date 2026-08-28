@@ -266,6 +266,9 @@ class LocalIngressHandler {
     event: PagentEvent,
   ): Promise<void> {
     await this.#lifecycle({ status: "received" }, encryptedEvent, route);
+    let startedThread:
+      | { threadId: string; threadName: string }
+      | undefined;
     try {
       const threadName = investigationThreadName(route.repositoryKey, event);
       await this.#agent.run({
@@ -274,8 +277,9 @@ class LocalIngressHandler {
         threadName,
         event,
         signal: this.#abort.signal,
-        onThreadStarted: (thread) =>
-          this.#lifecycle(
+        onThreadStarted: async (thread) => {
+          startedThread = thread;
+          await this.#lifecycle(
             {
               status: "thread-started",
               threadId: thread.threadId,
@@ -283,9 +287,17 @@ class LocalIngressHandler {
             },
             encryptedEvent,
             route,
-          ),
+          );
+        },
       });
-      await this.#lifecycle({ status: "completed" }, encryptedEvent, route);
+      await this.#lifecycle(
+        {
+          status: "completed",
+          ...(startedThread ?? {}),
+        },
+        encryptedEvent,
+        route,
+      );
     } catch (error) {
       await this.#lifecycle(
         {
@@ -294,6 +306,7 @@ class LocalIngressHandler {
             ? "daemon_stopped"
             : "codex_failed",
           errorMessage: safeErrorMessage(error),
+          ...(startedThread ?? {}),
         },
         encryptedEvent,
         route,

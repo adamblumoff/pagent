@@ -218,16 +218,10 @@ async function runCodex(
     );
     const threadId = thread.thread.id;
 
-    send(appServer.child, {
-      method: "thread/name/set",
-      id: 3,
-      params: { threadId, name: request.threadName },
-    });
-    await waitForResponse(
-      appServer.messages,
-      3,
-      "thread/name/set",
-      appServer.stderr,
+    await setThreadNameBestEffort(
+      appServer,
+      threadId,
+      request.threadName,
       signal,
     );
     await request.onThreadStarted({
@@ -270,6 +264,30 @@ async function runCodex(
   } finally {
     signal?.removeEventListener("abort", abort);
     closeAppServer(appServer);
+  }
+}
+
+async function setThreadNameBestEffort(
+  appServer: AppServerConnection,
+  threadId: string,
+  name: string,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  send(appServer.child, {
+    method: "thread/name/set",
+    id: 3,
+    params: { threadId, name },
+  });
+  try {
+    await waitForResponse(
+      appServer.messages,
+      3,
+      "thread/name/set",
+      appServer.stderr,
+      signal,
+    );
+  } catch {
+    throwIfAborted(signal);
   }
 }
 
