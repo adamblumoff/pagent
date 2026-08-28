@@ -15,6 +15,7 @@ interface EventView {
   status: EventLifecycleStatus;
   receivedAt: string;
   threadId?: string | undefined;
+  threadName?: string | undefined;
   completedAt?: string | undefined;
   errorCode?: string | undefined;
   errorMessage?: string | undefined;
@@ -59,6 +60,7 @@ function eventView(record: HandoffHistoryRecord): EventView {
     status: record.status,
     receivedAt: record.receivedAt,
     ...(record.threadId === undefined ? {} : { threadId: record.threadId }),
+    ...(record.threadName === undefined ? {} : { threadName: record.threadName }),
     ...(record.completedAt === undefined ? {} : { completedAt: record.completedAt }),
     ...(record.errorCode === undefined ? {} : { errorCode: record.errorCode }),
     ...(record.errorMessage === undefined ? {} : { errorMessage: record.errorMessage }),
@@ -105,6 +107,7 @@ function printEvent(event: EventView): void {
   console.log(`Status: ${event.status}`);
   console.log(`Received locally: ${event.receivedAt}`);
   if (event.threadId !== undefined) console.log(`Codex thread: ${event.threadId}`);
+  if (event.threadName !== undefined) console.log(`Thread name: ${event.threadName}`);
   if (event.errorMessage !== undefined) console.log(`Last error: ${event.errorMessage}`);
   else if (event.errorCode !== undefined) console.log(`Last error code: ${event.errorCode}`);
   console.log("Context: encrypted and not shown");

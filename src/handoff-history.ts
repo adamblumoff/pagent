@@ -20,6 +20,7 @@ export interface HandoffHistoryRecord {
   errorCode?: string | undefined;
   errorMessage?: string | undefined;
   threadId?: string | undefined;
+  threadName?: string | undefined;
 }
 
 export type HandoffHistoryPatch = Partial<
@@ -31,6 +32,7 @@ export type HandoffHistoryPatch = Partial<
     | "errorCode"
     | "errorMessage"
     | "threadId"
+    | "threadName"
   >
 >;
 
@@ -185,7 +187,8 @@ function parseRecord(value: unknown): HandoffHistoryRecord | undefined {
     !optionalIsoDate(candidate.completedAt) ||
     !optionalString(candidate.errorCode) ||
     !optionalString(candidate.errorMessage) ||
-    !optionalString(candidate.threadId)
+    !optionalString(candidate.threadId) ||
+    !optionalString(candidate.threadName)
   ) {
     return undefined;
   }
@@ -211,6 +214,9 @@ function parseRecord(value: unknown): HandoffHistoryRecord | undefined {
     ...(candidate.threadId === undefined
       ? {}
       : { threadId: candidate.threadId }),
+    ...(candidate.threadName === undefined
+      ? {}
+      : { threadName: candidate.threadName }),
   };
 }
 

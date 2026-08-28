@@ -42,6 +42,16 @@ describe("events CLI", () => {
         version: 1,
         records: [
           {
+            eventId: "event-active",
+            eventType: "checkout.failure-rate",
+            environment: "staging",
+            status: "running",
+            receivedAt: "2026-08-26T12:01:00.000Z",
+            startedAt: "2026-08-26T12:01:01.000Z",
+            threadId: "thread-active",
+            threadName: "Investigating checkout.failure-rate in app",
+          },
+          {
             eventId: "event-1",
             eventType: "worker.exception",
             environment: "staging",
@@ -61,6 +71,7 @@ describe("events CLI", () => {
             startedAt: "2026-08-26T11:00:02.000Z",
             completedAt: "2026-08-26T11:00:04.000Z",
             threadId: "thread-local",
+            threadName: "Investigating job.completed in app",
           },
           {
             eventId: "event-3",
@@ -85,16 +96,19 @@ describe("events CLI", () => {
     expect(list).toMatchObject({ code: 0, stderr: "" });
     expect(list.stdout).toContain("worker.exception");
     expect(list.stdout).toContain("job.completed");
+    expect(list.stdout).toContain("checkout.failure-rate");
+    expect(list.stdout).toContain("thread-active");
     expect(list.stdout).toContain("failed");
 
     const jsonList = JSON.parse(
       (await runCli(["events", "--json"], environment, root)).stdout,
     ) as { events: Array<Record<string, unknown>> };
-    expect(jsonList.events).toHaveLength(3);
+    expect(jsonList.events).toHaveLength(4);
     expect(jsonList.events[0]).toMatchObject({
-      eventId: "event-1",
-      status: "failed",
-      errorCode: "codex_failed",
+      eventId: "event-active",
+      status: "running",
+      threadId: "thread-active",
+      threadName: "Investigating checkout.failure-rate in app",
     });
 
     const detail = await runCli(["events", "show", "event-1"], environment, root);
@@ -102,6 +116,31 @@ describe("events CLI", () => {
     expect(detail.stdout).toContain("Codex app server is unavailable.");
     expect(detail.stdout).toContain("Next action: Open Codex");
     expect(detail.stdout).toContain("Context: encrypted and not shown");
+
+    const active = await runCli(
+      ["events", "show", "event-active"],
+      environment,
+      root,
+    );
+    expect(active).toMatchObject({ code: 0, stderr: "" });
+    expect(active.stdout).toContain("Status: running");
+    expect(active.stdout).toContain("Codex thread: thread-active");
+    expect(active.stdout).toContain(
+      "Thread name: Investigating checkout.failure-rate in app",
+    );
+
+    const activeOnly = await runCli(
+      ["events", "--status", "running", "--json"],
+      environment,
+      root,
+    );
+    expect(JSON.parse(activeOnly.stdout).events).toEqual([
+      expect.objectContaining({
+        eventId: "event-active",
+        threadId: "thread-active",
+        threadName: "Investigating checkout.failure-rate in app",
+      }),
+    ]);
 
     const filtered = await runCli(
       ["events", "--status", "completed", "--json"],
