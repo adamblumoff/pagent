@@ -23,6 +23,16 @@ import type {
 
 const LOCAL_COOLDOWN_LIMIT = 1_000;
 
+interface CooldownPreparationState {
+  deliveryGeneration: number;
+  pending: number;
+}
+
+interface CooldownPreparation {
+  generation: number;
+  state: CooldownPreparationState;
+}
+
 function isNativePromise(value: unknown): value is Promise<unknown> {
   return value instanceof Promise;
 }
@@ -49,6 +59,10 @@ class Pagent implements PagentClient {
   readonly #pending = new Set<Promise<void>>();
   readonly #inFlightCooldowns = new Set<string>();
   readonly #cooldownExpirations = new Map<string, number>();
+  readonly #cooldownPreparations = new Map<
+    string,
+    CooldownPreparationState
+  >();
   readonly #endpoint: EndpointEmitter | undefined;
 
   constructor(options: PagentOptions) {
@@ -249,50 +263,71 @@ class Pagent implements PagentClient {
       cooldownMs,
       ...(group === undefined ? {} : { group }),
     };
-    const payload = await options.context(observation);
-    if (
-      cooldownKey !== undefined &&
-      !reserveCooldown(
-        this.#cooldownExpirations,
-        this.#inFlightCooldowns,
-        cooldownKey,
-        Date.now(),
-      )
-    ) {
-      return;
-    }
+    const preparation =
+      cooldownKey === undefined
+        ? undefined
+        : beginCooldownPreparation(this.#cooldownPreparations, cooldownKey);
     try {
-      const metadata: PagentEventMetadata = {
-        id: crypto.randomUUID(),
-        type: options.event.name,
-        environment: this.#environment!,
-        occurredAt: new Date(now).toISOString(),
-        investigation,
-      };
-      const event = {
-        ...metadata,
-        context: await this.#encrypt!(metadata, payload),
-      };
-      await this.#endpoint!(event);
-      if (cooldownKey !== undefined) {
-        rememberCooldown(
+      const payload = await options.context(observation);
+      if (
+        preparation !== undefined &&
+        preparation.state.deliveryGeneration !== preparation.generation
+      ) {
+        return;
+      }
+      if (
+        cooldownKey !== undefined &&
+        !reserveCooldown(
           this.#cooldownExpirations,
+          this.#inFlightCooldowns,
           cooldownKey,
           Date.now(),
-          cooldownMs,
-        );
+        )
+      ) {
+        return;
       }
       try {
-        this.#onDelivery?.({
-          eventId: metadata.id,
-          deliveredAt: new Date().toISOString(),
-        });
-      } catch {
-        // Pagent callbacks must not affect the observed application.
+        const metadata: PagentEventMetadata = {
+          id: crypto.randomUUID(),
+          type: options.event.name,
+          environment: this.#environment!,
+          occurredAt: new Date(now).toISOString(),
+          investigation,
+        };
+        const event = {
+          ...metadata,
+          context: await this.#encrypt!(metadata, payload),
+        };
+        await this.#endpoint!(event);
+        if (cooldownKey !== undefined) {
+          rememberCooldown(
+            this.#cooldownExpirations,
+            cooldownKey,
+            Date.now(),
+            cooldownMs,
+          );
+          preparation!.state.deliveryGeneration += 1;
+        }
+        try {
+          this.#onDelivery?.({
+            eventId: metadata.id,
+            deliveredAt: new Date().toISOString(),
+          });
+        } catch {
+          // Pagent callbacks must not affect the observed application.
+        }
+      } finally {
+        if (cooldownKey !== undefined) {
+          this.#inFlightCooldowns.delete(cooldownKey);
+        }
       }
     } finally {
-      if (cooldownKey !== undefined) {
-        this.#inFlightCooldowns.delete(cooldownKey);
+      if (cooldownKey !== undefined && preparation !== undefined) {
+        endCooldownPreparation(
+          this.#cooldownPreparations,
+          cooldownKey,
+          preparation.state,
+        );
       }
     }
   }
@@ -322,6 +357,30 @@ function rememberCooldown(
   );
   expirations.delete(key);
   expirations.set(key, expiresAt);
+}
+
+function beginCooldownPreparation(
+  preparations: Map<string, CooldownPreparationState>,
+  key: string,
+): CooldownPreparation {
+  const state = preparations.get(key) ?? {
+    deliveryGeneration: 0,
+    pending: 0,
+  };
+  state.pending += 1;
+  preparations.set(key, state);
+  return { generation: state.deliveryGeneration, state };
+}
+
+function endCooldownPreparation(
+  preparations: Map<string, CooldownPreparationState>,
+  key: string,
+  state: CooldownPreparationState,
+): void {
+  state.pending -= 1;
+  if (state.pending === 0 && preparations.get(key) === state) {
+    preparations.delete(key);
+  }
 }
 
 function pruneExpiredCooldowns(

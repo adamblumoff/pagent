@@ -309,6 +309,42 @@ describe("Pagent", () => {
     expect(endpointFetch).toHaveBeenCalledTimes(1);
   });
 
+  it("discards stale context after a newer cooldown delivery", async () => {
+    const endpointFetch = successfulEndpoint();
+    const delivered = vi.fn();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    let releaseContext!: (value: { reason: string }) => void;
+    const pendingContext = new Promise<{ reason: string }>((resolve) => {
+      releaseContext = resolve;
+    });
+    const context = vi.fn(({ result }: { result: string }) =>
+      result === "stale" ? pendingContext : { reason: "fresh" });
+    const pagent = createPagent({
+      enabled: true,
+      environment: "staging",
+      endpoint: endpointOptions(),
+      encryption: encryptionOptions(),
+      onDelivery: delivered,
+    });
+    const observed = pagent.observe((state: string) => state, {
+      event: healthFailed,
+      on: "result",
+      triggerWhen: () => true,
+      context,
+    });
+
+    observed("stale");
+    await vi.waitFor(() => expect(context).toHaveBeenCalledTimes(1));
+    observed("fresh");
+    await vi.waitFor(() => expect(delivered).toHaveBeenCalledTimes(1));
+
+    now.mockReturnValue(61_001);
+    releaseContext({ reason: "stale" });
+    await pagent.flush();
+
+    expect(endpointFetch).toHaveBeenCalledTimes(1);
+  });
+
   it("does not let a failed delivery suppress a later trigger", async () => {
     const errors: unknown[] = [];
     const endpointFetch = vi
