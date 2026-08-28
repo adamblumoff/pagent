@@ -117,7 +117,7 @@ describe("Pagent", () => {
     expect(endpointFetch).not.toHaveBeenCalled();
   });
 
-  it("delivers every qualifying trigger even while the same event is in flight", async () => {
+  it("coalesces the same cooldown group while delivery is in flight", async () => {
     const responses: Array<(response: Response) => void> = [];
     const endpointFetch = vi.fn(
       () =>
@@ -141,12 +141,64 @@ describe("Pagent", () => {
 
     observed();
     observed();
-    await vi.waitFor(() => expect(endpointFetch).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(endpointFetch).toHaveBeenCalledTimes(1));
 
     for (const respond of responses) {
       respond(new Response(null, { status: 202 }));
     }
     await pagent.flush();
+
+    observed();
+    await pagent.flush();
+    expect(endpointFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers a cooldown group again after its window expires", async () => {
+    const endpointFetch = successfulEndpoint();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const pagent = createPagent({
+      enabled: true,
+      environment: "staging",
+      endpoint: endpointOptions(),
+      encryption: encryptionOptions(),
+    });
+    const observed = pagent.observe(() => "failed", {
+      event: healthFailed,
+      on: "result",
+      triggerWhen: () => true,
+      context: () => ({ reason: "still unhealthy" }),
+    });
+
+    observed();
+    await pagent.flush();
+    now.mockReturnValue(61_000);
+    observed();
+    await pagent.flush();
+
+    expect(endpointFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not coalesce different cooldown groups", async () => {
+    const endpointFetch = successfulEndpoint();
+    const pagent = createPagent({
+      enabled: true,
+      environment: "staging",
+      endpoint: endpointOptions(),
+      encryption: encryptionOptions(),
+    });
+    const observed = pagent.observe((region: string) => region, {
+      event: healthFailed,
+      on: "result",
+      triggerWhen: () => true,
+      group: ({ result }) => result,
+      context: ({ result }) => ({ reason: `${result} is unhealthy` }),
+    });
+
+    observed("us-east-1");
+    observed("us-west-2");
+    await pagent.flush();
+
+    expect(endpointFetch).toHaveBeenCalledTimes(2);
   });
 
   it("does not let a failed delivery suppress a later trigger", async () => {
@@ -229,6 +281,51 @@ describe("Pagent", () => {
     await expect(decryptedPayload(eventBody(endpointFetch))).resolves.toEqual({
       message: "database offline",
     });
+  });
+
+  it("observes results and errors with one explicit configuration", async () => {
+    const endpointFetch = successfulEndpoint();
+    const event = defineEvent<{ outcome: string }>({
+      name: "operation.finished",
+    });
+    const failure = new Error("database offline");
+    const pagent = createPagent({
+      enabled: true,
+      environment: "staging",
+      endpoint: endpointOptions(),
+      encryption: encryptionOptions(),
+    });
+    const observed = pagent.observe(
+      async (succeeds: boolean) => {
+        if (!succeeds) throw failure;
+        return "healthy";
+      },
+      {
+        event,
+        on: ["result", "error"],
+        triggerWhen: () => true,
+        context: (observation) => ({
+          outcome:
+            observation.kind === "result"
+              ? observation.result
+              : observation.error instanceof Error
+                ? observation.error.message
+                : "unknown error",
+        }),
+      },
+    );
+
+    await expect(observed(true)).resolves.toBe("healthy");
+    await expect(observed(false)).rejects.toBe(failure);
+    await pagent.flush();
+
+    expect(endpointFetch).toHaveBeenCalledTimes(2);
+    await expect(
+      decryptedPayload(eventBody(endpointFetch, 0)),
+    ).resolves.toEqual({ outcome: "healthy" });
+    await expect(
+      decryptedPayload(eventBody(endpointFetch, 1)),
+    ).resolves.toEqual({ outcome: "database offline" });
   });
 
   it("preserves synchronous errors while observing them", async () => {
@@ -659,8 +756,8 @@ function successfulEndpoint() {
   return endpointFetch;
 }
 
-function requestBody(endpointFetch: ReturnType<typeof vi.fn>) {
-  const request = endpointFetch.mock.calls[0]?.[1] as RequestInit | undefined;
+function requestBody(endpointFetch: ReturnType<typeof vi.fn>, call = 0) {
+  const request = endpointFetch.mock.calls[call]?.[1] as RequestInit | undefined;
   if (typeof request?.body !== "string") {
     throw new Error("Expected a JSON request body");
   }
@@ -670,8 +767,11 @@ function requestBody(endpointFetch: ReturnType<typeof vi.fn>) {
   };
 }
 
-function eventBody(endpointFetch: ReturnType<typeof vi.fn>): EncryptedPagentEvent {
-  return requestBody(endpointFetch).event;
+function eventBody(
+  endpointFetch: ReturnType<typeof vi.fn>,
+  call = 0,
+): EncryptedPagentEvent {
+  return requestBody(endpointFetch, call).event;
 }
 
 function decryptedPayload(event: EncryptedPagentEvent) {

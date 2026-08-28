@@ -8,6 +8,8 @@ application -> Cloudflare edge -> named tunnel -> local Pagent -> Codex app serv
 
 The application SDK observes selected functions and emits qualifying events without changing their return values or errors. It does not read source code or start Codex.
 
+When an event has a nonzero cooldown, one SDK client sends at most one event for the same event name, environment, and group during that window. A failed delivery does not start the cooldown. The local connector still enforces cooldowns across every application process.
+
 `pagent init` provisions one named Cloudflare Tunnel for the development environment. The local daemon authenticates each source, enforces the repository and environment policy, decrypts the selected context, and applies bounded deduplication and cooldowns.
 
 Pagent hands each accepted event to the Codex installation already on the machine. Codex investigates that checkout in read-only mode and creates a thread that a person can continue in the Codex app.

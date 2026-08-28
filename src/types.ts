@@ -121,14 +121,20 @@ export interface ResultObservation<
   TArgs extends readonly unknown[],
   TResult,
 > {
+  kind: "result";
   args: TArgs;
   result: TResult;
 }
 
 export interface ErrorObservation<TArgs extends readonly unknown[]> {
+  kind: "error";
   args: TArgs;
   error: unknown;
 }
+
+export type Observation<TArgs extends readonly unknown[], TResult> =
+  | ResultObservation<TArgs, TResult>
+  | ErrorObservation<TArgs>;
 
 export interface ObserveResultOptions<
   TArgs extends readonly unknown[],
@@ -165,18 +171,51 @@ export interface ObserveErrorOptions<
   ): JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
 }
 
+export interface ObserveResultAndErrorOptions<
+  TArgs extends readonly unknown[],
+  TResult,
+  TPayload,
+> {
+  event: EventDefinition<TPayload>;
+  on:
+    | readonly ["result", "error"]
+    | readonly ["error", "result"];
+  triggerWhen(
+    observation: Observation<TArgs, TResult>,
+  ): boolean | Promise<boolean>;
+  group?(
+    observation: Observation<TArgs, TResult>,
+  ): string | undefined | Promise<string | undefined>;
+  context(
+    observation: Observation<TArgs, TResult>,
+  ): JsonCompatible<TPayload> | Promise<JsonCompatible<TPayload>>;
+}
+
 export type ObserveOptions<
   TArgs extends readonly unknown[],
   TResult,
   TPayload,
 > =
   | ObserveResultOptions<TArgs, TResult, TPayload>
-  | ObserveErrorOptions<TArgs, TPayload>;
+  | ObserveErrorOptions<TArgs, TPayload>
+  | ObserveResultAndErrorOptions<TArgs, TResult, TPayload>;
 
 export interface PagentClient {
   observe<TThis, TArgs extends unknown[], TResult, TPayload>(
     fn: (this: TThis, ...args: TArgs) => TResult,
-    options: ObserveOptions<TArgs, Awaited<TResult>, TPayload>,
+    options: ObserveResultAndErrorOptions<
+      TArgs,
+      Awaited<TResult>,
+      TPayload
+    >,
+  ): (this: TThis, ...args: TArgs) => TResult;
+  observe<TThis, TArgs extends unknown[], TResult, TPayload>(
+    fn: (this: TThis, ...args: TArgs) => TResult,
+    options: ObserveResultOptions<TArgs, Awaited<TResult>, TPayload>,
+  ): (this: TThis, ...args: TArgs) => TResult;
+  observe<TThis, TArgs extends unknown[], TResult, TPayload>(
+    fn: (this: TThis, ...args: TArgs) => TResult,
+    options: ObserveErrorOptions<TArgs, TPayload>,
   ): (this: TThis, ...args: TArgs) => TResult;
   flush(): Promise<void>;
 }

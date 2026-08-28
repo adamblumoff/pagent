@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import * as cloudSdk from "../src/index.js";
 import * as localConnector from "../src/connector-entry.js";
-import type { ObserveResultOptions } from "../src/index.js";
+import type {
+  ObserveResultAndErrorOptions,
+  ObserveResultOptions,
+} from "../src/index.js";
 
 type CloudExports = typeof import("../src/index.js");
 
@@ -29,6 +32,19 @@ const validObservation = {
 } satisfies ObserveResultOptions<[], string, { reason: string }>;
 
 void validObservation;
+
+const validResultAndErrorObservation = {
+  event: typedEvent,
+  on: ["result", "error"],
+  triggerWhen: (observation) =>
+    observation.kind === "error" || observation.result === "failed",
+  context: (observation) => ({
+    reason:
+      observation.kind === "error" ? "request threw" : observation.result,
+  }),
+} satisfies ObserveResultAndErrorOptions<[], string, { reason: string }>;
+
+void validResultAndErrorObservation;
 
 const invalidObservation = {
   event: typedEvent,
