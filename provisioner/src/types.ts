@@ -30,6 +30,10 @@ export interface ProvisionerEnv {
   CLOUDFLARE_API_BASE_URL?: string;
 }
 
+export interface ProvisionerDependencies {
+  cloudflareFetch?: typeof fetch;
+}
+
 export type LifecycleStatus = "active" | "revoked";
 
 export interface EnvironmentRecord {
