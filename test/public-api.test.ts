@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import * as cloudSdk from "../src/index.js";
 import * as localConnector from "../src/connector-entry.js";
 import type {
+  ObserveOptions,
   ObserveResultAndErrorOptions,
   ObserveResultOptions,
 } from "../src/index.js";
@@ -45,6 +46,22 @@ const validResultAndErrorObservation = {
 } satisfies ObserveResultAndErrorOptions<[], string, { reason: string }>;
 
 void validResultAndErrorObservation;
+
+const storedObservation: ObserveOptions<[], string, { reason: string }> =
+  Math.random() < 0.5
+    ? validObservation
+    : {
+        event: typedEvent,
+        on: "error",
+        triggerWhen: () => true,
+        context: () => ({ reason: "request threw" }),
+      };
+
+const observedFromStoredOptions = cloudSdk
+  .createPagent({})
+  .observe(() => "ok", storedObservation);
+
+void observedFromStoredOptions;
 
 const invalidObservation = {
   event: typedEvent,

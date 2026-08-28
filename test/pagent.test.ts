@@ -201,6 +201,51 @@ describe("Pagent", () => {
     expect(endpointFetch).toHaveBeenCalledTimes(2);
   });
 
+  it("prunes expired cooldowns before evicting an active one", async () => {
+    const endpointFetch = successfulEndpoint();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const pagent = createPagent({
+      enabled: true,
+      environment: "staging",
+      endpoint: endpointOptions(),
+      encryption: encryptionOptions(),
+    });
+    const longCooldown = pagent.observe(() => "long", {
+      event: defineEvent<{ reason: string }>({
+        name: "health.long-cooldown",
+        investigation: { cooldownMs: 86_400_000 },
+      }),
+      on: "result",
+      triggerWhen: () => true,
+      group: ({ result }) => result,
+      context: () => ({ reason: "still unhealthy" }),
+    });
+    const shortCooldown = pagent.observe((group: string) => group, {
+      event: defineEvent<{ reason: string }>({
+        name: "health.short-cooldown",
+        investigation: { cooldownMs: 1 },
+      }),
+      on: "result",
+      triggerWhen: () => true,
+      group: ({ result }) => result,
+      context: () => ({ reason: "briefly unhealthy" }),
+    });
+
+    longCooldown();
+    for (let index = 0; index < 999; index += 1) {
+      shortCooldown(`short-${index}`);
+    }
+    await pagent.flush();
+
+    now.mockReturnValue(2_000);
+    shortCooldown("replacement");
+    await pagent.flush();
+    longCooldown();
+    await pagent.flush();
+
+    expect(endpointFetch).toHaveBeenCalledTimes(1_001);
+  });
+
   it("does not let a failed delivery suppress a later trigger", async () => {
     const errors: unknown[] = [];
     const endpointFetch = vi

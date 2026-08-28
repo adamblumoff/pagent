@@ -48,7 +48,7 @@ class Pagent implements PagentClient {
   readonly #onDelivery: PagentOptions["onDelivery"];
   readonly #pending = new Set<Promise<void>>();
   readonly #inFlightCooldowns = new Set<string>();
-  readonly #deliveredCooldowns = new Map<string, number>();
+  readonly #cooldownExpirations = new Map<string, number>();
   readonly #endpoint: EndpointEmitter | undefined;
 
   constructor(options: PagentOptions) {
@@ -88,6 +88,10 @@ class Pagent implements PagentClient {
   observe<TThis, TArgs extends unknown[], TResult, TPayload>(
     fn: (this: TThis, ...args: TArgs) => TResult,
     options: ObserveErrorOptions<TArgs, TPayload>,
+  ): (this: TThis, ...args: TArgs) => TResult;
+  observe<TThis, TArgs extends unknown[], TResult, TPayload>(
+    fn: (this: TThis, ...args: TArgs) => TResult,
+    options: ObserveOptions<TArgs, Awaited<TResult>, TPayload>,
   ): (this: TThis, ...args: TArgs) => TResult;
   observe<
     TThis,
@@ -232,8 +236,7 @@ class Pagent implements PagentClient {
     if (
       cooldownKey !== undefined &&
       (this.#inFlightCooldowns.has(cooldownKey) ||
-        now - (this.#deliveredCooldowns.get(cooldownKey) ?? -Infinity) <
-          cooldownMs)
+        (this.#cooldownExpirations.get(cooldownKey) ?? -Infinity) > now)
     ) {
       return;
     }
@@ -260,10 +263,11 @@ class Pagent implements PagentClient {
       };
       await this.#endpoint!(event);
       if (cooldownKey !== undefined) {
-        rememberDelivery(
-          this.#deliveredCooldowns,
+        rememberCooldown(
+          this.#cooldownExpirations,
           cooldownKey,
           Date.now(),
+          cooldownMs,
         );
       }
       try {
@@ -294,18 +298,32 @@ export function createPagent(options: PagentOptions): PagentClient {
   return new Pagent(options);
 }
 
-function rememberDelivery(
-  deliveries: Map<string, number>,
+function rememberCooldown(
+  expirations: Map<string, number>,
   key: string,
   deliveredAt: number,
+  cooldownMs: number,
 ): void {
-  deliveries.delete(key);
-  deliveries.set(key, deliveredAt);
-  while (deliveries.size > LOCAL_COOLDOWN_LIMIT) {
-    const oldest = deliveries.keys().next().value;
+  const expiresAt = Math.min(
+    Number.MAX_SAFE_INTEGER,
+    deliveredAt + cooldownMs,
+  );
+  expirations.delete(key);
+  expirations.set(key, expiresAt);
+  if (expirations.size <= LOCAL_COOLDOWN_LIMIT) {
+    return;
+  }
+
+  for (const [storedKey, storedExpiresAt] of expirations) {
+    if (storedExpiresAt <= deliveredAt) {
+      expirations.delete(storedKey);
+    }
+  }
+  while (expirations.size > LOCAL_COOLDOWN_LIMIT) {
+    const oldest = expirations.keys().next().value;
     if (oldest === undefined) {
       return;
     }
-    deliveries.delete(oldest);
+    expirations.delete(oldest);
   }
 }

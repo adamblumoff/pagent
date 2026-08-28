@@ -217,6 +217,10 @@ export interface PagentClient {
     fn: (this: TThis, ...args: TArgs) => TResult,
     options: ObserveErrorOptions<TArgs, TPayload>,
   ): (this: TThis, ...args: TArgs) => TResult;
+  observe<TThis, TArgs extends unknown[], TResult, TPayload>(
+    fn: (this: TThis, ...args: TArgs) => TResult,
+    options: ObserveOptions<TArgs, Awaited<TResult>, TPayload>,
+  ): (this: TThis, ...args: TArgs) => TResult;
   flush(): Promise<void>;
 }
 
