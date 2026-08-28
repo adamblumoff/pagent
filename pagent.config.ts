@@ -28,6 +28,12 @@ export default defineConnectorConfig({
   codex: {
     sandboxMode: "read-only",
   },
+  notifications: {
+    slack: {
+      webhookUrl: required("PAGENT_SLACK_WEBHOOK_URL"),
+      timeoutMs: 2_000,
+    },
+  },
   stateDirectory: join(repositoryDirectory, ".pagent", "state"),
 });
 
