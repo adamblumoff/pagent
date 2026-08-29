@@ -91,10 +91,8 @@ describe.each(fixtures)("$name framework fixture", (fixture) => {
         status: 503,
         body: { status: "unhealthy", framework: fixture.name, count: 3 },
       });
-      await waitForRequests(endpoint.requests, 5);
-      for (const request of endpoint.requests.slice(2)) {
-        expectEndpointEvent(request, fixture.name, "fixture.failure", "burst");
-      }
+      await waitForRequests(endpoint.requests, 3);
+      expectEndpointEvent(endpoint.requests[2], fixture.name, "fixture.failure", "burst");
       endpoint.releaseAll();
     } finally {
       endpoint.releaseAll();

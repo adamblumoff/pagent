@@ -21,3 +21,23 @@ const observed = pagent.observe(
 );
 
 void observed(2);
+
+const observedRequest = pagent.observe(
+  async (status: number) => {
+    if (status >= 500) throw new Error("request failed");
+    return { status };
+  },
+  {
+    event,
+    on: ["result", "error"],
+    triggerWhen: (observation) =>
+      observation.kind === "error" || observation.result.status >= 500,
+    context: (observation) => ({
+      reason:
+        observation.kind === "error" ? "request failed" : "bad response",
+      attempts: 1,
+    }),
+  },
+);
+
+void observedRequest(200);

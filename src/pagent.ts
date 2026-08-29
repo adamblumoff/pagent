@@ -13,12 +13,25 @@ import type {
   JsonCompatible,
   ObserveErrorOptions,
   ObserveOptions,
+  ObserveResultAndErrorOptions,
   ObserveResultOptions,
   PagentClient,
   PagentEventMetadata,
   PagentOptions,
   ResultObservation,
 } from "./types.js";
+
+const LOCAL_COOLDOWN_LIMIT = 1_000;
+
+interface CooldownPreparationState {
+  deliveryGeneration: number;
+  pending: number;
+}
+
+interface CooldownPreparation {
+  generation: number;
+  state: CooldownPreparationState;
+}
 
 function isNativePromise(value: unknown): value is Promise<unknown> {
   return value instanceof Promise;
@@ -44,6 +57,12 @@ class Pagent implements PagentClient {
   readonly #onDeliveryError: PagentOptions["onDeliveryError"];
   readonly #onDelivery: PagentOptions["onDelivery"];
   readonly #pending = new Set<Promise<void>>();
+  readonly #inFlightCooldowns = new Set<string>();
+  readonly #cooldownExpirations = new Map<string, number>();
+  readonly #cooldownPreparations = new Map<
+    string,
+    CooldownPreparationState
+  >();
   readonly #endpoint: EndpointEmitter | undefined;
 
   constructor(options: PagentOptions) {
@@ -68,6 +87,26 @@ class Pagent implements PagentClient {
     }
   }
 
+  observe<TThis, TArgs extends unknown[], TResult, TPayload>(
+    fn: (this: TThis, ...args: TArgs) => TResult,
+    options: ObserveResultAndErrorOptions<
+      TArgs,
+      Awaited<TResult>,
+      TPayload
+    >,
+  ): (this: TThis, ...args: TArgs) => TResult;
+  observe<TThis, TArgs extends unknown[], TResult, TPayload>(
+    fn: (this: TThis, ...args: TArgs) => TResult,
+    options: ObserveResultOptions<TArgs, Awaited<TResult>, TPayload>,
+  ): (this: TThis, ...args: TArgs) => TResult;
+  observe<TThis, TArgs extends unknown[], TResult, TPayload>(
+    fn: (this: TThis, ...args: TArgs) => TResult,
+    options: ObserveErrorOptions<TArgs, TPayload>,
+  ): (this: TThis, ...args: TArgs) => TResult;
+  observe<TThis, TArgs extends unknown[], TResult, TPayload>(
+    fn: (this: TThis, ...args: TArgs) => TResult,
+    options: ObserveOptions<TArgs, Awaited<TResult>, TPayload>,
+  ): (this: TThis, ...args: TArgs) => TResult;
   observe<
     TThis,
     TArgs extends unknown[],
@@ -86,34 +125,28 @@ class Pagent implements PagentClient {
         if (isNativePromise(result)) {
           return result.then(
             (value) => {
-              if (options.on === "result") {
-                pagent.#scheduleResult(options, {
-                  args,
-                  result: value as Awaited<TResult>,
-                });
-              }
+              pagent.#scheduleResult(options, {
+                kind: "result",
+                args,
+                result: value as Awaited<TResult>,
+              });
               return value;
             },
             (error: unknown) => {
-              if (options.on === "error") {
-                pagent.#scheduleError(options, { args, error });
-              }
+              pagent.#scheduleError(options, { kind: "error", args, error });
               throw error;
             },
           ) as TResult;
         }
 
-        if (options.on === "result") {
-          pagent.#scheduleResult(options, {
-            args,
-            result: result as Awaited<TResult>,
-          });
-        }
+        pagent.#scheduleResult(options, {
+          kind: "result",
+          args,
+          result: result as Awaited<TResult>,
+        });
         return result;
       } catch (error) {
-        if (options.on === "error") {
-          pagent.#scheduleError(options, { args, error });
-        }
+        pagent.#scheduleError(options, { kind: "error", args, error });
         throw error;
       }
     };
@@ -125,16 +158,30 @@ class Pagent implements PagentClient {
   }
 
   #scheduleResult<TArgs extends unknown[], TResult, TPayload>(
-    options: ObserveResultOptions<TArgs, TResult, TPayload>,
+    options: ObserveOptions<TArgs, TResult, TPayload>,
     observation: ResultObservation<TArgs, TResult>,
   ): void {
+    if (options.on === "error") {
+      return;
+    }
+    if (options.on === "result") {
+      this.#schedule(options, observation);
+      return;
+    }
     this.#schedule(options, observation);
   }
 
-  #scheduleError<TArgs extends unknown[], TPayload>(
-    options: ObserveErrorOptions<TArgs, TPayload>,
+  #scheduleError<TArgs extends unknown[], TResult, TPayload>(
+    options: ObserveOptions<TArgs, TResult, TPayload>,
     observation: ErrorObservation<TArgs>,
   ): void {
+    if (options.on === "result") {
+      return;
+    }
+    if (options.on === "error") {
+      this.#schedule(options, observation);
+      return;
+    }
     this.#schedule(options, observation);
   }
 
@@ -189,32 +236,99 @@ class Pagent implements PagentClient {
       return;
     }
 
-    const now = Date.now();
     const group = investigationGroup(await options.group?.(observation));
-    const payload = await options.context(observation);
+    const cooldownMs = options.event.investigation?.cooldownMs ?? 0;
+    const cooldownKey =
+      cooldownMs === 0
+        ? undefined
+        : JSON.stringify([
+            options.event.name,
+            this.#environment,
+            group ?? null,
+          ]);
+    const now = Date.now();
+    if (
+      cooldownKey !== undefined &&
+      !cooldownAvailable(
+        this.#cooldownExpirations,
+        this.#inFlightCooldowns,
+        cooldownKey,
+        now,
+      )
+    ) {
+      return;
+    }
+
     const investigation = {
-      cooldownMs: options.event.investigation?.cooldownMs ?? 0,
+      cooldownMs,
       ...(group === undefined ? {} : { group }),
     };
-    const metadata: PagentEventMetadata = {
-      id: crypto.randomUUID(),
-      type: options.event.name,
-      environment: this.#environment!,
-      occurredAt: new Date(now).toISOString(),
-      investigation,
-    };
-    const event = {
-      ...metadata,
-      context: await this.#encrypt!(metadata, payload),
-    };
-    await this.#endpoint!(event);
+    const preparation =
+      cooldownKey === undefined
+        ? undefined
+        : beginCooldownPreparation(this.#cooldownPreparations, cooldownKey);
     try {
-      this.#onDelivery?.({
-        eventId: metadata.id,
-        deliveredAt: new Date().toISOString(),
-      });
-    } catch {
-      // Pagent callbacks must not affect the observed application.
+      const payload = await options.context(observation);
+      if (
+        preparation !== undefined &&
+        preparation.state.deliveryGeneration !== preparation.generation
+      ) {
+        return;
+      }
+      if (
+        cooldownKey !== undefined &&
+        !reserveCooldown(
+          this.#cooldownExpirations,
+          this.#inFlightCooldowns,
+          cooldownKey,
+          Date.now(),
+        )
+      ) {
+        return;
+      }
+      try {
+        const metadata: PagentEventMetadata = {
+          id: crypto.randomUUID(),
+          type: options.event.name,
+          environment: this.#environment!,
+          occurredAt: new Date(now).toISOString(),
+          investigation,
+        };
+        const event = {
+          ...metadata,
+          context: await this.#encrypt!(metadata, payload),
+        };
+        await this.#endpoint!(event);
+        if (cooldownKey !== undefined) {
+          rememberCooldown(
+            this.#cooldownExpirations,
+            cooldownKey,
+            Date.now(),
+            cooldownMs,
+          );
+          preparation!.state.deliveryGeneration += 1;
+        }
+        try {
+          this.#onDelivery?.({
+            eventId: metadata.id,
+            deliveredAt: new Date().toISOString(),
+          });
+        } catch {
+          // Pagent callbacks must not affect the observed application.
+        }
+      } finally {
+        if (cooldownKey !== undefined) {
+          this.#inFlightCooldowns.delete(cooldownKey);
+        }
+      }
+    } finally {
+      if (cooldownKey !== undefined && preparation !== undefined) {
+        endCooldownPreparation(
+          this.#cooldownPreparations,
+          cooldownKey,
+          preparation.state,
+        );
+      }
     }
   }
 
@@ -229,4 +343,83 @@ class Pagent implements PagentClient {
 
 export function createPagent(options: PagentOptions): PagentClient {
   return new Pagent(options);
+}
+
+function rememberCooldown(
+  expirations: Map<string, number>,
+  key: string,
+  deliveredAt: number,
+  cooldownMs: number,
+): void {
+  const expiresAt = Math.min(
+    Number.MAX_SAFE_INTEGER,
+    deliveredAt + cooldownMs,
+  );
+  expirations.delete(key);
+  expirations.set(key, expiresAt);
+}
+
+function beginCooldownPreparation(
+  preparations: Map<string, CooldownPreparationState>,
+  key: string,
+): CooldownPreparation {
+  const state = preparations.get(key) ?? {
+    deliveryGeneration: 0,
+    pending: 0,
+  };
+  state.pending += 1;
+  preparations.set(key, state);
+  return { generation: state.deliveryGeneration, state };
+}
+
+function endCooldownPreparation(
+  preparations: Map<string, CooldownPreparationState>,
+  key: string,
+  state: CooldownPreparationState,
+): void {
+  state.pending -= 1;
+  if (state.pending === 0 && preparations.get(key) === state) {
+    preparations.delete(key);
+  }
+}
+
+function pruneExpiredCooldowns(
+  expirations: Map<string, number>,
+  now: number,
+): void {
+  for (const [storedKey, storedExpiresAt] of expirations) {
+    if (storedExpiresAt <= now) {
+      expirations.delete(storedKey);
+    }
+  }
+}
+
+function cooldownAvailable(
+  expirations: Map<string, number>,
+  inFlight: Set<string>,
+  key: string,
+  now: number,
+): boolean {
+  const expiresAt = expirations.get(key);
+  if (inFlight.has(key) || (expiresAt !== undefined && expiresAt > now)) {
+    return false;
+  }
+  if (expirations.size + inFlight.size < LOCAL_COOLDOWN_LIMIT) {
+    return true;
+  }
+  pruneExpiredCooldowns(expirations, now);
+  return expirations.size + inFlight.size < LOCAL_COOLDOWN_LIMIT;
+}
+
+function reserveCooldown(
+  expirations: Map<string, number>,
+  inFlight: Set<string>,
+  key: string,
+  now: number,
+): boolean {
+  if (!cooldownAvailable(expirations, inFlight, key, now)) {
+    return false;
+  }
+  inFlight.add(key);
+  return true;
 }

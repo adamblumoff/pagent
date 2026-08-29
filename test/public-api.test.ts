@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import * as cloudSdk from "../src/index.js";
 import * as localConnector from "../src/connector-entry.js";
-import type { ObserveResultOptions } from "../src/index.js";
+import type {
+  ObserveOptions,
+  ObserveResultAndErrorOptions,
+  ObserveResultOptions,
+  ResultObservation,
+} from "../src/index.js";
 
 type CloudExports = typeof import("../src/index.js");
 
@@ -29,6 +34,46 @@ const validObservation = {
 } satisfies ObserveResultOptions<[], string, { reason: string }>;
 
 void validObservation;
+
+const validResultAndErrorObservation = {
+  event: typedEvent,
+  on: ["result", "error"],
+  triggerWhen: (observation) =>
+    observation.kind === "error" || observation.result === "failed",
+  context: (observation) => ({
+    reason:
+      observation.kind === "error" ? "request threw" : observation.result,
+  }),
+} satisfies ObserveResultAndErrorOptions<[], string, { reason: string }>;
+
+void validResultAndErrorObservation;
+
+const invalidNarrowCombinedObservation = {
+  event: typedEvent,
+  on: ["result", "error"],
+  // @ts-expect-error Combined callbacks must accept both observation branches.
+  triggerWhen: (observation: ResultObservation<[], string>) =>
+    observation.result === "failed",
+  context: () => ({ reason: "expected" }),
+} satisfies ObserveResultAndErrorOptions<[], string, { reason: string }>;
+
+void invalidNarrowCombinedObservation;
+
+const storedObservation: ObserveOptions<[], string, { reason: string }> =
+  Math.random() < 0.5
+    ? validObservation
+    : {
+        event: typedEvent,
+        on: "error",
+        triggerWhen: () => true,
+        context: () => ({ reason: "request threw" }),
+      };
+
+const observedFromStoredOptions = cloudSdk
+  .createPagent({})
+  .observe(() => "ok", storedObservation);
+
+void observedFromStoredOptions;
 
 const invalidObservation = {
   event: typedEvent,
